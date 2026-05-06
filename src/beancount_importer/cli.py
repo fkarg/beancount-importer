@@ -1,7 +1,7 @@
 """Command-line entry point.
 
 Two subcommands today:
-- `import-year`: load config + rules + tag state, drive the pipeline, write
+- `import`: load config + rules + tag state, drive the pipeline, write
   the resulting beancount entries, and persist any new rules / tag deltas.
 - `init`: write a starter `import_config.toml` next to a fresh `transactions/`
   tree so a user can get going without copying boilerplate.
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Annotated
 
@@ -217,14 +218,14 @@ def _resolve(base: Path, template: str, year: int) -> Path:
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 
-@app.command("import-year")
-def import_year(
+@app.command("import")
+def import_command(
     year: Annotated[
-        int,
+        int | None,
         typer.Argument(
-            help="Year used in {year} path templates (e.g. transactions/{year}/SPK.bean)"
+            help="Year used in {year} path templates and as the implicit year-filter. With no YEAR, every parsed transaction is processed and each new entry is filed under transactions/<its-booking-year>/.",
         ),
-    ],
+    ] = None,
     config_path: Annotated[
         Path,
         typer.Option("--config", "-c", help="Path to the importer config TOML"),
@@ -268,7 +269,14 @@ def import_year(
         ),
     ] = None,
 ) -> None:
-    """Run the import for a given year and write new beancount entries."""
+    """Run the import and write new beancount entries.
+
+    With no YEAR, every parsed transaction is processed (no year-filter) and
+    each new entry is filed under `transactions/<its-booking-year>/`. Pass an
+    explicit YEAR to scope both the year-filter and the output folder. The
+    `--all-years` flag is still useful when you want to *file* under a
+    specific year while pulling in transactions from any year.
+    """
     if not config_path.exists():
         console.print(f"[red]config not found:[/] {config_path}")
         raise typer.Exit(code=2)
@@ -285,14 +293,15 @@ def import_year(
     decisions = DecisionLog(None) if preview else DecisionLog(decisions_path)
     tag_state = _load_tag_state(tags_path)
 
-    # `import-year YEAR` implicitly filters to that year — multi-year CSV
-    # exports are common (a 2024 export usually carries late-2023 rows), and
-    # the user almost always wants only YEAR's transactions in the YEAR file.
-    # `--all-years` opts out; explicit `--year-filter` takes precedence.
-    if all_years:
-        effective_year_filter: tuple[int, ...] | None = None
-    elif year_filter:
-        effective_year_filter = tuple(year_filter)
+    # `import YEAR` implicitly filters to that year — multi-year CSV exports
+    # are common (a 2024 export usually carries late-2023 rows), and the user
+    # almost always wants only YEAR's transactions in the YEAR file. With no
+    # YEAR (or with `--all-years`), no implicit filter is applied so every
+    # parsed row is considered. Explicit `--year-filter` always wins.
+    if year_filter:
+        effective_year_filter: tuple[int, ...] | None = tuple(year_filter)
+    elif all_years or year is None:
+        effective_year_filter = None
     else:
         effective_year_filter = (year,)
 
@@ -387,23 +396,27 @@ def _persist_results(
     results: list[ImportResult],
     config: Config,
     base_dir: Path,
-    year: int,
+    year: int | None,
     *,
     dry_run: bool,
 ) -> None:
-    by_bank: dict[str, list[ImportResult]] = {}
-    for r in results:
-        if r.action == "new" and r.new_entry_text:
-            by_bank.setdefault(r.source_txn.bank_key, []).append(r)
+    """Append each new entry to its bank's output file.
 
-    for bank_key, batch in by_bank.items():
+    When `year` is given, the same `output_file.format(year=year)` path is used
+    for every txn in the batch (the explicit-year flow). When `year` is None
+    (no-year flow), each txn is filed under its own `booking_date.year` so a
+    single sweep across multiple years lands in the correct per-year files.
+    """
+    for r in results:
+        if r.action != "new" or not r.new_entry_text:
+            continue
         try:
-            bank_cfg = config.bank(bank_key)
+            bank_cfg = config.bank(r.source_txn.bank_key)
         except KeyError:
             continue
-        out_path = _resolve(base_dir, bank_cfg.output_file, year)
-        for r in batch:
-            append_entry(r.new_entry_text, out_path, dry_run=dry_run)
+        target_year = year if year is not None else r.source_txn.booking_date.year
+        out_path = _resolve(base_dir, bank_cfg.output_file, target_year)
+        append_entry(r.new_entry_text, out_path, dry_run=dry_run)
 
 
 def _persist_new_rules(

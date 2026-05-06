@@ -83,7 +83,8 @@ field_sepa_reference = "Kundenreferenz"
 ## Running an import
 
 ```sh
-uv run beancount-import import-year 2024
+uv run beancount-import import          # current year (uses today's year)
+uv run beancount-import import 2024     # explicit year
 ```
 
 This will:
@@ -108,13 +109,13 @@ Examples:
 
 ```sh
 # See what 2024 would look like without writing anything
-uv run beancount-import import-year 2024 --preview
+uv run beancount-import import 2024 --preview
 
 # Only import 2023 transactions, but file them under transactions/2024/
-uv run beancount-import import-year 2024 --year-filter 2023
+uv run beancount-import import 2024 --year-filter 2023
 
 # Just process the SPK bank for both years
-uv run beancount-import import-year 2024 -b spk -Y 2023 -Y 2024
+uv run beancount-import import 2024 -b spk -Y 2023 -Y 2024
 ```
 
 ## Migrating from the old vibe-coded importer
@@ -178,7 +179,7 @@ your-project/
 ├── documents/                     # CSV exports go here
 └── transactions/
     └── 2024/
-        ├── SPK.bean               # appended to by import-year 2024 --bank spk
+        ├── SPK.bean               # appended to by import 2024 --bank spk
         └── N26.bean
 ```
 

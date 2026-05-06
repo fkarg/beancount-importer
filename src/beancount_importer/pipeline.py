@@ -110,7 +110,7 @@ def _resolve(base_dir: Path, template: str, year: int) -> Path:
 def _load_existing(
     bank: BankConfig,
     base_dir: Path,
-    year: int,
+    year: int | None,
     transactions_dir: str,
 ) -> list[LedgerEntry]:
     """Load every already-imported entry for `bank`, across all years.
@@ -122,20 +122,23 @@ def _load_existing(
 
     We scan two places:
     1. The bank's `source_files` template, expanded for the target year — the
-       conventional one-file-per-bank-per-year layout.
+       conventional one-file-per-bank-per-year layout. Skipped when year is
+       None (all-years mode) since we'd otherwise need to enumerate every
+       conceivable year; the rglob below already covers them.
     2. `transactions_dir/**/*.bean` — catches mixed-bank monthly files
        (`2022-01.bean`, etc.) and historical years.
     """
     seen_paths: set[Path] = set()
     entries: list[LedgerEntry] = []
 
-    for src in bank.source_files:
-        path = _resolve(base_dir, src, year)
-        if path in seen_paths:
-            continue
-        seen_paths.add(path)
-        if path.exists():
-            entries.extend(read_ledger(path, bank.account))
+    if year is not None:
+        for src in bank.source_files:
+            path = _resolve(base_dir, src, year)
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            if path.exists():
+                entries.extend(read_ledger(path, bank.account))
 
     tx_root = (base_dir / transactions_dir).resolve()
     if tx_root.exists():

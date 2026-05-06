@@ -64,7 +64,7 @@ class TestImportYearPreview:
         result = runner.invoke(
             app,
             [
-                "import-year",
+                "import",
                 "2024",
                 "--config",
                 str(project_dir / "import_config.toml"),
@@ -80,7 +80,7 @@ class TestImportYearPreview:
         result = runner.invoke(
             app,
             [
-                "import-year",
+                "import",
                 "2024",
                 "--config",
                 str(project_dir / "import_config.toml"),

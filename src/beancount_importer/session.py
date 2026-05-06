@@ -35,7 +35,11 @@ class ImportOptions(BaseModel):
 class ImportSession(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    year: int
+    # None means "no fixed year": don't expand `{year}` templates against a
+    # single year; route output per-transaction (booking_date.year) and load
+    # existing entries across all years. Concrete years still drive the
+    # implicit year-filter and the per-year output template.
+    year: int | None
     config: Config
     rules: tuple[CategorizationRule, ...] = ()
     tag_state: TagState = TagState()
