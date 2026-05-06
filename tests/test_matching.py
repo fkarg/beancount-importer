@@ -322,3 +322,118 @@ class TestIsPaypalFundingTxn:
 
     def test_unrelated_false(self):
         assert not is_paypal_funding_txn(make_txn(payee="Rewe", description="Groceries"))
+
+
+# ── cross-bank matching: inferred amount + metadata dates ────────────────────
+
+from beancount_importer.matching.scorer import score_candidate, find_candidates
+
+
+class TestCrossBankInferredAmount:
+    """When matching a CSV row against an entry whose source posting was
+    inferred by beancount (typically a transit account on another bank's
+    transfer entry), the sign convention is opposite to the CSV's.
+    """
+
+    def test_inferred_entry_matches_opposite_sign(self):
+        # PayPal CSV: user paid -7.49 at merchant
+        txn = make_txn(
+            amount=Decimal("-7.49"),
+            booking_date=date(2024, 1, 17),
+            payee="Steam",
+            description="Steam purchase",
+            bank_key="paypal",
+        )
+        # SPK→PayPal transfer entry as seen from PayPal side: SPK booked
+        # -7.49, PayPal leg was inferred to +7.49
+        entry = make_entry(
+            amount=Decimal("7.49"),
+            date=date(2024, 1, 19),
+            source_account="Assets:B:PayPal",
+            target_account="Assets:B:SPK",
+            payee="PayPal",
+            narration="PayPal Einkauf",
+            amount_inferred=True,
+        )
+        score = score_candidate(txn, entry)
+        assert score > 0.0, "inferred-amount entry should match opposite-sign txn"
+
+    def test_explicit_entry_rejects_opposite_sign(self):
+        # Same shape but the entry's amount was explicit in the source file
+        # — that's a real PayPal-CSV-derived entry, not a transit leg, so we
+        # require strict sign equality.
+        txn = make_txn(amount=Decimal("-7.49"), bank_key="paypal")
+        entry = make_entry(
+            amount=Decimal("7.49"),  # explicit, not inferred
+            source_account="Assets:B:PayPal",
+            payee="Different",
+            narration="Different",
+        )
+        assert score_candidate(txn, entry) == 0.0
+
+    def test_inferred_entry_uses_metadata_date(self):
+        # Bookkeeping date is 2 days after the actual purchase. With the
+        # `actual:` metadata, the scorer should consider both dates and pick
+        # the closer one.
+        txn = make_txn(
+            amount=Decimal("-103.19"),
+            booking_date=date(2024, 1, 17),
+            bank_key="paypal",
+        )
+        entry = make_entry(
+            amount=Decimal("103.19"),
+            date=date(2024, 1, 19),
+            metadata_dates=(date(2024, 1, 17),),
+            amount_inferred=True,
+        )
+        score = score_candidate(txn, entry)
+        assert score > 0.0
+
+    def test_inferred_entry_outside_tolerance_still_rejected(self):
+        # 30 days apart even with metadata dates
+        txn = make_txn(amount=Decimal("-50"), booking_date=date(2024, 1, 1))
+        entry = make_entry(
+            amount=Decimal("50"),
+            date=date(2024, 2, 15),
+            amount_inferred=True,
+        )
+        assert score_candidate(txn, entry, max_date_days=14) == 0.0
+
+    def test_find_candidates_picks_inferred_match(self):
+        txn = make_txn(
+            amount=Decimal("-15.99"),
+            booking_date=date(2024, 1, 15),
+            bank_key="paypal",
+            payee="Steam",
+        )
+        entry = make_entry(
+            amount=Decimal("15.99"),
+            date=date(2024, 1, 16),
+            amount_inferred=True,
+            payee="PayPal",
+            narration="PayPal Einkauf",
+        )
+        candidates = find_candidates(txn, [entry], min_score=0.35)
+        assert len(candidates) == 1
+
+
+class TestMetadataDateProximity:
+    """Even non-inferred entries may carry metadata dates that should be
+    considered for proximity (e.g. a PayPal-side entry with `actual:`).
+    """
+
+    def test_metadata_date_brings_distant_entry_in_range(self):
+        # Booking date 30 days away — outside default tolerance — but the
+        # metadata date is exact.
+        txn = make_txn(
+            amount=Decimal("-15.99"),
+            booking_date=date(2024, 1, 15),
+        )
+        entry = make_entry(
+            amount=Decimal("-15.99"),
+            date=date(2024, 2, 15),  # 31 days away
+            metadata_dates=(date(2024, 1, 15),),  # exact
+        )
+        # Default max_date_days=14 would normally reject this entry.
+        score = score_candidate(txn, entry)
+        assert score > 0.0

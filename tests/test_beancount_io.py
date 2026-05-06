@@ -65,6 +65,128 @@ class TestReadLedger:
         assert entries == []
 
 
+class TestReadLedgerInferredAmount:
+    """beancount fills in a missing posting amount during load. The reader
+    needs to flag those entries (`amount_inferred=True`) so the scorer can
+    treat them as cross-bank transit legs.
+    """
+
+    def _write(self, path: Path, content: str) -> None:
+        path.write_text(content)
+
+    def test_explicit_amount_not_marked_inferred(self, tmp_path: Path):
+        bean = tmp_path / "spk.bean"
+        self._write(
+            bean,
+            '2024-01-15 * "Netflix" "Abo"\n'
+            '  Assets:B:SPK  -15.99 EUR\n'
+            '  Expenses:Entertainment  15.99 EUR\n',
+        )
+        entries = read_ledger(bean, "Assets:B:SPK")
+        assert entries[0].amount_inferred is False
+
+    def test_inferred_amount_marked(self, tmp_path: Path):
+        # SPK→PayPal transfer: SPK has explicit amount, PayPal leg is inferred.
+        bean = tmp_path / "spk.bean"
+        self._write(
+            bean,
+            '2024-04-18 * "PayPal" "Einkauf"\n'
+            '  Assets:B:SPK  -10.00 EUR\n'
+            '  Assets:B:PayPal\n',
+        )
+        entries = read_ledger(bean, "Assets:B:PayPal")
+        assert len(entries) == 1
+        assert entries[0].amount == Decimal("10.00")
+        assert entries[0].amount_inferred is True
+
+
+class TestReadLedgerMetadataDates:
+    def _write(self, path: Path, content: str) -> None:
+        path.write_text(content)
+
+    def test_extracts_actual_date(self, tmp_path: Path):
+        bean = tmp_path / "spk.bean"
+        self._write(
+            bean,
+            '2024-01-19 * "Merchant" "PayPal"\n'
+            '  Assets:B:SPK  -103.19 EUR\n'
+            '  Assets:B:PayPal\n'
+            '    actual: 2024-01-17\n',
+        )
+        entries = read_ledger(bean, "Assets:B:PayPal")
+        assert len(entries) == 1
+        assert date(2024, 1, 17) in entries[0].metadata_dates
+
+    def test_unconfigured_keys_ignored(self, tmp_path: Path):
+        bean = tmp_path / "spk.bean"
+        self._write(
+            bean,
+            '2024-01-19 * "Merchant" "PayPal"\n'
+            '  Assets:B:SPK  -100 EUR\n'
+            '  Assets:B:PayPal\n'
+            '    actual: 2024-01-17\n',
+        )
+        # Only consider `paypal:` — `actual:` should be ignored.
+        entries = read_ledger(
+            bean, "Assets:B:PayPal", metadata_date_keys=("paypal",)
+        )
+        assert entries[0].metadata_dates == ()
+
+
+class TestReadLedgerSynthesize:
+    """When a user runs plugins that split transactions at load time, the
+    bean file may carry only a metadata hint (`paypal: 2024-01-17`). The
+    reader can synthesise the virtual entry the plugin would produce so
+    that cross-bank PayPal matching works without loading plugins.
+    """
+
+    def _write(self, path: Path, content: str) -> None:
+        path.write_text(content)
+
+    def test_synthesizes_paypal_entry_from_metadata(self, tmp_path: Path):
+        bean = tmp_path / "spk.bean"
+        # Bank-side entry where the user's plugin would split off a PayPal
+        # transaction on the actual purchase date.
+        self._write(
+            bean,
+            '2024-04-13 * "Google Payment" ""\n'
+            '  Assets:B:SPK  -3.39 EUR\n'
+            '    paypal: 2024-04-11\n'
+            '  Expenses:Apps  3.39 EUR\n',
+        )
+        entries = read_ledger(
+            bean,
+            "Assets:B:PayPal",
+            synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
+        )
+        # No real PayPal posting → only the synthesized one.
+        assert len(entries) == 1
+        e = entries[0]
+        assert e.date == date(2024, 4, 11)
+        assert e.amount == Decimal("-3.39")
+        assert e.target_account == "Expenses:Apps"
+        assert e.amount_inferred is True
+
+    def test_synthesize_ignored_when_account_doesnt_match(self, tmp_path: Path):
+        bean = tmp_path / "spk.bean"
+        self._write(
+            bean,
+            '2024-04-13 * "Google Payment" ""\n'
+            '  Assets:B:SPK  -3.39 EUR\n'
+            '    paypal: 2024-04-11\n'
+            '  Expenses:Apps  3.39 EUR\n',
+        )
+        # Loading for SPK shouldn't trigger PayPal synthesis.
+        entries = read_ledger(
+            bean,
+            "Assets:B:SPK",
+            synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
+        )
+        assert len(entries) == 1
+        assert entries[0].source_account == "Assets:B:SPK"
+        assert entries[0].amount_inferred is False
+
+
 # ── writer: format_transaction ───────────────────────────────────────────────
 
 class TestFormatTransaction:
