@@ -110,35 +110,35 @@ def _resolve(base_dir: Path, template: str, year: int) -> Path:
 def _load_existing(
     bank: BankConfig,
     base_dir: Path,
-    year: int | None,
+    years: tuple[int, ...] | None,
     transactions_dir: str,
 ) -> list[LedgerEntry]:
     """Load every already-imported entry for `bank`, across all years.
 
-    Dedup needs to see the full ledger: a CSV may contain rows from years
-    *other* than `year` (a 2024 Sparkasse export still includes Q4 2023). If
-    we only loaded `output_file.format(year=year)`, those would re-appear as
-    "new" instead of being recognized as duplicates.
+    Dedup needs to see the full ledger: CSVs straddle year boundaries (a 2024
+    Sparkasse export still includes Q4 2023), so loading only one year's
+    output_file would resurface real duplicates as "new" entries.
 
-    We scan two places:
-    1. The bank's `source_files` template, expanded for the target year — the
-       conventional one-file-per-bank-per-year layout. Skipped when year is
-       None (all-years mode) since we'd otherwise need to enumerate every
-       conceivable year; the rglob below already covers them.
+    Two scan paths:
+    1. The bank's `source_files` template, expanded for each year in the
+       active filter — the conventional one-file-per-bank-per-year layout.
+       Skipped when `years` is None (all-years mode); the rglob below
+       already sweeps every year-folder under transactions_dir.
     2. `transactions_dir/**/*.bean` — catches mixed-bank monthly files
        (`2022-01.bean`, etc.) and historical years.
     """
     seen_paths: set[Path] = set()
     entries: list[LedgerEntry] = []
 
-    if year is not None:
-        for src in bank.source_files:
-            path = _resolve(base_dir, src, year)
-            if path in seen_paths:
-                continue
-            seen_paths.add(path)
-            if path.exists():
-                entries.extend(read_ledger(path, bank.account))
+    if years:
+        for year in years:
+            for src in bank.source_files:
+                path = _resolve(base_dir, src, year)
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                if path.exists():
+                    entries.extend(read_ledger(path, bank.account))
 
     tx_root = (base_dir / transactions_dir).resolve()
     if tx_root.exists():
@@ -172,14 +172,17 @@ def run(
     reporter: Reporter,
     decisions: DecisionLog | None = None,
 ) -> list[ImportResult]:
-    """Execute the import pipeline for one year.
+    """Execute the import pipeline.
 
     `base_dir` is the directory used to resolve all relative paths in the config
-    (typically the directory containing `import_config.toml`).
+    (typically the directory containing `import_config.toml`). The session's
+    `options.year_filter` (if any) scopes which transactions are processed;
+    output paths are resolved against each transaction's own booking year by
+    the CLI after the pipeline returns.
     """
     decisions = decisions if decisions is not None else DecisionLog(None)
     config = session.config
-    year = session.year
+    year_filter = session.options.year_filter
 
     banks = _select_banks(session)
     work: list[_BankWork] = []
@@ -191,10 +194,10 @@ def run(
                 txns.extend(parser.parse(str(csv_file)))
             except Exception as exc:
                 reporter.on_error(f"{bank.key}: failed to parse {csv_file}: {exc}")
-        if session.options.year_filter is not None:
-            allowed = set(session.options.year_filter)
+        if year_filter is not None:
+            allowed = set(year_filter)
             txns = [t for t in txns if t.booking_date.year in allowed]
-        existing = _load_existing(bank, base_dir, year, config.transactions_dir)
+        existing = _load_existing(bank, base_dir, year_filter, config.transactions_dir)
         work.append(_BankWork(bank, parser, txns, existing))
 
     transforms = load_transforms(config.transforms.enabled)

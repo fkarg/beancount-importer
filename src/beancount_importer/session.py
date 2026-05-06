@@ -28,18 +28,14 @@ class ImportOptions(BaseModel):
     bank_filter: str | None = None
     # When set, only transactions whose booking_date.year is in this tuple are
     # processed. None means "no filter" — all parsed transactions are passed
-    # through. The session's `year` still controls output-path templating.
+    # through. Output paths are always resolved against each transaction's
+    # own booking year, so this filter is a pure scope control.
     year_filter: tuple[int, ...] | None = None
 
 
 class ImportSession(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    # None means "no fixed year": don't expand `{year}` templates against a
-    # single year; route output per-transaction (booking_date.year) and load
-    # existing entries across all years. Concrete years still drive the
-    # implicit year-filter and the per-year output template.
-    year: int | None
     config: Config
     rules: tuple[CategorizationRule, ...] = ()
     tag_state: TagState = TagState()

@@ -79,7 +79,6 @@ def make_session(
         matching=MatchingConfig(min_score=0.35),
     )
     return ImportSession(
-        year=2024,
         config=cfg,
         rules=rules,
         tag_state=tag_state,
@@ -350,7 +349,6 @@ class TestPipelineBankFilter:
             matching=MatchingConfig(min_score=0.35),
         )
         session = ImportSession(
-            year=2024,
             config=cfg,
             options=ImportOptions(bank_filter="spk"),
         )

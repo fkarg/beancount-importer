@@ -22,18 +22,17 @@ class TestImportOptions:
 
 class TestImportSession:
     def test_minimal_construction(self):
-        s = ImportSession(year=2025, config=Config())
-        assert s.year == 2025
+        s = ImportSession(config=Config())
         assert s.rules == ()
         assert s.tag_state == TagState()
 
     def test_with_active_tag(self):
         ts = TagState(active=ActiveTag(tag="x", mode="always"))
-        s = ImportSession(year=2025, config=Config(), tag_state=ts)
+        s = ImportSession(config=Config(), tag_state=ts)
         assert s.tag_state.active is not None
         assert s.tag_state.active.tag == "x"
 
     def test_frozen(self):
-        s = ImportSession(year=2025, config=Config())
+        s = ImportSession(config=Config())
         with pytest.raises(Exception):
-            s.year = 2026  # type: ignore[misc]
+            s.config = Config()  # type: ignore[misc]

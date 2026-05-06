@@ -83,8 +83,9 @@ field_sepa_reference = "Kundenreferenz"
 ## Running an import
 
 ```sh
-uv run beancount-import import          # current year (uses today's year)
-uv run beancount-import import 2024     # explicit year
+uv run beancount-import import                    # all years, all banks
+uv run beancount-import import 2024               # just 2024
+uv run beancount-import import 2022 2023 2024     # multiple years
 ```
 
 This will:
@@ -92,7 +93,9 @@ This will:
 2. Dedupe against existing entries in `output_file` and any extra `source_files`.
 3. Apply categorization rules from `categorization_rules.json`.
 4. Prompt you for anything not covered by a rule (target account, save-as-rule).
-5. Append new entries to `transactions/{year}/<BANK>.bean`.
+5. Append each new entry to `transactions/<its-booking-year>/<BANK>.bean` —
+   a single import that spans multiple years splits cleanly into the
+   per-year files you already have on disk.
 
 ### Useful flags
 
@@ -100,22 +103,22 @@ This will:
 |---|---|
 | `--config`, `-c` | Path to the importer config TOML (default: `./.beancount-importer/config.toml`) |
 | `--bank`, `-b spk` | Only process one bank by key |
-| `--year-filter`, `-Y 2024` | Only import transactions whose **booking date** falls in this year. Repeatable for multiple years. The required `year` argument still controls the `{year}` template in output paths. |
-| `--preview`, `-P` | Non-interactive dry run. Shows a table of what would be imported, applying only existing rules; never writes files or touches the decision log. |
+| `--year-filter`, `-Y 2024` | Restrict to transactions whose **booking date** falls in this year. Repeatable. Equivalent to passing the years as positional arguments; takes precedence when both are given. |
+| `--preview`, `-P` | Non-interactive dry run. Shows a per-bank breakdown of what would be imported, applying only existing rules; never writes files or touches the decision log. |
 | `--dry-run` | Run interactively (with prompts) but skip all file writes. |
 | `--auto-threshold 0.85` | When matching against existing entries, auto-apply matches scoring above this threshold instead of prompting. |
 
 Examples:
 
 ```sh
-# See what 2024 would look like without writing anything
-uv run beancount-import import 2024 --preview
+# Peek at every CSV the importer can see, across all years
+uv run beancount-import import --preview
 
-# Only import 2023 transactions, but file them under transactions/2024/
-uv run beancount-import import 2024 --year-filter 2023
+# See what 2022 + 2023 would look like
+uv run beancount-import import 2022 2023 --preview
 
-# Just process the SPK bank for both years
-uv run beancount-import import 2024 -b spk -Y 2023 -Y 2024
+# Just process the SPK bank for one year
+uv run beancount-import import 2024 -b spk
 ```
 
 ## Migrating from the old vibe-coded importer
@@ -179,7 +182,7 @@ your-project/
 ├── documents/                     # CSV exports go here
 └── transactions/
     └── 2024/
-        ├── SPK.bean               # appended to by import 2024 --bank spk
+        ├── SPK.bean               # appended to by `import 2024 --bank spk`
         └── N26.bean
 ```
 

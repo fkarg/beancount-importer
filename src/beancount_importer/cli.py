@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 from typing import Annotated
 
@@ -220,10 +219,10 @@ def _resolve(base: Path, template: str, year: int) -> Path:
 
 @app.command("import")
 def import_command(
-    year: Annotated[
-        int | None,
+    years: Annotated[
+        list[int] | None,
         typer.Argument(
-            help="Year used in {year} path templates and as the implicit year-filter. With no YEAR, every parsed transaction is processed and each new entry is filed under transactions/<its-booking-year>/.",
+            help="Years to process. With none, every parsed transaction is considered. Pass one or more (e.g. `import 2022 2023`) to scope by booking year. Each new entry is always filed under transactions/<its-booking-year>/.",
         ),
     ] = None,
     config_path: Annotated[
@@ -251,16 +250,9 @@ def import_command(
         typer.Option(
             "--year-filter",
             "-Y",
-            help="Restrict to transactions whose booking date falls in these years (repeatable). Defaults to [year].",
+            help="Restrict to transactions whose booking date falls in these years. Equivalent to passing the years as positional arguments; takes precedence when both are given.",
         ),
     ] = None,
-    all_years: Annotated[
-        bool,
-        typer.Option(
-            "--all-years",
-            help="Disable the implicit year filter — process every transaction the CSV contains.",
-        ),
-    ] = False,
     auto_threshold: Annotated[
         float | None,
         typer.Option(
@@ -271,11 +263,11 @@ def import_command(
 ) -> None:
     """Run the import and write new beancount entries.
 
-    With no YEAR, every parsed transaction is processed (no year-filter) and
-    each new entry is filed under `transactions/<its-booking-year>/`. Pass an
-    explicit YEAR to scope both the year-filter and the output folder. The
-    `--all-years` flag is still useful when you want to *file* under a
-    specific year while pulling in transactions from any year.
+    Examples:
+        import                       # all years, all banks
+        import 2024                  # just 2024
+        import 2022 2023 --preview   # peek at multiple years without writing
+        import 2024 --bank spk       # one bank, one year
     """
     if not config_path.exists():
         console.print(f"[red]config not found:[/] {config_path}")
@@ -293,17 +285,13 @@ def import_command(
     decisions = DecisionLog(None) if preview else DecisionLog(decisions_path)
     tag_state = _load_tag_state(tags_path)
 
-    # `import YEAR` implicitly filters to that year — multi-year CSV exports
-    # are common (a 2024 export usually carries late-2023 rows), and the user
-    # almost always wants only YEAR's transactions in the YEAR file. With no
-    # YEAR (or with `--all-years`), no implicit filter is applied so every
-    # parsed row is considered. Explicit `--year-filter` always wins.
+    # `--year-filter` wins, then positional years, else no scoping.
     if year_filter:
         effective_year_filter: tuple[int, ...] | None = tuple(year_filter)
-    elif all_years or year is None:
-        effective_year_filter = None
+    elif years:
+        effective_year_filter = tuple(years)
     else:
-        effective_year_filter = (year,)
+        effective_year_filter = None
 
     options = ImportOptions(
         bank_filter=bank,
@@ -314,7 +302,6 @@ def import_command(
         year_filter=effective_year_filter,
     )
     session = ImportSession(
-        year=year,
         config=config,
         rules=rules,
         tag_state=tag_state,
@@ -328,7 +315,7 @@ def import_command(
     results = run_pipeline(session, base_dir, categorize, reporter, decisions=decisions)  # type: ignore[arg-type]
 
     skip_persist = dry_run or preview
-    _persist_results(results, config, base_dir, year, dry_run=skip_persist)
+    _persist_results(results, config, base_dir, dry_run=skip_persist)
     _persist_new_rules(results, list(rules), rules_path, dry_run=skip_persist)
     _persist_tag_updates(results, tag_state, tags_path, dry_run=skip_persist)
     if preview:
@@ -396,16 +383,14 @@ def _persist_results(
     results: list[ImportResult],
     config: Config,
     base_dir: Path,
-    year: int | None,
     *,
     dry_run: bool,
 ) -> None:
-    """Append each new entry to its bank's output file.
+    """Append each new entry to its bank's output file, routed by booking year.
 
-    When `year` is given, the same `output_file.format(year=year)` path is used
-    for every txn in the batch (the explicit-year flow). When `year` is None
-    (no-year flow), each txn is filed under its own `booking_date.year` so a
-    single sweep across multiple years lands in the correct per-year files.
+    Each transaction lands in `output_file.format(year=booking_date.year)` so a
+    single import that spans multiple years (or none specified at all) splits
+    cleanly into the per-year files the user already has on disk.
     """
     for r in results:
         if r.action != "new" or not r.new_entry_text:
@@ -414,8 +399,9 @@ def _persist_results(
             bank_cfg = config.bank(r.source_txn.bank_key)
         except KeyError:
             continue
-        target_year = year if year is not None else r.source_txn.booking_date.year
-        out_path = _resolve(base_dir, bank_cfg.output_file, target_year)
+        out_path = _resolve(
+            base_dir, bank_cfg.output_file, r.source_txn.booking_date.year
+        )
         append_entry(r.new_entry_text, out_path, dry_run=dry_run)
 
 
@@ -508,67 +494,80 @@ def _aggregate_preview(results: list[ImportResult]) -> dict[str, _PreviewStats]:
 
 
 def _print_preview_table(results: list[ImportResult]) -> None:
-    """Render a per-bank breakdown matching the legacy importer's style:
-    indented hierarchy with absolute counts and percentages, plus colors that
-    flag manual work (cyan), auto-applied (green/yellow), and unmatched bean
-    entries when relevant. Per-bank section followed by a TOTAL when more
-    than one bank is in play.
+    """Render the preview as one block per booking-year, plus an overall total.
+
+    Each year-block lists every bank that contributed transactions in that
+    year, followed by a per-year subtotal — that's what the user actually
+    plans against (and what the per-year `.bean` files reflect on disk). When
+    more than one year is in play, an OVERALL TOTAL is appended at the end.
     """
     if not results:
         return
 
-    by_bank = _aggregate_preview(results)
-    totals = _PreviewStats()
-    for s in by_bank.values():
-        totals.add(s)
+    by_year: dict[int, list[ImportResult]] = {}
+    for r in results:
+        by_year.setdefault(r.source_txn.booking_date.year, []).append(r)
 
     def pct(n: int, denom: int) -> str:
         return f"({n / denom * 100:5.1f}%)" if denom else "(  0.0%)"
 
-    def section(label: str, s: _PreviewStats) -> None:
-        console.print(f"\n  [bold]{label}[/]")
+    def section(label: str, s: _PreviewStats, indent: str = "  ") -> None:
+        console.print(f"\n{indent}[bold]{label}[/]")
         denom = s.total
+        body = indent + "  "
         console.print(
-            f"    CSV transactions:     [bold]{s.total:4d}[/]  [dim]{pct(s.total, denom)}[/]"
+            f"{body}CSV transactions:     [bold]{s.total:4d}[/]  [dim]{pct(s.total, denom)}[/]"
         )
         console.print(
-            f"    Already matched:      {s.matched:4d}  [dim]{pct(s.matched, denom)}[/]"
+            f"{body}Already matched:      {s.matched:4d}  [dim]{pct(s.matched, denom)}[/]"
         )
         if s.update_total:
             console.print(
-                f"    Would update:         [yellow]{s.update_total:4d}[/]  [yellow]{pct(s.update_total, denom)}[/]"
+                f"{body}Would update:         [yellow]{s.update_total:4d}[/]  [yellow]{pct(s.update_total, denom)}[/]"
             )
             if s.update_auto:
                 console.print(
-                    f"      - Auto (rule):      [yellow]{s.update_auto:4d}[/]  [yellow]{pct(s.update_auto, denom)}[/]"
+                    f"{body}  - Auto (rule):      [yellow]{s.update_auto:4d}[/]  [yellow]{pct(s.update_auto, denom)}[/]"
                 )
             if s.update_manual:
                 console.print(
-                    f"      - Manual:           [cyan]{s.update_manual:4d}[/]  [cyan]{pct(s.update_manual, denom)}[/]"
+                    f"{body}  - Manual:           [cyan]{s.update_manual:4d}[/]  [cyan]{pct(s.update_manual, denom)}[/]"
                 )
         if s.import_total:
             console.print(
-                f"    Would import:         [green]{s.import_total:4d}[/]  [green]{pct(s.import_total, denom)}[/]"
+                f"{body}Would import:         [green]{s.import_total:4d}[/]  [green]{pct(s.import_total, denom)}[/]"
             )
             if s.import_auto:
                 console.print(
-                    f"      - Auto (rule):      [green]{s.import_auto:4d}[/]  [green]{pct(s.import_auto, denom)}[/]"
+                    f"{body}  - Auto (rule):      [green]{s.import_auto:4d}[/]  [green]{pct(s.import_auto, denom)}[/]"
                 )
             if s.import_manual:
                 console.print(
-                    f"      - Manual:           [cyan]{s.import_manual:4d}[/]  [cyan]{pct(s.import_manual, denom)}[/]"
+                    f"{body}  - Manual:           [cyan]{s.import_manual:4d}[/]  [cyan]{pct(s.import_manual, denom)}[/]"
                 )
 
     rule = "  " + "─" * 66
+    overall = _PreviewStats()
     console.print(rule)
-    console.print(f"  [bold]Preview[/]")
-    for bank in sorted(by_bank):
-        section(bank.upper(), by_bank[bank])
-    if len(by_bank) > 1:
-        section("TOTAL", totals)
+    console.print("  [bold]Preview[/]")
 
-    manual = totals.update_manual + totals.import_manual
-    auto = totals.update_auto + totals.import_auto
+    for year in sorted(by_year):
+        console.print(f"\n  [bold magenta]── {year} ──[/]")
+        year_results = by_year[year]
+        by_bank = _aggregate_preview(year_results)
+        year_total = _PreviewStats()
+        for bank in sorted(by_bank):
+            section(bank.upper(), by_bank[bank], indent="    ")
+            year_total.add(by_bank[bank])
+        section(f"{year} TOTAL", year_total, indent="    ")
+        overall.add(year_total)
+
+    if len(by_year) > 1:
+        console.print(f"\n  [bold magenta]── OVERALL ──[/]")
+        section("TOTAL", overall, indent="    ")
+
+    manual = overall.update_manual + overall.import_manual
+    auto = overall.update_auto + overall.import_auto
     console.print()
     if manual:
         console.print(f"  [cyan]→ {manual} transaction(s) need manual attention[/]")
