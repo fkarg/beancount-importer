@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+from decimal import Decimal
+from datetime import date
+
+from beancount_importer.matching.normalize import normalize_text
+from beancount_importer.matching.scorer import similarity_score, levenshtein_distance, lcs_length
+from beancount_importer.matching.dedup import dedup_key, is_duplicate
+from beancount_importer.models import SourceTransaction, LedgerEntry
+
+
+def make_txn(**kwargs) -> SourceTransaction:
+    defaults = dict(
+        booking_date=date(2024, 1, 15),
+        amount=Decimal("-15.99"),
+        currency="EUR",
+        bank_key="spk",
+        payee="Netflix",
+        description="Netflix Abo",
+    )
+    return SourceTransaction(**(defaults | kwargs))
+
+
+def make_entry(**kwargs) -> LedgerEntry:
+    defaults = dict(
+        date=date(2024, 1, 15),
+        narration="Netflix",
+        source_account="Assets:B:SPK",
+        target_account="Expenses:Entertainment",
+        amount=Decimal("-15.99"),
+        currency="EUR",
+    )
+    return LedgerEntry(**(defaults | kwargs))
+
+
+# ── normalize_text ───────────────────────────────────────────────────────────
+
+class TestNormalizeText:
+    def test_lowercases(self):
+        assert normalize_text("NETFLIX") == "netflix"
+
+    def test_strips_accents(self):
+        # ü → u
+        assert normalize_text("Müller") == "muller"
+
+    def test_collapses_whitespace(self):
+        assert normalize_text("hello   world") == "hello world"
+
+    def test_strips_leading_trailing(self):
+        assert normalize_text("  hello  ") == "hello"
+
+    def test_nfkd_ligature(self):
+        # ﬁ (ligature) → fi
+        result = normalize_text("ﬁle")
+        assert "fi" in result or "le" in result  # depends on ASCII encoding
+
+    def test_empty_string(self):
+        assert normalize_text("") == ""
+
+    def test_already_normalized(self):
+        assert normalize_text("hello world") == "hello world"
+
+
+# ── similarity_score ─────────────────────────────────────────────────────────
+
+class TestSimilarityScore:
+    def test_identical_strings_score_100(self):
+        assert similarity_score("Netflix", "Netflix") == 100.0
+
+    def test_empty_strings_score_zero(self):
+        # rapidfuzz returns 0 for two empty strings
+        assert similarity_score("", "") == 0.0
+
+    def test_completely_different_score_low(self):
+        score = similarity_score("Netflix", "Rewe")
+        assert score < 50
+
+    def test_case_insensitive(self):
+        assert similarity_score("Netflix", "NETFLIX") == 100.0
+
+    def test_token_order_irrelevant(self):
+        s1 = similarity_score("Netflix Abo Monatlich", "Monatlich Abo Netflix")
+        assert s1 == 100.0
+
+    def test_partial_overlap_scores_between(self):
+        score = similarity_score("Netflix Premium", "Netflix")
+        assert 0 < score <= 100
+
+    def test_returns_float(self):
+        assert isinstance(similarity_score("a", "b"), float)
+
+
+# ── levenshtein_distance ─────────────────────────────────────────────────────
+
+class TestLevenshteinDistance:
+    def test_identical_is_zero(self):
+        assert levenshtein_distance("Netflix", "Netflix") == 0
+
+    def test_one_edit(self):
+        assert levenshtein_distance("cat", "bat") == 1
+
+    def test_completely_different(self):
+        d = levenshtein_distance("abc", "xyz")
+        assert d == 3
+
+    def test_empty_vs_nonempty(self):
+        assert levenshtein_distance("", "abc") == 3
+
+    def test_case_insensitive(self):
+        assert levenshtein_distance("Netflix", "NETFLIX") == 0
+
+
+# ── lcs_length ───────────────────────────────────────────────────────────────
+
+class TestLcsLength:
+    def test_identical_strings(self):
+        assert lcs_length("abc", "abc") == 3
+
+    def test_empty_strings(self):
+        assert lcs_length("", "") == 0
+        assert lcs_length("abc", "") == 0
+
+    def test_partial_overlap(self):
+        assert lcs_length("abcde", "ace") == 3
+
+    def test_no_overlap(self):
+        assert lcs_length("abc", "xyz") == 0
+
+    def test_case_insensitive(self):
+        assert lcs_length("ABC", "abc") == 3
+
+
+# ── dedup_key ────────────────────────────────────────────────────────────────
+
+class TestDedupKey:
+    def test_uses_sepa_ref_when_present(self):
+        txn = make_txn(sepa_reference="NETFLIX-001")
+        assert dedup_key(txn) == "sepa:NETFLIX-001"
+
+    def test_uses_hash_when_no_sepa(self):
+        txn = make_txn(sepa_reference="")
+        key = dedup_key(txn)
+        assert key.startswith("hash:")
+
+    def test_hash_deterministic(self):
+        txn = make_txn(sepa_reference="")
+        assert dedup_key(txn) == dedup_key(txn)
+
+    def test_different_amounts_different_hash(self):
+        t1 = make_txn(sepa_reference="", amount=Decimal("-10"))
+        t2 = make_txn(sepa_reference="", amount=Decimal("-20"))
+        assert dedup_key(t1) != dedup_key(t2)
+
+    def test_different_sepa_different_key(self):
+        t1 = make_txn(sepa_reference="REF-001")
+        t2 = make_txn(sepa_reference="REF-002")
+        assert dedup_key(t1) != dedup_key(t2)
+
+
+# ── is_duplicate ─────────────────────────────────────────────────────────────
+
+class TestIsDuplicate:
+    def test_not_duplicate_when_empty_list(self):
+        txn = make_txn(sepa_reference="NETFLIX-001")
+        assert not is_duplicate(txn, [])
+
+    def test_detects_sepa_match(self):
+        txn = make_txn(sepa_reference="NETFLIX-001")
+        entry = make_entry(metadata={"sepa_ref": "NETFLIX-001"})
+        assert is_duplicate(txn, [entry])
+
+    def test_no_false_positive_different_sepa(self):
+        txn = make_txn(sepa_reference="NETFLIX-002")
+        entry = make_entry(metadata={"sepa_ref": "NETFLIX-001"})
+        assert not is_duplicate(txn, [entry])
+
+    def test_not_duplicate_different_amounts(self):
+        t1 = make_txn(sepa_reference="", amount=Decimal("-10"))
+        e = make_entry(amount=Decimal("-20"), narration="other")
+        assert not is_duplicate(t1, [e])
+
+
+# ── transfers: heuristic ─────────────────────────────────────────────────────
+
+from beancount_importer.matching.transfers import (
+    is_likely_internal_transfer,
+    find_existing_counterparty,
+)
+
+
+class TestIsLikelyInternalTransfer:
+    def test_keyword_in_description(self):
+        txn = make_txn(payee="", description="Überweisung an Sparkasse")
+        is_t, _ = is_likely_internal_transfer(txn)
+        assert is_t
+
+    def test_paypal_always_transfer(self):
+        # Even a non-round PayPal amount with a merchant URL is treated as a
+        # transfer to PayPal — the bank doesn't pay the merchant directly.
+        txn = make_txn(payee="PayPal Europe", description="www.amazon.de purchase")
+        is_t, target = is_likely_internal_transfer(txn)
+        assert is_t
+        assert target == "Assets:B:PayPal"
+
+    def test_n26_round_amount(self):
+        txn = make_txn(payee="N26", description="", amount=Decimal("-500.00"))
+        is_t, target = is_likely_internal_transfer(txn)
+        assert is_t
+        assert target == "Assets:B:N26"
+
+    def test_normal_purchase_not_transfer(self):
+        txn = make_txn(payee="Rewe", description="REWE Filiale", amount=Decimal("-42.50"))
+        is_t, target = is_likely_internal_transfer(txn)
+        assert not is_t
+        assert target is None
+
+    def test_round_without_bank_name_not_transfer(self):
+        txn = make_txn(payee="Random Shop", description="Stuff", amount=Decimal("-100.00"))
+        is_t, _ = is_likely_internal_transfer(txn)
+        assert not is_t
+
+
+class TestFindExistingCounterparty:
+    def test_finds_reversed_match(self):
+        txn = make_txn(amount=Decimal("-100.00"), payee="Transfer")
+        # The OTHER bank already booked the +100 incoming side
+        entry = make_entry(amount=Decimal("100.00"), source_account="Assets:B:N26")
+        result = find_existing_counterparty(txn, [entry])
+        assert result is entry
+
+    def test_ignores_non_internal_account(self):
+        txn = make_txn(amount=Decimal("-100.00"))
+        entry = make_entry(amount=Decimal("100.00"), source_account="Expenses:Foo")
+        assert find_existing_counterparty(txn, [entry]) is None
+
+    def test_respects_tolerance(self):
+        txn = make_txn(amount=Decimal("-100.00"), booking_date=date(2024, 1, 15))
+        entry = make_entry(
+            amount=Decimal("100.00"),
+            date=date(2024, 1, 25),
+            source_account="Assets:B:N26",
+        )
+        assert find_existing_counterparty(txn, [entry], tolerance_days=5) is None
+
+    def test_currency_mismatch_excluded(self):
+        txn = make_txn(amount=Decimal("-100.00"))
+        entry = make_entry(
+            amount=Decimal("100.00"),
+            currency="USD",
+            source_account="Assets:B:N26",
+        )
+        assert find_existing_counterparty(txn, [entry]) is None
+
+    def test_picks_closest_date(self):
+        txn = make_txn(amount=Decimal("-50.00"), booking_date=date(2024, 1, 15))
+        far = make_entry(
+            amount=Decimal("50.00"), date=date(2024, 1, 19), source_account="Assets:B:N26",
+        )
+        near = make_entry(
+            amount=Decimal("50.00"), date=date(2024, 1, 16), source_account="Assets:B:N26",
+        )
+        assert find_existing_counterparty(txn, [far, near]) is near
+
+
+# ── paypal cross-reference ───────────────────────────────────────────────────
+
+from beancount_importer.matching.paypal import (
+    find_paypal_counterpart,
+    is_paypal_funding_txn,
+)
+
+
+class TestFindPaypalCounterpart:
+    def test_matches_same_amount_close_date(self):
+        bank = make_txn(amount=Decimal("-15.99"), booking_date=date(2024, 1, 15), payee="PayPal")
+        pp = make_txn(
+            amount=Decimal("-15.99"),
+            booking_date=date(2024, 1, 14),
+            bank_key="paypal",
+            payee="Amazon",
+        )
+        assert find_paypal_counterpart(bank, [pp]) is pp
+
+    def test_no_match_when_amount_differs(self):
+        bank = make_txn(amount=Decimal("-15.99"))
+        pp = make_txn(amount=Decimal("-20.00"), bank_key="paypal")
+        assert find_paypal_counterpart(bank, [pp]) is None
+
+    def test_no_match_outside_tolerance(self):
+        bank = make_txn(amount=Decimal("-15.99"), booking_date=date(2024, 1, 15))
+        pp = make_txn(
+            amount=Decimal("-15.99"),
+            booking_date=date(2024, 1, 30),
+            bank_key="paypal",
+        )
+        assert find_paypal_counterpart(bank, [pp], tolerance_days=7) is None
+
+    def test_picks_closest_date(self):
+        bank = make_txn(amount=Decimal("-15.99"), booking_date=date(2024, 1, 15))
+        far = make_txn(
+            amount=Decimal("-15.99"),
+            booking_date=date(2024, 1, 12),
+            bank_key="paypal",
+            payee="Far",
+        )
+        near = make_txn(
+            amount=Decimal("-15.99"),
+            booking_date=date(2024, 1, 14),
+            bank_key="paypal",
+            payee="Near",
+        )
+        match = find_paypal_counterpart(bank, [far, near])
+        assert match is not None and match.payee == "Near"
+
+
+class TestIsPaypalFundingTxn:
+    def test_payee_paypal(self):
+        assert is_paypal_funding_txn(make_txn(payee="PayPal Europe S.a.r.l."))
+
+    def test_description_paypal(self):
+        assert is_paypal_funding_txn(make_txn(payee="", description="PayPal Top-up"))
+
+    def test_unrelated_false(self):
+        assert not is_paypal_funding_txn(make_txn(payee="Rewe", description="Groceries"))

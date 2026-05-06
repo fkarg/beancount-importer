@@ -1,0 +1,17 @@
+2024-01-01 open Assets:B:SPK EUR
+2024-01-01 open Expenses:Entertainment EUR
+2024-01-01 open Expenses:Groceries EUR
+2024-01-01 open Income:Salary EUR
+
+2024-01-15 * "Netflix" "Netflix Abo"
+  sepa_ref: "NETFLIX-001"
+  Assets:B:SPK                   -15.99 EUR
+  Expenses:Entertainment          15.99 EUR
+
+2024-01-16 * "Rewe" "Einkauf"
+  Assets:B:SPK                   -42.50 EUR
+  Expenses:Groceries              42.50 EUR
+
+2024-01-17 * "Arbeitgeber" "Gehalt Januar"
+  Assets:B:SPK                  3000.00 EUR
+  Income:Salary                -3000.00 EUR
