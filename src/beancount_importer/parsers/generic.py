@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from decimal import Decimal
+from pathlib import Path
 from typing import Iterator
 
 from beancount_importer.config import BankConfig
@@ -38,6 +39,69 @@ def _read_with_fallback(file_path: str, primary: str) -> str:
     )
 
 
+def _cell_to_str(value: object) -> str:
+    """Best-effort coerce an xlrd cell value to the string shape `_parse_row` expects.
+
+    xlrd hands back floats for numeric cells and Python strings for text. We
+    keep numbers as their plain decimal repr (no scientific notation) so the
+    locale-aware amount/date parsers see the same string content they would
+    from a CSV column.
+    """
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.10f}".rstrip("0").rstrip(".")
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _read_xls_rows(
+    file_path: str, field_date: str, field_amount: str
+) -> Iterator[dict[str, str]]:
+    """Read the first sheet of an .xls workbook and yield CSV-DictReader-shaped rows.
+
+    Bank xls exports usually carry several rows of human-readable preamble
+    (account holder, date range, balance) before the actual table — the Zinia
+    "Amazon Visa" export ships 11 such rows. We auto-locate the header row by
+    scanning for one that contains both `field_date` and `field_amount`, then
+    treat every subsequent row whose date column is non-empty as a data row
+    (skipping the blank separator row Zinia injects between header and body).
+
+    `xlrd<2.0` is the only library that still reads the legacy .xls binary
+    format; openpyxl handles xlsx only. We import it lazily so users who never
+    touch xls don't pay the import cost.
+    """
+    import xlrd  # type: ignore[import-not-found]
+
+    workbook = xlrd.open_workbook(file_path)
+    sheet = workbook.sheet_by_index(0)
+
+    header_row_idx = -1
+    for r in range(sheet.nrows):
+        cells = [_cell_to_str(c).strip() for c in sheet.row_values(r)]
+        if field_date in cells and field_amount in cells:
+            header_row_idx = r
+            break
+    if header_row_idx < 0:
+        raise ValueError(
+            f"could not locate header row in {file_path}: "
+            f"no row contains both {field_date!r} and {field_amount!r}"
+        )
+
+    headers = [_cell_to_str(c).strip() for c in sheet.row_values(header_row_idx)]
+    for r in range(header_row_idx + 1, sheet.nrows):
+        values = [_cell_to_str(c).strip() for c in sheet.row_values(r)]
+        # Pad/truncate to header length so dict construction is well-defined.
+        if len(values) < len(headers):
+            values = values + [""] * (len(headers) - len(values))
+        row = dict(zip(headers, values))
+        # Skip the blank separator row most banks insert between header and body.
+        if not row.get(field_date, "").strip():
+            continue
+        yield row
+
+
 class GenericCsvParser:
     """Config-driven parser; handles any bank described entirely by BankConfig.csv."""
 
@@ -70,14 +134,23 @@ class GenericCsvParser:
 
     def parse(self, file_path: str) -> Iterator[SourceTransaction]:
         csv_cfg = self._csv
-        # Banks ship CSVs in mixed encodings — Sparkasse exports are typically
-        # cp1252/latin-1 (the BOM-prefixed UTF-8 variant only landed recently).
-        # Try the configured encoding first, then walk through the usual German
-        # bank fallbacks. We decode upfront so a mid-file invalid byte fails
-        # fast instead of yielding partial rows.
-        text = _read_with_fallback(file_path, csv_cfg.encoding)
-        reader = csv.DictReader(text.splitlines(), delimiter=csv_cfg.delimiter)
-        for row in reader:
+        suffix = Path(file_path).suffix.lower()
+        if suffix in (".xls", ".xlsx"):
+            rows: Iterator[dict[str, str]] = _read_xls_rows(
+                file_path, csv_cfg.field_date, csv_cfg.field_amount
+            )
+        else:
+            # Banks ship CSVs in mixed encodings — Sparkasse exports are
+            # typically cp1252/latin-1 (the BOM-prefixed UTF-8 variant only
+            # landed recently). Try the configured encoding first, then walk
+            # through the usual German bank fallbacks. We decode upfront so
+            # a mid-file invalid byte fails fast instead of yielding partial
+            # rows.
+            text = _read_with_fallback(file_path, csv_cfg.encoding)
+            rows = iter(
+                csv.DictReader(text.splitlines(), delimiter=csv_cfg.delimiter)
+            )
+        for row in rows:
             txn = self._parse_row(row)
             if txn is not None:
                 yield txn

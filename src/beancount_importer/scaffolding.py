@@ -105,15 +105,18 @@ _LEGACY_CSV_DEFAULTS: dict[str, dict[str, Any]] = {
         "field_description": "description",
     },
     "zinia": {
-        # Best-effort skeleton — the legacy ZiniaParser was never fully
-        # implemented, so the user will need to fill these in once they have
-        # an actual export to inspect.
+        # Zinia (Amazon Visa) exports are .xls workbooks with a multi-row
+        # preamble — `_read_xls_rows` auto-locates the header. delimiter and
+        # encoding are unused on the xls path but the schema still requires
+        # them.
         "delimiter": ",",
         "encoding": "utf-8",
-        "date_format": ["%Y-%m-%d"],
-        "amount_locale": "en",
-        "field_date": "Date",
-        "field_amount": "Amount",
+        "date_format": ["%d.%m.%Y"],
+        "amount_locale": "de",
+        "field_date": "Datum",
+        "field_amount": "Betrag",
+        "field_payee": "Beschreibung",
+        "field_description": ["Umsatzkategorie", "Unterkategorie"],
     },
 }
 
@@ -128,7 +131,7 @@ _LEGACY_FILE_GLOBS: dict[str, str] = {
     "n26": "../documents/**/N26_*.csv",
     "paypal": "../documents/**/PayPal_*.csv",
     "cash": "../documents/cash.csv",
-    "zinia": "../documents/**/Zinia_*.csv",
+    "zinia": "../documents/**/Zinia_*.xls",
 }
 
 

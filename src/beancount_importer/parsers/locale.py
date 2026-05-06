@@ -17,18 +17,38 @@ def parse_date(value: str, formats: list[str]) -> date:
     raise ValueError(f"Cannot parse date {value!r} with formats {formats}")
 
 
+_CURRENCY_SYMBOLS = ("€", "$", "£", "¥", "EUR", "USD", "GBP", "CHF")
+
+
+def _strip_amount_decoration(value: str) -> tuple[str, bool]:
+    """Strip whitespace, currency symbols, and a leading sign from `value`.
+
+    Returns (cleaned_digits, negative). Zinia exports look like `+184,90 €`
+    and `-43,22 €` — same shape as bank CSVs except for the trailing currency
+    symbol — so we centralize the decoration handling here rather than push
+    it into each callsite.
+    """
+    s = value.strip().replace("\xa0", "")
+    for sym in _CURRENCY_SYMBOLS:
+        if s.endswith(sym):
+            s = s[: -len(sym)].rstrip()
+        elif s.startswith(sym):
+            s = s[len(sym) :].lstrip()
+    if not s:
+        raise ValueError("Empty amount string")
+    negative = s.startswith("-")
+    if negative or s.startswith("+"):
+        s = s[1:].strip()
+    return s, negative
+
+
 def parse_amount_de(value: str) -> Decimal:
     """Parse German locale amount: 1.234,56 → Decimal('1234.56')."""
-    value = value.strip().replace("\xa0", "")
-    if not value:
-        raise ValueError("Empty amount string")
-    negative = value.startswith("-")
-    if negative:
-        value = value[1:].strip()
+    s, negative = _strip_amount_decoration(value)
     # Remove thousand separators (dots), replace decimal comma with dot
-    value = value.replace(".", "").replace(",", ".")
+    s = s.replace(".", "").replace(",", ".")
     try:
-        result = Decimal(value)
+        result = Decimal(s)
     except InvalidOperation:
         raise ValueError(f"Cannot parse German amount {value!r}")
     return -result if negative else result
@@ -36,16 +56,11 @@ def parse_amount_de(value: str) -> Decimal:
 
 def parse_amount_en(value: str) -> Decimal:
     """Parse English locale amount: 1,234.56 → Decimal('1234.56')."""
-    value = value.strip().replace("\xa0", "")
-    if not value:
-        raise ValueError("Empty amount string")
-    negative = value.startswith("-")
-    if negative:
-        value = value[1:].strip()
+    s, negative = _strip_amount_decoration(value)
     # Remove thousand separators (commas)
-    value = value.replace(",", "")
+    s = s.replace(",", "")
     try:
-        result = Decimal(value)
+        result = Decimal(s)
     except InvalidOperation:
         raise ValueError(f"Cannot parse English amount {value!r}")
     return -result if negative else result
