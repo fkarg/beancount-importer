@@ -11,6 +11,8 @@ one `run()` call. The session itself is frozen.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -569,3 +571,164 @@ def _format_new_entry(
         postings=postings,
         metadata=metadata,
     )
+
+
+# ── Preview-only: reverse provenance stats ────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class BeanProvenanceStats:
+    """Per-(bank, year) reverse-matching counts for the preview.
+
+    `total_in_bean`: existing ledger entries booked into this bank's account.
+    `bean_unmatched`: subset that have no matching CSV row across any bank.
+    `bean_expanded`: post-plugin transaction count from `bean-query`. Zero
+    when the count was not collected (no `main_bean` configured, file
+    missing, or `bean-query` unavailable).
+    """
+
+    bank: str
+    year: int
+    total_in_bean: int = 0
+    bean_unmatched: int = 0
+    bean_expanded: int = 0
+
+
+def _amount_cents(amount) -> int:
+    return int(round(float(amount) * 100))
+
+
+def _has_csv_match(
+    entry: LedgerEntry,
+    csv_txns: list[SourceTransaction],
+    tolerance_days: int = 5,
+) -> bool:
+    """Mirror of the reference's bean-vs-csv reverse match: amount cents
+    must agree exactly, booking date within `tolerance_days`. Also accepts
+    matches against any of the entry's `metadata_dates` (settle/paypal/actual)
+    so plugin-rewritten dates don't show up as unmatched."""
+    target_cents = _amount_cents(entry.amount)
+    candidate_dates = (entry.date, *entry.metadata_dates)
+    for csv_txn in csv_txns:
+        if _amount_cents(csv_txn.amount) != target_cents:
+            continue
+        for d in candidate_dates:
+            if abs((csv_txn.booking_date - d).days) <= tolerance_days:
+                return True
+    return False
+
+
+def compute_bean_provenance_stats(
+    session: ImportSession,
+    base_dir: Path,
+) -> dict[tuple[str, int], BeanProvenanceStats]:
+    """Per-(bank, year) bean-side stats for the preview.
+
+    Independent of `run()` to avoid widening the pipeline's return type.
+    Reuses the same loaders so the entries and CSV rows match exactly what
+    `run()` would have seen.
+    """
+    config = session.config
+    year_filter = session.options.year_filter
+    banks = _select_banks(session)
+
+    csv_by_bank: dict[str, list[SourceTransaction]] = {}
+    bean_by_bank: dict[str, list[LedgerEntry]] = {}
+
+    for bank in banks:
+        parser = _build_parser(bank)
+        txns: list[SourceTransaction] = []
+        for csv_file in _gather_csv_files(bank, base_dir):
+            try:
+                txns.extend(parser.parse(str(csv_file)))
+            except Exception:
+                continue
+        if year_filter is not None:
+            allowed = set(year_filter)
+            txns = [t for t in txns if t.booking_date.year in allowed]
+        csv_by_bank[bank.key] = txns
+        bean_by_bank[bank.key] = _load_existing(
+            bank,
+            base_dir,
+            year_filter,
+            config.transactions_dir,
+            metadata_date_keys=tuple(config.matching.metadata_date_keys),
+            synthesize_from_metadata=dict(config.matching.synthesize_from_metadata),
+        )
+
+    all_csv: list[SourceTransaction] = [t for ts in csv_by_bank.values() for t in ts]
+
+    stats: dict[tuple[str, int], BeanProvenanceStats] = {}
+    expanded = _expanded_counts(config, base_dir, banks, year_filter)
+
+    for bank in banks:
+        # Group entries by year, honouring the active year_filter.
+        years_present: dict[int, list[LedgerEntry]] = {}
+        for entry in bean_by_bank[bank.key]:
+            if year_filter is not None and entry.date.year not in year_filter:
+                continue
+            years_present.setdefault(entry.date.year, []).append(entry)
+
+        for year, entries in years_present.items():
+            unmatched = sum(1 for e in entries if not _has_csv_match(e, all_csv))
+            stats[(bank.key, year)] = BeanProvenanceStats(
+                bank=bank.key,
+                year=year,
+                total_in_bean=len(entries),
+                bean_unmatched=unmatched,
+                bean_expanded=expanded.get((bank.key, year), 0),
+            )
+
+    return stats
+
+
+def _expanded_counts(
+    config,
+    base_dir: Path,
+    banks: list[BankConfig],
+    year_filter: tuple[int, ...] | None,
+) -> dict[tuple[str, int], int]:
+    """Run `bean-query` once per (bank, year) to get the plugin-expanded count.
+
+    Silently returns an empty mapping when `main_bean` is unset, the file
+    does not exist, or `bean-query` is missing. This is a "nice to have"
+    line in the preview; no error should derail the rest of the report.
+    """
+    main_bean_template: str | None = getattr(config, "main_bean", None)
+    if not main_bean_template:
+        return {}
+    if shutil.which("bean-query") is None:
+        return {}
+
+    if year_filter is None:
+        return {}
+
+    counts: dict[tuple[str, int], int] = {}
+    for year in year_filter:
+        main_bean_path = (base_dir / main_bean_template.format(year=year)).resolve()
+        if not main_bean_path.exists():
+            continue
+        for bank in banks:
+            query = (
+                f"SELECT count(date) WHERE date >= {year}-01-01"
+                f" AND date < {year + 1}-01-01"
+                f" AND account ~ '{bank.account}'"
+            )
+            try:
+                result = subprocess.run(
+                    ["bean-query", str(main_bean_path), query],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode != 0:
+                continue
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    counts[(bank.key, year)] = int(line)
+                    break
+
+    return counts

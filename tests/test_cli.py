@@ -93,6 +93,32 @@ class TestImportYearPreview:
         # should leave exactly 2 transactions accounted for.
         assert "new=2" in result.output
 
+    def test_preview_shows_bean_provenance_when_ledger_present(
+        self, project_dir: Path
+    ):
+        # An existing SPK ledger entry that no CSV row matches — the preview
+        # should call it out as having no CSV source.
+        year_dir = project_dir / "transactions" / "2024"
+        year_dir.mkdir(parents=True)
+        (year_dir / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-03-04 * "Cash" "no csv source"
+              Assets:B:SPK  -7.50 EUR
+              Expenses:Cash  7.50 EUR
+        """))
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "2024",
+                "--config",
+                str(project_dir / "import_config.toml"),
+                "--preview",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "No source provenanace:" in result.output
+        assert "Transactions:" in result.output
+
 
 class TestInit:
     def test_init_writes_starter_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

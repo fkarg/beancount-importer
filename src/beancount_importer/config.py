@@ -139,6 +139,11 @@ class Config(BaseModel):
     tag_state_file: str = "tag_state.json"
     documents_dir: str = "../documents"
     transactions_dir: str = "../transactions"
+    # Path to the top-level beancount file used by `bean-query` to compute
+    # the plugin-expanded transaction count shown in the preview. May contain
+    # `{year}` for per-year main files. Optional — the count is skipped if
+    # the file does not exist or `bean-query` is not on PATH.
+    main_bean: str | None = None
     skip_update_patterns: list[SkipUpdatePattern] = []
     transforms: TransformsConfig = TransformsConfig()
     matching: MatchingConfig = MatchingConfig()

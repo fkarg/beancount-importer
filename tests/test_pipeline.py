@@ -23,6 +23,7 @@ from beancount_importer.models import (
 from beancount_importer.pipeline import (
     CategorizeContext,
     NoopReporter,
+    compute_bean_provenance_stats,
     run,
 )
 from beancount_importer.replay import DecisionLog
@@ -473,3 +474,102 @@ class TestPipelineCrossBank:
         assert len(results) == 1
         assert results[0].action == "update"
         assert results[0].proposed_changes == []
+
+
+# ── Reverse provenance: bean entries that lack a CSV row ─────────────────────
+
+
+class TestBeanProvenanceStats:
+    def _bank(self) -> BankConfig:
+        return make_spk_bank(year_template_output=False)
+
+    def test_counts_total_bean_entries_per_year(self, tmp_path: Path):
+        # Two SPK ledger entries in 2024, one in 2023.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+
+            2024-02-01 * "Mystery" "Cash withdraw"
+              Assets:B:SPK  -50.00 EUR
+              Expenses:Cash  50.00 EUR
+
+            2023-12-01 * "Old" "from last year"
+              Assets:B:SPK  -1.00 EUR
+              Expenses:Misc  1.00 EUR
+        """))
+        # No CSV files at all.
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        assert stats[("spk", 2024)].total_in_bean == 2
+        assert stats[("spk", 2024)].bean_unmatched == 2
+        assert stats[("spk", 2023)].total_in_bean == 1
+        assert stats[("spk", 2023)].bean_unmatched == 1
+
+    def test_csv_match_reduces_unmatched(self, tmp_path: Path):
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+
+            2024-02-01 * "Mystery" "Cash withdraw"
+              Assets:B:SPK  -50.00 EUR
+              Expenses:Cash  50.00 EUR
+        """))
+        # CSV row matches the Netflix entry; the cash withdrawal stays unmatched.
+        write_spk_csv(tmp_path / "SPK_jan.csv")  # 3 rows in 2024-01
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        assert stats[("spk", 2024)].total_in_bean == 2
+        assert stats[("spk", 2024)].bean_unmatched == 1
+
+    def test_year_filter_scopes_results(self, tmp_path: Path):
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "X" ""
+              Assets:B:SPK  -1.00 EUR
+              Expenses:X  1.00 EUR
+
+            2023-06-01 * "Y" ""
+              Assets:B:SPK  -2.00 EUR
+              Expenses:Y  2.00 EUR
+        """))
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        opts = ImportOptions(year_filter=(2024,))
+        session = ImportSession(config=cfg, options=opts)
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        assert ("spk", 2024) in stats
+        assert ("spk", 2023) not in stats
+
+    def test_expanded_count_skipped_without_main_bean(self, tmp_path: Path):
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "X" ""
+              Assets:B:SPK  -1.00 EUR
+              Expenses:X  1.00 EUR
+        """))
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # No `main_bean` configured ⇒ expanded count is reported as zero.
+        assert stats[("spk", 2024)].bean_expanded == 0

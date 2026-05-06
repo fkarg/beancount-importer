@@ -30,7 +30,9 @@ from beancount_importer.models import (
     SourceTransaction,
 )
 from beancount_importer.pipeline import (
+    BeanProvenanceStats,
     CategorizeContext,
+    compute_bean_provenance_stats,
     run as run_pipeline,
 )
 from beancount_importer.replay import DecisionLog
@@ -380,7 +382,8 @@ def main(
     _persist_new_rules(results, list(rules), rules_path, dry_run=skip_persist)
     _persist_tag_updates(results, tag_state, tags_path, dry_run=skip_persist)
     if preview:
-        _print_preview_table(results)
+        bean_stats = compute_bean_provenance_stats(session, base_dir)
+        _print_preview_table(results, bean_stats)
     _print_summary(results, dry_run=skip_persist)
 
 
@@ -451,6 +454,12 @@ class _PreviewStats:
     update_manual: int = 0
     import_auto: int = 0
     import_manual: int = 0
+    # Reverse-matching: ledger entries observed for this bank in this year,
+    # the subset with no CSV provenance, and the plugin-expanded count from
+    # `bean-query` (zero when not collected).
+    total_in_bean: int = 0
+    bean_unmatched: int = 0
+    bean_expanded: int = 0
 
     @property
     def update_total(self) -> int:
@@ -467,9 +476,16 @@ class _PreviewStats:
         self.update_manual += other.update_manual
         self.import_auto += other.import_auto
         self.import_manual += other.import_manual
+        self.total_in_bean += other.total_in_bean
+        self.bean_unmatched += other.bean_unmatched
+        self.bean_expanded += other.bean_expanded
 
 
-def _aggregate_preview(results: list[ImportResult]) -> dict[str, _PreviewStats]:
+def _aggregate_preview(
+    results: list[ImportResult],
+    bean_stats: dict[tuple[str, int], BeanProvenanceStats],
+    year: int,
+) -> dict[str, _PreviewStats]:
     by_bank: dict[str, _PreviewStats] = {}
     for r in results:
         bank = r.source_txn.bank_key
@@ -489,16 +505,34 @@ def _aggregate_preview(results: list[ImportResult]) -> dict[str, _PreviewStats]:
                 s.import_auto += 1
             else:
                 s.import_manual += 1
+
+    # Fold in bean-side stats for every bank that has ledger entries for
+    # this year, even those without any CSV rows in the import set.
+    for (bank_key, bean_year), prov in bean_stats.items():
+        if bean_year != year:
+            continue
+        s = by_bank.setdefault(bank_key, _PreviewStats())
+        s.total_in_bean = prov.total_in_bean
+        s.bean_unmatched = prov.bean_unmatched
+        s.bean_expanded = prov.bean_expanded
     return by_bank
 
 
-def _print_preview_table(results: list[ImportResult]) -> None:
-    if not results:
+def _print_preview_table(
+    results: list[ImportResult],
+    bean_stats: dict[tuple[str, int], BeanProvenanceStats] | None = None,
+) -> None:
+    bean_stats = bean_stats or {}
+    if not results and not bean_stats:
         return
 
     by_year: dict[int, list[ImportResult]] = {}
     for r in results:
         by_year.setdefault(r.source_txn.booking_date.year, []).append(r)
+    # Years that only show up via bean-side data (e.g., the user is
+    # checking last year's ledger after CSVs were already imported).
+    for (_, bean_year) in bean_stats:
+        by_year.setdefault(bean_year, [])
 
     def pct(n: int, denom: int) -> str:
         return f"({n / denom * 100:5.1f}%)" if denom else "(  0.0%)"
@@ -538,6 +572,22 @@ def _print_preview_table(results: list[ImportResult]) -> None:
                     f"{body}  - Manual:           [cyan]{s.import_manual:4d}[/]  [cyan]{pct(s.import_manual, denom)}[/]"
                 )
 
+        if s.total_in_bean or s.bean_unmatched or s.bean_expanded:
+            console.print(f"{body}[dim]---[/]")
+            if s.bean_expanded and s.bean_expanded != s.total_in_bean:
+                console.print(
+                    f"{body}Expanded:             {s.bean_expanded:4d}"
+                )
+            if s.total_in_bean:
+                console.print(
+                    f"{body}Transactions:         {s.total_in_bean:4d}  [dim](100.0%)[/]"
+                )
+            if s.bean_unmatched:
+                bean_denom = s.total_in_bean
+                console.print(
+                    f"{body}No source provenance: [magenta]{s.bean_unmatched:4d}[/]  [magenta]{pct(s.bean_unmatched, bean_denom)}[/]"
+                )
+
     rule = "  " + "─" * 66
     overall = _PreviewStats()
     console.print(rule)
@@ -546,7 +596,7 @@ def _print_preview_table(results: list[ImportResult]) -> None:
     for year in sorted(by_year):
         console.print(f"\n  [bold magenta]── {year} ──[/]")
         year_results = by_year[year]
-        by_bank = _aggregate_preview(year_results)
+        by_bank = _aggregate_preview(year_results, bean_stats, year)
         year_total = _PreviewStats()
         for bank in sorted(by_bank):
             section(bank.upper(), by_bank[bank], indent="    ")
