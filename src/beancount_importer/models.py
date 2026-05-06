@@ -43,6 +43,16 @@ class LedgerEntry(BaseModel):
     line_start: int = 0
     line_end: int = 0
     file_path: str = ""
+    # True when the source posting's amount was inferred by beancount (the
+    # leg had no explicit number in the file). Used to recognise cross-bank
+    # transit entries — e.g., the `Assets:B:PayPal` leg of an SPK→PayPal
+    # transfer is inferred, while a real PayPal-CSV-derived entry has it
+    # written explicitly.
+    amount_inferred: bool = False
+    # Alternate dates extracted from posting-level metadata (`actual:`,
+    # `paypal:`, `settle:`, …). The user's plugins move postings to these
+    # dates; matching against the original CSV row should consider both.
+    metadata_dates: tuple[date, ...] = ()
 
 
 class ProposedChange(NamedTuple):

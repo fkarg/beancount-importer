@@ -13,6 +13,13 @@ DEFAULT_MAX_DATE_DAYS = 14
 TEXT_WEIGHT = 0.7
 DATE_WEIGHT = 0.3
 SEPA_BONUS = 0.5  # added (then clipped to 1.0) when SEPA refs match exactly
+# Cross-bank "transit" matches (entries where the source posting was inferred
+# by beancount, e.g. the PayPal leg of an SPK→PayPal transfer) compare a
+# CSV row to bookkeeping that intentionally describes the *funding bank's*
+# perspective — so the text barely overlaps with the merchant on the CSV
+# side. A flat confidence floor based on amount+date is more reliable than
+# the text-weighted formula in that case.
+CROSS_BANK_FIXED_SCORE = 0.85
 
 
 def similarity_score(a: str, b: str) -> float:
@@ -42,6 +49,16 @@ def lcs_length(a: str, b: str) -> int:
     return prev[n]
 
 
+def _candidate_dates(entry: LedgerEntry) -> tuple:
+    """All dates we'll consider when scoring `entry` against a CSV txn.
+
+    Includes the entry's own date plus any alternate dates extracted from
+    posting-level metadata (`actual:`, `paypal:`, `settle:`). Returning a
+    tuple of date objects keeps the scorer free of metadata-key knowledge.
+    """
+    return (entry.date,) + tuple(entry.metadata_dates)
+
+
 def score_candidate(
     txn: SourceTransaction,
     entry: LedgerEntry,
@@ -53,23 +70,43 @@ def score_candidate(
 
     Hard filters return 0.0 immediately:
     - currency mismatch
-    - amount mismatch (signs must agree unless `include_reversed_sign`)
-    - date difference > max_date_days
+    - amount mismatch (signs must agree unless `include_reversed_sign` or
+      the entry's source-posting amount was inferred — see `amount_inferred`)
+    - date difference > max_date_days, where "date" is the closest of
+      `entry.date` and any `entry.metadata_dates`
 
     Otherwise: weighted combination of text similarity (payee+narration vs.
     payee+description) and date proximity, plus a SEPA-reference bonus.
+    For inferred-amount (cross-bank transit) entries we score on amount+date
+    only and return a flat confidence — the text fields describe the funding
+    bank, not the merchant the CSV row references.
     """
     if txn.currency != entry.currency:
         return 0.0
-    if include_reversed_sign:
+
+    # Cross-bank transit entries can legitimately match the CSV row with
+    # opposite sign: the funding bank's bookkeeping shows money flowing
+    # *into* the transit account, while the CSV records the user paying
+    # *out of* it (or vice versa for top-ups).
+    allow_reversed = include_reversed_sign or entry.amount_inferred
+    if allow_reversed:
         if abs(txn.amount) != abs(entry.amount):
             return 0.0
     elif txn.amount != entry.amount:
         return 0.0
 
-    days_apart = abs((txn.booking_date - entry.date).days)
+    days_apart = min(
+        abs((txn.booking_date - d).days) for d in _candidate_dates(entry)
+    )
     if days_apart > max_date_days:
         return 0.0
+
+    if entry.amount_inferred:
+        # Amount + close date on a transit-account entry is already a strong
+        # signal; the descriptive text is from the wrong perspective. Returning
+        # a fixed confidence avoids text-similarity noise pulling the score
+        # below `min_score`.
+        return CROSS_BANK_FIXED_SCORE
 
     txn_text = " ".join(filter(None, [txn.payee, txn.description]))
     entry_text = " ".join(filter(None, [entry.payee, entry.narration]))

@@ -110,6 +110,20 @@ class MatchingConfig(BaseModel):
     transfer_tolerance_days: int = 5
     transit_account: str = "Assets:Extern:Transit"
     internal_transfer_account_prefixes: list[str] = ["Assets:B:", "Liabilities:CreditCard:"]
+    # Posting-level metadata keys whose value is parsed as an alternate
+    # transaction date. Defaults match the user's `plugins/actual.py`,
+    # `plugins/settle.py`, and `plugins/settle_inv.py` conventions; users
+    # without those plugins can leave the defaults — the keys simply won't
+    # appear in their ledgers and have no effect.
+    metadata_date_keys: list[str] = ["actual", "paypal", "settle"]
+    # Maps a posting-level metadata key to the account that the user's
+    # plugin synthesizes a posting on at load time. With
+    # `plugin "plugins.settle_inv" "Assets:B:PayPal"`, an SPK posting
+    # carrying `paypal: 2024-01-17` is split — at runtime — into a separate
+    # PayPal-side transaction on 2024-01-17. We don't run plugins, so the
+    # importer reconstructs that virtual entry from the metadata to make
+    # cross-bank matching work without the plugin loaded.
+    synthesize_from_metadata: dict[str, str] = {}
 
 
 class Config(BaseModel):

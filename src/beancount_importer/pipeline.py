@@ -112,6 +112,8 @@ def _load_existing(
     base_dir: Path,
     years: tuple[int, ...] | None,
     transactions_dir: str,
+    metadata_date_keys: tuple[str, ...] = (),
+    synthesize_from_metadata: dict[str, str] | None = None,
 ) -> list[LedgerEntry]:
     """Load every already-imported entry for `bank`, across all years.
 
@@ -129,6 +131,11 @@ def _load_existing(
     """
     seen_paths: set[Path] = set()
     entries: list[LedgerEntry] = []
+    read_kwargs: dict = {}
+    if metadata_date_keys:
+        read_kwargs["metadata_date_keys"] = metadata_date_keys
+    if synthesize_from_metadata:
+        read_kwargs["synthesize_from_metadata"] = synthesize_from_metadata
 
     if years:
         for year in years:
@@ -138,7 +145,7 @@ def _load_existing(
                     continue
                 seen_paths.add(path)
                 if path.exists():
-                    entries.extend(read_ledger(path, bank.account))
+                    entries.extend(read_ledger(path, bank.account, **read_kwargs))
 
     tx_root = (base_dir / transactions_dir).resolve()
     if tx_root.exists():
@@ -146,7 +153,7 @@ def _load_existing(
             if bean in seen_paths:
                 continue
             seen_paths.add(bean)
-            entries.extend(read_ledger(bean, bank.account))
+            entries.extend(read_ledger(bean, bank.account, **read_kwargs))
 
     return entries
 
@@ -197,7 +204,14 @@ def run(
         if year_filter is not None:
             allowed = set(year_filter)
             txns = [t for t in txns if t.booking_date.year in allowed]
-        existing = _load_existing(bank, base_dir, year_filter, config.transactions_dir)
+        existing = _load_existing(
+            bank,
+            base_dir,
+            year_filter,
+            config.transactions_dir,
+            metadata_date_keys=tuple(config.matching.metadata_date_keys),
+            synthesize_from_metadata=dict(config.matching.synthesize_from_metadata),
+        )
         work.append(_BankWork(bank, parser, txns, existing))
 
     transforms = load_transforms(config.transforms.enabled)
@@ -492,6 +506,15 @@ def _diff_changes(
     changes: list[ProposedChange] = []
     suppress_all = rule.suppress_updates if rule else False
     if suppress_all:
+        return []
+
+    # Cross-bank transit match: the matched entry lives in another bank's
+    # ledger (e.g., the PayPal leg of an SPK→PayPal transfer). The CSV row
+    # being imported describes the *merchant* side; the existing entry
+    # describes the *funding* side. Updating the funding-bank's payee or
+    # narration from a PayPal-CSV proposal is wrong — it'd corrupt the
+    # original SPK booking. Treat the row as already accounted for.
+    if entry.amount_inferred:
         return []
 
     if proposal.payee and proposal.payee != (entry.payee or ""):
