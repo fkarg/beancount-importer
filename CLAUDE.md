@@ -13,7 +13,7 @@ uv run pytest                                    # full test suite
 uv run pytest tests/test_pipeline.py -k year_filter  # single test / feature
 uv run ruff check src tests                      # lint
 uv run pyrefly check src tests                   # type-check
-uv run beancount-import --help                   # CLI entry point
+uv run bean-import --help                        # CLI entry point
 ```
 
 ## Architecture

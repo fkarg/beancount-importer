@@ -1,10 +1,7 @@
 """Command-line entry point.
 
-Two subcommands today:
-- `import`: load config + rules + tag state, drive the pipeline, write
-  the resulting beancount entries, and persist any new rules / tag deltas.
-- `init`: write a starter `import_config.toml` next to a fresh `transactions/`
-  tree so a user can get going without copying boilerplate.
+One command: `bean-import`. Pass no flags to run the import interactively.
+Use `--init` to scaffold a new project, `--migrate` to migrate a legacy setup.
 
 Interactive prompts live here and only here. The pipeline never reads stdin
 or writes to stdout — all user contact funnels through the `categorize_fn`
@@ -44,7 +41,7 @@ from beancount_importer.session import ImportOptions, ImportSession
 
 
 app = typer.Typer(
-    no_args_is_help=True,
+    no_args_is_help=False,
     add_completion=False,
     help="Modular beancount CSV importer.",
 )
@@ -214,15 +211,57 @@ def _resolve(base: Path, template: str, year: int) -> Path:
     return (base / template.format(year=year)).resolve()
 
 
-# ── Commands ──────────────────────────────────────────────────────────────────
+# ── Init / migrate helpers ────────────────────────────────────────────────────
 
 
-@app.command("import")
-def import_command(
+def _run_init(target: Path) -> None:
+    """Write a starter `.beancount-importer/config.toml` and project skeleton.
+
+    Layout produced:
+      <target>/.beancount-importer/config.toml
+      <target>/transactions/
+      <target>/documents/
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    config_dir = target / ".beancount-importer"
+    config_dir.mkdir(exist_ok=True)
+    cfg_path = config_dir / "config.toml"
+    if cfg_path.exists():
+        console.print(f"[yellow]exists:[/] {cfg_path} (not overwriting)")
+    else:
+        cfg_path.write_text(_STARTER_CONFIG, encoding="utf-8")
+        console.print(f"[green]wrote[/] {cfg_path}")
+    (target / "transactions").mkdir(exist_ok=True)
+    (target / "documents").mkdir(exist_ok=True)
+    console.print(
+        f"Edit {cfg_path.relative_to(target)} and add a `[[banks]]` entry per bank."
+    )
+
+
+def _run_migrate(project_dir: Path) -> None:
+    """Migrate a legacy importer setup in place.
+
+    Writes `import_config.toml`, `categorization_rules.json`, and
+    `.import_tag_state.json` next to the existing legacy files. Existing files
+    are never overwritten — re-run safely after hand-edits.
+    """
+    if not project_dir.exists():
+        console.print(f"[red]not found:[/] {project_dir}")
+        raise typer.Exit(code=2)
+    from beancount_importer.scaffolding import migrate_legacy
+
+    migrate_legacy(project_dir, console=console)
+
+
+# ── Main command ──────────────────────────────────────────────────────────────
+
+
+@app.command()
+def main(
     years: Annotated[
         list[int] | None,
         typer.Argument(
-            help="Years to process. With none, every parsed transaction is considered. Pass one or more (e.g. `import 2022 2023`) to scope by booking year. Each new entry is always filed under transactions/<its-booking-year>/.",
+            help="Years to process. With none, every parsed transaction is considered.",
         ),
     ] = None,
     config_path: Annotated[
@@ -250,7 +289,7 @@ def import_command(
         typer.Option(
             "--year-filter",
             "-Y",
-            help="Restrict to transactions whose booking date falls in these years. Equivalent to passing the years as positional arguments; takes precedence when both are given.",
+            help="Restrict to transactions whose booking date falls in these years. Takes precedence over positional years when both are given.",
         ),
     ] = None,
     auto_threshold: Annotated[
@@ -260,15 +299,39 @@ def import_command(
             help="Score threshold above which matches auto-apply without prompt",
         ),
     ] = None,
+    init: Annotated[
+        bool,
+        typer.Option(
+            "--init",
+            help="Write a starter config and project skeleton in the current directory, then exit",
+        ),
+    ] = False,
+    migrate: Annotated[
+        bool,
+        typer.Option(
+            "--migrate",
+            help="Migrate a legacy importer setup in the current directory, then exit",
+        ),
+    ] = False,
 ) -> None:
-    """Run the import and write new beancount entries.
+    """Import CSV transactions into beancount ledger files.
 
     Examples:
-        import                       # all years, all banks
-        import 2024                  # just 2024
-        import 2022 2023 --preview   # peek at multiple years without writing
-        import 2024 --bank spk       # one bank, one year
+        bean-import                          # all years, all banks
+        bean-import 2024                     # just 2024
+        bean-import 2022 2023 --preview      # peek without writing
+        bean-import 2024 --bank spk          # one bank, one year
+        bean-import --init                   # scaffold a new project
+        bean-import --migrate                # migrate legacy setup
     """
+    if init:
+        _run_init(Path("."))
+        return
+
+    if migrate:
+        _run_migrate(Path("."))
+        return
+
     if not config_path.exists():
         console.print(f"[red]config not found:[/] {config_path}")
         raise typer.Exit(code=2)
@@ -281,11 +344,9 @@ def import_command(
     tags_path = base_dir / config.tag_state_file
 
     rules = tuple(load_rules(rules_path))
-    # Preview mode is a pure read — never write back to the decision log.
     decisions = DecisionLog(None) if preview else DecisionLog(decisions_path)
     tag_state = _load_tag_state(tags_path)
 
-    # `--year-filter` wins, then positional years, else no scoping.
     if year_filter:
         effective_year_filter: tuple[int, ...] | None = tuple(year_filter)
     elif years:
@@ -323,59 +384,6 @@ def import_command(
     _print_summary(results, dry_run=skip_persist)
 
 
-@app.command("init")
-def init(
-    target: Annotated[
-        Path,
-        typer.Argument(help="Project directory to scaffold (created if missing)"),
-    ] = Path("."),
-) -> None:
-    """Write a starter `.beancount-importer/config.toml` and a project skeleton.
-
-    Layout produced:
-      <target>/.beancount-importer/config.toml   (configuration + state lives here)
-      <target>/transactions/                     (per-year .bean files written here)
-      <target>/documents/                        (CSV exports go here)
-    """
-    target.mkdir(parents=True, exist_ok=True)
-    config_dir = target / ".beancount-importer"
-    config_dir.mkdir(exist_ok=True)
-    cfg_path = config_dir / "config.toml"
-    if cfg_path.exists():
-        console.print(f"[yellow]exists:[/] {cfg_path} (not overwriting)")
-    else:
-        cfg_path.write_text(_STARTER_CONFIG, encoding="utf-8")
-        console.print(f"[green]wrote[/] {cfg_path}")
-    (target / "transactions").mkdir(exist_ok=True)
-    (target / "documents").mkdir(exist_ok=True)
-    console.print(
-        f"Edit {cfg_path.relative_to(target)} and add a `[[banks]]` entry per bank."
-    )
-
-
-@app.command("migrate-from-legacy")
-def migrate_from_legacy(
-    project_dir: Annotated[
-        Path,
-        typer.Argument(
-            help="Directory holding the old import_transactions.py + .import_config.json"
-        ),
-    ] = Path("."),
-) -> None:
-    """Migrate a legacy importer setup in place.
-
-    Writes `import_config.toml`, `categorization_rules.json`, and
-    `.import_tag_state.json` next to the existing legacy files. Existing files
-    are never overwritten — re-run safely after hand-edits.
-    """
-    if not project_dir.exists():
-        console.print(f"[red]not found:[/] {project_dir}")
-        raise typer.Exit(code=2)
-    from beancount_importer.scaffolding import migrate_legacy
-
-    migrate_legacy(project_dir, console=console)
-
-
 # ── Result persistence ────────────────────────────────────────────────────────
 
 
@@ -386,12 +394,7 @@ def _persist_results(
     *,
     dry_run: bool,
 ) -> None:
-    """Append each new entry to its bank's output file, routed by booking year.
-
-    Each transaction lands in `output_file.format(year=booking_date.year)` so a
-    single import that spans multiple years (or none specified at all) splits
-    cleanly into the per-year files the user already has on disk.
-    """
+    """Append each new entry to its bank's output file, routed by booking year."""
     for r in results:
         if r.action != "new" or not r.new_entry_text:
             continue
@@ -443,7 +446,7 @@ def _persist_tag_updates(
 @dataclass
 class _PreviewStats:
     total: int = 0
-    matched: int = 0  # already in ledger or would update with no actual changes
+    matched: int = 0
     update_auto: int = 0
     update_manual: int = 0
     import_auto: int = 0
@@ -475,10 +478,6 @@ def _aggregate_preview(results: list[ImportResult]) -> dict[str, _PreviewStats]:
         if r.action == "skip":
             s.matched += 1
         elif r.action == "update":
-            # An "update" with no actual proposed changes is just a match
-            # against an already-imported entry. The legacy preview rolled
-            # these into already-matched; do the same so the counts mean
-            # what they look like.
             if not r.proposed_changes:
                 s.matched += 1
             elif r.rule_matched is not None:
@@ -494,13 +493,6 @@ def _aggregate_preview(results: list[ImportResult]) -> dict[str, _PreviewStats]:
 
 
 def _print_preview_table(results: list[ImportResult]) -> None:
-    """Render the preview as one block per booking-year, plus an overall total.
-
-    Each year-block lists every bank that contributed transactions in that
-    year, followed by a per-year subtotal — that's what the user actually
-    plans against (and what the per-year `.bean` files reflect on disk). When
-    more than one year is in play, an OVERALL TOTAL is appended at the end.
-    """
     if not results:
         return
 
@@ -579,9 +571,6 @@ def _print_preview_table(results: list[ImportResult]) -> None:
 def _print_summary(results: list[ImportResult], *, dry_run: bool) -> None:
     counts: dict[str, int] = {}
     for r in results:
-        # An "update" with no proposed changes means the txn matches an
-        # existing entry verbatim — present it as a skip so the headline
-        # counts agree with the per-bank breakdown.
         action = r.action
         if action == "update" and not r.proposed_changes:
             action = "skip"

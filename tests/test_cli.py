@@ -64,7 +64,6 @@ class TestImportYearPreview:
         result = runner.invoke(
             app,
             [
-                "import",
                 "2024",
                 "--config",
                 str(project_dir / "import_config.toml"),
@@ -80,7 +79,6 @@ class TestImportYearPreview:
         result = runner.invoke(
             app,
             [
-                "import",
                 "2024",
                 "--config",
                 str(project_dir / "import_config.toml"),
@@ -97,26 +95,28 @@ class TestImportYearPreview:
 
 
 class TestInit:
-    def test_init_writes_starter_config(self, tmp_path: Path):
+    def test_init_writes_starter_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
         runner = CliRunner()
-        result = runner.invoke(app, ["init", str(tmp_path)])
+        result = runner.invoke(app, ["--init"])
         assert result.exit_code == 0, result.output
         assert (tmp_path / ".beancount-importer" / "config.toml").exists()
         assert (tmp_path / "transactions").is_dir()
         assert (tmp_path / "documents").is_dir()
 
-    def test_init_does_not_overwrite(self, tmp_path: Path):
+    def test_init_does_not_overwrite(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         config_dir = tmp_path / ".beancount-importer"
         config_dir.mkdir()
         existing = config_dir / "config.toml"
         existing.write_text("# user-edited\n")
+        monkeypatch.chdir(tmp_path)
         runner = CliRunner()
-        runner.invoke(app, ["init", str(tmp_path)])
+        runner.invoke(app, ["--init"])
         assert existing.read_text() == "# user-edited\n"
 
 
 class TestMigrateFromLegacy:
-    def test_writes_files_in_place(self, tmp_path: Path):
+    def test_writes_files_in_place(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         (tmp_path / ".import_config.json").write_text(textwrap.dedent("""\
             {
               "rules": [
@@ -128,8 +128,9 @@ class TestMigrateFromLegacy:
               }
             }
         """))
+        monkeypatch.chdir(tmp_path)
         runner = CliRunner()
-        result = runner.invoke(app, ["migrate-from-legacy", str(tmp_path)])
+        result = runner.invoke(app, ["--migrate"])
         assert result.exit_code == 0, result.output
         config_dir = tmp_path / ".beancount-importer"
         assert (config_dir / "config.toml").exists()

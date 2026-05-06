@@ -17,7 +17,7 @@ uv tool install --editable /path/to/beancount-importer
 on your `PATH` without reinstalling. After install:
 
 ```sh
-beancount-import --help
+bean-import --help
 ```
 
 If you previously installed a non-editable version (`uv tool install beancount-importer`
@@ -25,10 +25,10 @@ without `--editable`), reinstall it once with `--reinstall --editable` so future
 source changes flow through. To verify which copy is on your `PATH`:
 
 ```sh
-head -1 $(which beancount-import)   # should point inside ~/.local/share/uv/tools/
+head -1 $(which bean-import)   # should point inside ~/.local/share/uv/tools/
 ```
 
-For development against the checkout itself, `uv sync` + `uv run beancount-import`
+For development against the checkout itself, `uv sync` + `uv run bean-import`
 also works.
 
 ## First-time setup
@@ -37,7 +37,7 @@ Pick a directory that will hold your ledger, rules, and CSV exports:
 
 ```sh
 mkdir -p ~/finances && cd ~/finances
-beancount-import init .
+bean-import --init
 ```
 
 This produces:
@@ -83,9 +83,9 @@ field_sepa_reference = "Kundenreferenz"
 ## Running an import
 
 ```sh
-uv run beancount-import import                    # all years, all banks
-uv run beancount-import import 2024               # just 2024
-uv run beancount-import import 2022 2023 2024     # multiple years
+uv run bean-import                    # all years, all banks
+uv run bean-import 2024               # just 2024
+uv run bean-import 2022 2023 2024     # multiple years
 ```
 
 This will:
@@ -112,13 +112,13 @@ Examples:
 
 ```sh
 # Peek at every CSV the importer can see, across all years
-uv run beancount-import import --preview
+uv run bean-import --preview
 
 # See what 2022 + 2023 would look like
-uv run beancount-import import 2022 2023 --preview
+uv run bean-import 2022 2023 --preview
 
 # Just process the SPK bank for one year
-uv run beancount-import import 2024 -b spk
+uv run bean-import 2024 -b spk
 ```
 
 ## Migrating from the old vibe-coded importer
@@ -129,7 +129,7 @@ fresh `.beancount-importer/` folder next to it:
 
 ```sh
 cd ~/finances
-beancount-import migrate-from-legacy
+bean-import --migrate
 ```
 
 Output layout:
@@ -183,7 +183,7 @@ your-project/
 └── transactions/
     └── 2024/
         ├── SPK.bean               # appended to by `import 2024 --bank spk`
-        └── N26.bean
+        └── N26.bean               ← appended to by `bean-import 2024 --bank n26`
 ```
 
 The decision log persists user choices for transactions that are *not* rule-driven

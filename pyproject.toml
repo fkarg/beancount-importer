@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-beancount-import = "beancount_importer.cli:app"
+bean-import = "beancount_importer.cli:app"
 
 [build-system]
 requires = ["hatchling"]

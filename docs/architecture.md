@@ -1,4 +1,4 @@
-# Architecture: `beancount-importer`
+# Architecture: `bean-importer`
 
 _Clean-sheet design for an open-source, modular beancount CSV importer._
 _Written 2026-05-04. All decisions finalized._
@@ -9,7 +9,7 @@ _Written 2026-05-04. All decisions finalized._
 
 - **Zero hardcoded banks.** Adding a new bank should need only a config section; Python code only when the format is truly unusual.
 - **Zero private data in the repo.** Account names, file paths, rule patterns all come from user config, not the package.
-- **Installable and composable.** `uv add beancount-importer` gives a working CLI; users extend it without forking.
+- **Installable and composable.** `uv add bean-importer` gives a working CLI; users extend it without forking.
 - **Testable from the start.** Every layer has a clean interface; no global state; no interactive prompts in tests.
 - **beancount-first I/O.** No hand-rolled `.bean` parsers; beancount v3 AST for reads, its printer for writes.
 - **Modular pipeline.** Stages are independently testable. Logic changes don't touch UI code and vice versa.
@@ -56,7 +56,7 @@ Features to preserve from the existing implementation (used as behavioral refere
 ## Package Layout
 
 ```
-beancount-importer/
+bean-importer/
 ├── pyproject.toml
 ├── README.md
 ├── docs/
@@ -394,8 +394,8 @@ The `BankConfig` Pydantic model validates bank entries. The `source_files` field
 Config values are overridable via environment variables through `pydantic-settings`:
 
 ```bash
-BEANCOUNT_IMPORT_DRY_RUN=1 uv run beancount-import 2025
-BEANCOUNT_IMPORT_BANK=spk uv run beancount-import 2025
+BEANCOUNT_IMPORT_DRY_RUN=1 uv run bean-import 2025
+BEANCOUNT_IMPORT_BANK=spk uv run bean-import 2025
 ```
 
 ---
@@ -934,7 +934,7 @@ Test categories:
 
 ```toml
 [project]
-name = "beancount-importer"
+name = "bean-importer"
 version = "0.1.0"
 description = "Modular CSV importer for beancount ledgers"
 readme = "README.md"
@@ -947,11 +947,11 @@ dependencies = [
     "rapidfuzz>=3.0",
     "typer>=0.12",
     "rich>=13.0",
-    "tomli-w>=1.0",             # write TOML (for `beancount-import init`)
+    "tomli-w>=1.0",             # write TOML (for `bean-import init`)
 ]
 
 [project.scripts]
-beancount-import = "beancount_importer.cli:app"
+bean-import = "beancount_importer.cli:app"
 
 [build-system]
 requires = ["hatchling"]
@@ -1005,7 +1005,7 @@ field_payee       = "Gläubiger-ID"
 field_description = "Verwendungszweck"
 ```
 
-`uv run beancount-import 2025 --bank dkb` — done.
+`uv run bean-import 2025 --bank dkb` — done.
 
 ### Custom format (Python escape hatch)
 
@@ -1044,7 +1044,7 @@ The reference implementation at `~/finances/import_transactions.py` stores confi
 | `active_tag` + `recent_tags` | `.import_tag_state.json` |
 | One-off interactive decisions (not previously persisted) | `.import_decisions.jsonl` (new) |
 
-Ship a one-shot `beancount-import migrate-from-legacy <path-to-old.json>` that emits the three new files. The migration is read-only of the original; the user reviews and commits.
+Ship a one-shot `bean-import --migrate` (run from the project directory) that emits the three new files. The migration is read-only of the original; the user reviews and commits.
 
 ---
 
