@@ -354,3 +354,122 @@ class TestPipelineBankFilter:
         )
         results = run(session, base_dir, fixed_categorize(), NoopReporter())
         assert all(r.source_txn.bank_key == "spk" for r in results)
+
+
+# ── Cross-bank matching: PayPal CSV against an SPK→PayPal entry ─────────────
+
+
+class TestPipelineCrossBank:
+    """A PayPal CSV row should match against a transit-leg entry that lives
+    in another bank's ledger file. This covers the two main pathways:
+
+    1. The other bank's entry has an explicit `Assets:B:PayPal` posting with
+       no number (beancount infers the amount).
+    2. The other bank's entry only has a metadata hint (`paypal: <date>`)
+       that a user-installed plugin would split at load time.
+    """
+
+    def _write_paypal_csv(self, path: Path, row: str) -> None:
+        path.write_text(
+            "Date,Description,Currency,Gross\n"
+            f"{row}\n"
+        )
+
+    def _make_paypal_bank(self) -> BankConfig:
+        return BankConfig(
+            key="paypal",
+            display_name="PayPal",
+            account="Assets:B:PayPal",
+            file_glob="PayPal_*.csv",
+            output_file="paypal.bean",
+            csv=CsvConfig(
+                delimiter=",",
+                date_format=["%Y-%m-%d"],
+                amount_locale="en",
+                field_date="Date",
+                field_amount="Gross",
+                field_currency="Currency",
+                field_description="Description",
+            ),
+        )
+
+    def test_inferred_paypal_leg_matches_csv_row(self, tmp_path: Path):
+        # SPK-side entry where PayPal posting amount is inferred.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(
+            '2024-04-13 * "Google Payment" "PayPal Einkauf"\n'
+            '  Assets:B:SPK  -3.39 EUR\n'
+            '  Assets:B:PayPal\n'
+        )
+        # PayPal CSV: same purchase, opposite sign, on the same/nearby date.
+        self._write_paypal_csv(
+            tmp_path / "PayPal_2024.csv",
+            "2024-04-13,Google Payment,EUR,-3.39",
+        )
+        cfg = Config(
+            banks=[self._make_paypal_bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 1
+        # Cross-bank transit match → no proposed changes → counts as matched.
+        assert results[0].action == "update"
+        assert results[0].proposed_changes == []
+        assert results[0].matched_entry is not None
+        assert results[0].matched_entry.amount_inferred is True
+
+    def test_paypal_metadata_synthesizes_match(self, tmp_path: Path):
+        # SPK entry with `paypal: <date>` metadata — plugin would split this
+        # into a separate PayPal transaction at load time. Without the
+        # plugin, the importer reconstructs the virtual entry from config.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(
+            '2024-04-13 * "Google Payment" ""\n'
+            '  Assets:B:SPK  -3.39 EUR\n'
+            '    paypal: 2024-04-11\n'
+            '  Expenses:Apps  3.39 EUR\n'
+        )
+        # PayPal CSV records the actual purchase date.
+        self._write_paypal_csv(
+            tmp_path / "PayPal_2024.csv",
+            "2024-04-11,Google Payment,EUR,-3.39",
+        )
+        cfg = Config(
+            banks=[self._make_paypal_bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(
+                min_score=0.35,
+                synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
+            ),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 1
+        assert results[0].action == "update"
+        assert results[0].proposed_changes == []
+
+    def test_funding_bank_can_be_n26(self, tmp_path: Path):
+        # Same shape as above but the transit leg lives on N26 instead of
+        # SPK — proves the cross-bank matching is bank-agnostic.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "N26.bean").write_text(
+            '2024-05-01 * "PayPal" "Top-up"\n'
+            '  Assets:B:N26  -50.00 EUR\n'
+            '  Assets:B:PayPal\n'
+        )
+        self._write_paypal_csv(
+            tmp_path / "PayPal_2024.csv",
+            "2024-05-01,Bank Deposit,EUR,50.00",
+        )
+        cfg = Config(
+            banks=[self._make_paypal_bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 1
+        assert results[0].action == "update"
+        assert results[0].proposed_changes == []
