@@ -2,6 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+This is a public repository rewrite of a vibe-coded beancount importer script. Do not leak financials.
+The reference implementation is in ~/finances/import_transactions.py
+
 ## Commands
 
 ```sh
