@@ -124,6 +124,15 @@ class MatchingConfig(BaseModel):
     # importer reconstructs that virtual entry from the metadata to make
     # cross-bank matching work without the plugin loaded.
     synthesize_from_metadata: dict[str, str] = {}
+    # Cross-source matchers run before user prompting: they spot duplicates
+    # already booked in another bank's ledger (skip), or rewrite a proposal's
+    # target account when a row is part of a known cross-source pair (e.g.,
+    # PayPal-funded SPK debit → transfer to `Assets:B:PayPal`). Order matters;
+    # the first matcher to fire wins. See `matching/registry.py`.
+    enabled_matchers: list[str] = [
+        "beancount_importer.matching.transfers",
+        "beancount_importer.matching.paypal",
+    ]
 
 
 class Config(BaseModel):

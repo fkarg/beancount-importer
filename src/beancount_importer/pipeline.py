@@ -26,6 +26,12 @@ from beancount_importer.beancount_io.reader import read_ledger_multi
 from beancount_importer.beancount_io.writer import format_transaction
 from beancount_importer.config import BankConfig
 from beancount_importer.matching.dedup import is_duplicate
+from beancount_importer.matching.registry import (
+    MatcherHook,
+    MatchOutcome,
+    first_outcome,
+    load_matchers,
+)
 from beancount_importer.matching.scorer import find_candidates
 from beancount_importer.models import (
     CategoryProposal,
@@ -248,8 +254,15 @@ def run(
     bank_by_key = {b.key: b for b in banks}
 
     transforms = load_transforms(config.transforms.enabled)
+    matchers = load_matchers(list(config.matching.enabled_matchers))
     working_rules: list[CategorizationRule] = list(session.rules)
     working_tag: ActiveTag | None = session.tag_state.active
+
+    # Pre-bucket all CSV rows by bank key so cross-source matchers can scan
+    # the PayPal CSV (or any other bank) without re-iterating `inputs` per call.
+    csv_by_bank: dict[str, list[SourceTransaction]] = {}
+    for t in inputs:
+        csv_by_bank.setdefault(t.bank_key, []).append(t)
 
     total = len(inputs)
     results: list[ImportResult] = []
@@ -263,6 +276,9 @@ def run(
             txn=txn,
             bank=bank_cfg,
             existing=bucket,
+            existing_all=existing,
+            csv_by_bank=csv_by_bank,
+            matchers=matchers,
             config=config,
             working_rules=working_rules,
             working_tag=working_tag,
@@ -290,6 +306,9 @@ def _process_transaction(
     txn: SourceTransaction,
     bank: BankConfig,
     existing: list[LedgerEntry],
+    existing_all: list[LedgerEntry],
+    csv_by_bank: dict[str, list[SourceTransaction]],
+    matchers: list[MatcherHook],
     config,  # Config; type omitted to avoid a circular import at type level
     working_rules: list[CategorizationRule],
     working_tag: ActiveTag | None,
@@ -336,15 +355,42 @@ def _process_transaction(
             working_rules,
         )
 
-    # 4. Find rule + ranked candidates.
+    # 4. Cross-source matchers: detect rows already booked elsewhere (skip)
+    # or rows that should book to a non-default account (rewrite_target). The
+    # matcher uses the full CSV+ledger universe, not just the current bank's
+    # bucket. Recorded as a proposal so replay reproduces the outcome without
+    # re-running matchers.
+    matcher_outcome = first_outcome(matchers, txn, csv_by_bank, existing_all)
+    matcher_proposal: CategoryProposal | None = None
+    if matcher_outcome is not None:
+        if matcher_outcome.kind == "skip":
+            return (
+                ImportResult(
+                    source_txn=txn,
+                    action="skip",
+                    proposal=None,
+                    skip_reason="cross_source_match",
+                    matched_entry=matcher_outcome.matched_entry,
+                ),
+                _advance_tag(working_tag, txn.booking_date),
+                working_rules,
+            )
+        # rewrite_target: synthesize a proposal that bypasses the categorizer.
+        matcher_proposal = _proposal_from_outcome(matcher_outcome, txn)
+
+    # 5. Find rule + ranked candidates.
     rule = find_matching_rule(txn, working_rules)
     candidates = find_candidates(
         txn, existing, min_score=config.matching.min_score
     )
 
-    # 5. Auto-categorize when score >= threshold and a rule is available.
+    # 6. Choose the proposal source. Matcher rewrites are authoritative — they
+    # represent ground truth from cross-source data and pre-empt both the
+    # auto-threshold path and the user prompt.
     proposal: CategoryProposal
-    if (
+    if matcher_proposal is not None:
+        proposal = matcher_proposal
+    elif (
         auto_threshold is not None
         and candidates
         and candidates[0][1] >= auto_threshold
@@ -479,6 +525,24 @@ def _matches_skip_pattern(patterns, txn: SourceTransaction) -> bool:
         if re.search(p.pattern, haystack, re.IGNORECASE):
             return True
     return False
+
+
+def _proposal_from_outcome(
+    outcome: MatchOutcome, txn: SourceTransaction
+) -> CategoryProposal:
+    """Build a categorize proposal from a `rewrite_target` matcher outcome.
+
+    The target account comes from the matcher; metadata is folded in verbatim.
+    Payee/narration are left to the existing source transaction defaults so a
+    later rule or user override can still tweak them.
+    """
+    del txn  # currently unused; kept for symmetry with `_proposal_from_rule`
+    assert outcome.target_account is not None
+    return CategoryProposal(
+        action="categorize",
+        postings=(Posting(account=outcome.target_account),),
+        metadata=dict(outcome.metadata),
+    )
 
 
 def _proposal_from_rule(rule: CategorizationRule) -> CategoryProposal:

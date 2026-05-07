@@ -13,7 +13,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from beancount_importer.models import SourceTransaction
+from beancount_importer.matching.registry import MatchOutcome
+from beancount_importer.models import LedgerEntry, SourceTransaction
+
+
+# The PayPal account is the user-side leg the bank-funding row should book to.
+# It's hard-coded for the common SPK/N26-funded-PayPal case; if a user runs
+# multiple PayPal accounts they can copy this matcher and tweak the target.
+_PAYPAL_ACCOUNT = "Assets:B:PayPal"
 
 
 def find_paypal_counterpart(
@@ -54,3 +61,37 @@ def is_paypal_funding_txn(txn: SourceTransaction) -> bool:
     """
     text = f"{(txn.payee or '').lower()} {(txn.description or '').lower()}"
     return "paypal" in text
+
+
+class _PayPalCounterpartMatcher:
+    """When a bank-side row is funded by PayPal and the PayPal CSV records
+    the matching counterpart, rewrite the proposal to be a transfer to the
+    user's PayPal account. The PayPal-CSV row separately books the merchant.
+    """
+
+    name = "paypal_counterpart"
+
+    def match(
+        self,
+        txn: SourceTransaction,
+        all_csv_by_bank: dict[str, list[SourceTransaction]],
+        existing_entries: list[LedgerEntry],
+    ) -> MatchOutcome | None:
+        del existing_entries
+        # Only candidate rows on a non-PayPal bank can fund a PayPal balance.
+        if txn.bank_key == "paypal" or not is_paypal_funding_txn(txn):
+            return None
+        paypal_txns = all_csv_by_bank.get("paypal", [])
+        cp = find_paypal_counterpart(txn, paypal_txns)
+        if cp is None:
+            return None
+        return MatchOutcome(
+            kind="rewrite_target",
+            reason="paypal_counterpart",
+            target_account=_PAYPAL_ACCOUNT,
+            metadata={"paypal": cp.booking_date.isoformat()},
+            matched_txn=cp,
+        )
+
+
+hook = _PayPalCounterpartMatcher()

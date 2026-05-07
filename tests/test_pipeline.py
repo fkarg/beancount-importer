@@ -453,7 +453,10 @@ class TestPipelineCrossBank:
 
     def test_funding_bank_can_be_n26(self, tmp_path: Path):
         # Same shape as above but the transit leg lives on N26 instead of
-        # SPK — proves the cross-bank matching is bank-agnostic.
+        # SPK — proves the cross-bank matching is bank-agnostic. The PayPal
+        # row is a transfer ("Bank Deposit"), so the cross-source matcher
+        # spots the existing N26 leg and skips it before the candidate
+        # scorer runs.
         (tmp_path / "transactions").mkdir()
         (tmp_path / "transactions" / "N26.bean").write_text(
             '2024-05-01 * "PayPal" "Top-up"\n'
@@ -472,8 +475,123 @@ class TestPipelineCrossBank:
         session = ImportSession(config=cfg, options=ImportOptions())
         results = run(session, tmp_path, fixed_categorize(), NoopReporter())
         assert len(results) == 1
-        assert results[0].action == "update"
-        assert results[0].proposed_changes == []
+        assert results[0].action == "skip"
+        assert results[0].skip_reason == "cross_source_match"
+        assert results[0].matched_entry is not None
+        assert results[0].matched_entry.source_account == "Assets:B:N26"
+
+
+class TestPipelineMatchers:
+    """End-to-end tests that exercise cross-source matchers in `run()`."""
+
+    def _spk_csv(self, path: Path, row: str) -> None:
+        path.write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            f"{row}\n"
+        )
+
+    def _paypal_csv(self, path: Path, row: str) -> None:
+        path.write_text("Date,Description,Currency,Gross\n" + f"{row}\n")
+
+    def _make_paypal_bank(self) -> BankConfig:
+        return BankConfig(
+            key="paypal",
+            display_name="PayPal",
+            account="Assets:B:PayPal",
+            file_glob="PayPal_*.csv",
+            output_file="paypal.bean",
+            csv=CsvConfig(
+                delimiter=",",
+                date_format=["%Y-%m-%d"],
+                amount_locale="en",
+                field_date="Date",
+                field_amount="Gross",
+                field_currency="Currency",
+                field_description="Description",
+            ),
+        )
+
+    def test_paypal_funded_spk_row_books_to_paypal_account(self, tmp_path: Path):
+        # SPK CSV has a "PayPal" debit; PayPal CSV records the same amount
+        # near the same date. The matcher rewrites the SPK proposal to be a
+        # transfer to Assets:B:PayPal, with `paypal:` metadata pointing at
+        # the PayPal-side date.
+        self._spk_csv(
+            tmp_path / "SPK_2024.csv",
+            "13.04.24;PayPal;PayPal Einkauf 12345;-3,39;EUR;",
+        )
+        self._paypal_csv(
+            tmp_path / "PayPal_2024.csv",
+            "2024-04-13,Google Payment,EUR,-3.39",
+        )
+        cfg = Config(
+            banks=[
+                make_spk_bank(year_template_output=False),
+                self._make_paypal_bank(),
+            ],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        (tmp_path / "transactions").mkdir()
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+
+        spk_results = [r for r in results if r.source_txn.bank_key == "spk"]
+        assert len(spk_results) == 1
+        spk = spk_results[0]
+        assert spk.action == "new"
+        assert spk.proposal is not None
+        assert spk.proposal.target_account == "Assets:B:PayPal"
+        assert spk.proposal.metadata.get("paypal") == "2024-04-13"
+        assert "Assets:B:PayPal" in spk.new_entry_text
+
+    def test_internal_transfer_matcher_skips_already_booked_leg(
+        self, tmp_path: Path
+    ):
+        # SPK ledger already books the SPK→N26 leg. The N26 CSV row of the
+        # same transfer must be skipped, not reimported.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(
+            '2024-05-01 * "N26" "Überweisung an N26"\n'
+            '  Assets:B:SPK   -50.00 EUR\n'
+            '  Assets:B:N26    50.00 EUR\n'
+        )
+        # N26 CSV has a transfer keyword and the matching counterpart amount.
+        n26_csv = tmp_path / "N26_2024.csv"
+        n26_csv.write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "01.05.24;Sparkasse;Überweisung von SPK;50,00;EUR;\n"
+        )
+        n26_bank = BankConfig(
+            key="n26",
+            display_name="N26",
+            account="Assets:B:N26",
+            file_glob="N26_*.csv",
+            output_file="n26.bean",
+            csv=CsvConfig(
+                delimiter=";",
+                date_format=["%d.%m.%y"],
+                amount_locale="de",
+                field_date="Buchungstag",
+                field_amount="Betrag",
+                field_currency="Waehrung",
+                field_payee="Beguenstigter",
+                field_description="Verwendungszweck",
+                field_sepa_reference="Kundenreferenz",
+            ),
+        )
+        cfg = Config(
+            banks=[n26_bank],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+
+        assert len(results) == 1
+        assert results[0].action == "skip"
+        assert results[0].skip_reason == "cross_source_match"
+        assert results[0].matched_entry is not None
 
 
 # ── Reverse provenance: bean entries that lack a CSV row ─────────────────────

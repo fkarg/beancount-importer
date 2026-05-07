@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from beancount_importer.matching.normalize import normalize_text
+from beancount_importer.matching.registry import MatchOutcome
 from beancount_importer.models import LedgerEntry, SourceTransaction
 
 
@@ -122,3 +123,34 @@ def find_existing_counterparty(
         return None
     candidates.sort(key=lambda t: t[0])
     return candidates[0][1]
+
+
+class _ExistingTransferMatcher:
+    """When a CSV row looks like an internal transfer and the counterparty
+    leg is already booked in the ledger, skip the row — re-importing would
+    create a second booking of the same money movement.
+    """
+
+    name = "existing_transfer"
+
+    def match(
+        self,
+        txn: SourceTransaction,
+        all_csv_by_bank: dict[str, list[SourceTransaction]],
+        existing_entries: list[LedgerEntry],
+    ) -> MatchOutcome | None:
+        del all_csv_by_bank
+        is_transfer, _ = is_likely_internal_transfer(txn)
+        if not is_transfer:
+            return None
+        cp = find_existing_counterparty(txn, existing_entries)
+        if cp is None:
+            return None
+        return MatchOutcome(
+            kind="skip",
+            reason="counterpart_already_booked",
+            matched_entry=cp,
+        )
+
+
+hook = _ExistingTransferMatcher()
