@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import csv
 from decimal import Decimal
-from typing import Iterator
+from collections.abc import Iterator
 
 from beancount_importer.config import BankConfig
 from beancount_importer.models import SourceTransaction

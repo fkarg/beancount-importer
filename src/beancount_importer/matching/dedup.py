@@ -28,10 +28,7 @@ def _content_hash(txn: SourceTransaction) -> str:
 def is_duplicate(txn: SourceTransaction, existing: list[LedgerEntry]) -> bool:
     """Return True if any existing entry has the same dedup key."""
     key = dedup_key(txn)
-    for entry in existing:
-        if _entry_key(entry) == key:
-            return True
-    return False
+    return any(_entry_key(entry) == key for entry in existing)
 
 
 def _entry_key(entry: LedgerEntry) -> str:

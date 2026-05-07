@@ -509,7 +509,6 @@ class TestSpliceEntries:
         # Critical: if bean-check rejects the post-splice file, the writer
         # restores the .bak and raises so the user's ledger is never left
         # in a broken state.
-        import pytest
 
         target = tmp_path / "x.bean"
         original = "L1\nL2\nL3\n"

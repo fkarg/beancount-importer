@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Iterator, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
+from collections.abc import Iterator
 
 from beancount_importer.models import SourceTransaction
 

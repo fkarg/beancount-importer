@@ -49,8 +49,8 @@ def parse_amount_de(value: str) -> Decimal:
     s = s.replace(".", "").replace(",", ".")
     try:
         result = Decimal(s)
-    except InvalidOperation:
-        raise ValueError(f"Cannot parse German amount {value!r}")
+    except InvalidOperation as e:
+        raise ValueError(f"Cannot parse German amount {value!r}") from e
     return -result if negative else result
 
 
@@ -61,8 +61,8 @@ def parse_amount_en(value: str) -> Decimal:
     s = s.replace(",", "")
     try:
         result = Decimal(s)
-    except InvalidOperation:
-        raise ValueError(f"Cannot parse English amount {value!r}")
+    except InvalidOperation as e:
+        raise ValueError(f"Cannot parse English amount {value!r}") from e
     return -result if negative else result
 
 

@@ -84,11 +84,8 @@ class TestParseAmountDe:
 def test_parse_amount_de_roundtrip(units: int, cents: int, negative: bool):
     """Any valid German amount string round-trips through parse_amount_de."""
     cents_str = f"{cents:02d}"
-    if units >= 1000:
-        # format with thousand separator
-        units_str = f"{units:,}".replace(",", ".")
-    else:
-        units_str = str(units)
+    # Format with thousand separator (German uses dots) when >= 1000.
+    units_str = f"{units:,}".replace(",", ".") if units >= 1000 else str(units)
     raw = f"{units_str},{cents_str}"
     if negative:
         raw = f"-{raw}"

@@ -87,7 +87,7 @@ class CategoryProposal(BaseModel):
     narration: str | None = None
     metadata: dict[str, str] = {}
     tag: str | None = None
-    rule_used: "CategorizationRule | None" = None
+    rule_used: CategorizationRule | None = None
     save_as_rule: bool = False
 
     @property
@@ -107,7 +107,7 @@ class ImportResult(BaseModel):
     # The proposal that produced this result. None for "skip"/"quit" without
     # a categorize call. The replay log records it verbatim.
     proposal: CategoryProposal | None = None
-    rule_matched: "CategorizationRule | None" = None
+    rule_matched: CategorizationRule | None = None
     is_replay: bool = False
-    new_rule: "CategorizationRule | None" = None
-    tag_state_delta: "TagStateDelta | None" = None
+    new_rule: CategorizationRule | None = None
+    tag_state_delta: TagStateDelta | None = None

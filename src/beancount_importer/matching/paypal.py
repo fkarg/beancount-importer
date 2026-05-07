@@ -11,7 +11,7 @@ amount + date match; the pipeline rewrites the bank-side proposal accordingly.
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from beancount_importer.models import SourceTransaction
 

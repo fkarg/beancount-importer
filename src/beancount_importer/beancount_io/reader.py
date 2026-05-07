@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date as _date, datetime as _datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 
 from beancount.loader import load_file
 from beancount.core import data as bc_data
@@ -63,15 +63,14 @@ def _extract_entry(
     metadata_date_keys: tuple[str, ...],
 ) -> LedgerEntry | None:
     """Convert a beancount Transaction to LedgerEntry, keyed by source_account."""
-    source_posting = None
-    target_posting = None
+    source_posting: bc_data.Posting | None = None
+    target_posting: bc_data.Posting | None = None
 
     for posting in txn.postings:
         if posting.account == source_account:
             source_posting = posting
-        else:
-            if target_posting is None:
-                target_posting = posting
+        elif target_posting is None:
+            target_posting = posting
 
     if source_posting is None or source_posting.units is None:
         return None
@@ -112,9 +111,9 @@ def _extract_entry(
 
     return LedgerEntry(
         date=txn.date,
-        flag=txn.flag,
+        flag=txn.flag or "*",
         payee=txn.payee,
-        narration=txn.narration,
+        narration=txn.narration or "",
         source_account=source_account,
         target_account=target_account,
         amount=amount,
@@ -183,9 +182,9 @@ def _synthesize_virtual_entries(
             out.append(
                 LedgerEntry(
                     date=metadata_date,
-                    flag=txn.flag,
+                    flag=txn.flag or "*",
                     payee=txn.payee,
-                    narration=txn.narration,
+                    narration=txn.narration or "",
                     source_account=source_account,
                     target_account=target_account,
                     amount=amount,

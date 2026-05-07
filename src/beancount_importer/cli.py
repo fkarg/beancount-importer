@@ -128,7 +128,7 @@ def _render_candidates(ctx: CategorizeContext) -> Table | None:
     return table
 
 
-def make_preview_categorizer() -> "object":
+def make_preview_categorizer() -> object:
     """Non-interactive categorizer used by `--preview`.
 
     Resolution order for the proposal's target account:
@@ -158,7 +158,7 @@ def make_preview_categorizer() -> "object":
     return _fn
 
 
-def make_interactive_categorizer() -> "object":
+def make_interactive_categorizer() -> object:
     """Returns a callable matching `CategorizeFn` that prompts via Rich."""
 
     def _fn(ctx: CategorizeContext) -> CategoryProposal:
@@ -466,7 +466,7 @@ class _PreviewStats:
     def import_total(self) -> int:
         return self.import_auto + self.import_manual
 
-    def add(self, other: "_PreviewStats") -> None:
+    def add(self, other: _PreviewStats) -> None:
         self.total += other.total
         self.matched += other.matched
         self.update_auto += other.update_auto
@@ -602,7 +602,7 @@ def _print_preview_table(
         overall.add(year_total)
 
     if len(by_year) > 1:
-        console.print(f"\n  [bold magenta]── OVERALL ──[/]")
+        console.print("\n  [bold magenta]── OVERALL ──[/]")
         section("TOTAL", overall, indent="    ")
 
     manual = overall.update_manual + overall.import_manual

@@ -1,0 +1,34 @@
+# Pre-commit hooks. Activate via `uv run pre-commit install` once per clone.
+#
+# All hooks shell out through `uv run` so they share the project's locked
+# environment — no separate virtualenvs managed by pre-commit itself.
+# `pass_filenames: false` because every check operates on the whole
+# project (test suite, type-checker, linter), not just the staged subset.
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check
+        entry: uv run ruff check src tests
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: pyrefly
+        name: pyrefly check (src only)
+        # Tests rely on a `**(defaults | kwargs)` factory pattern that
+        # type-checkers cannot narrow accurately; the resulting noise
+        # would drown real bugs. Production code under `src/` is held
+        # to a clean bar.
+        entry: uv run pyrefly check src
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: pytest
+        name: pytest (with coverage gate)
+        entry: uv run pytest
+        language: system
+        pass_filenames: false
+        types: [python]

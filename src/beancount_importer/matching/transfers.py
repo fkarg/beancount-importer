@@ -16,7 +16,7 @@ Two complementary mechanisms:
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from beancount_importer.matching.normalize import normalize_text
 from beancount_importer.models import LedgerEntry, SourceTransaction

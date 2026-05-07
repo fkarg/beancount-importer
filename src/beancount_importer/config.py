@@ -149,7 +149,7 @@ class Config(BaseModel):
     matching: MatchingConfig = MatchingConfig()
 
     @classmethod
-    def load(cls, path: Path) -> "Config":
+    def load(cls, path: Path) -> Config:
         with open(path, "rb") as f:
             data = tomllib.load(f)
         return cls.model_validate(data)

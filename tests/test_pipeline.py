@@ -629,7 +629,6 @@ class TestExpandedCounts:
         )
 
     def test_returns_count_when_bean_query_succeeds(self, tmp_path: Path, monkeypatch):
-        import subprocess as sp
         session, base = self._setup(tmp_path)
 
         def fake_run(*args, **kwargs):
@@ -988,10 +987,7 @@ class TestPipelineUpdateChanges:
             transactions_dir="transactions",
             matching=MatchingConfig(min_score=0.0),  # Force a candidate to surface
         )
-        if rule_kwargs:
-            rules = (CategorizationRule(**rule_kwargs),)
-        else:
-            rules = ()
+        rules = (CategorizationRule(**rule_kwargs),) if rule_kwargs else ()
         return ImportSession(config=cfg, rules=rules, options=ImportOptions())
 
     def test_payee_narration_account_diffs_proposed(self, tmp_path: Path):

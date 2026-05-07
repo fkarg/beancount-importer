@@ -36,9 +36,7 @@ class ActiveTag(BaseModel):
             return True
         if self.from_date is not None and booking_date < self.from_date:
             return False
-        if self.until_date is not None and booking_date > self.until_date:
-            return False
-        return True
+        return not (self.until_date is not None and booking_date > self.until_date)
 
     def is_expired(self, booking_date: date) -> bool:
         """Whether `duration` mode has run past its until_date."""

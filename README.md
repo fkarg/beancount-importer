@@ -215,11 +215,36 @@ ledger writes happen in the CLI after `run()` returns. See
 
 ```sh
 uv sync
-uv run pytest                # full test suite
+uv run pytest                # full test suite (enforces 100% coverage)
 uv run pytest tests/test_pipeline.py -k year_filter   # one feature
 uv run ruff check src tests
+uv run pyrefly check src     # type check on production code
 ```
 
 Type checking is configured for both pyright and pyrefly via
 `pyproject.toml`. The `.venv` interpreter is referenced explicitly so LSPs
 don't pick the system Python.
+
+Coverage is gated at 100% line + branch on every non-IO module
+(`cli.py` and `beancount_io/writer.py` are omitted because they're
+interactive / subprocess-driven). Adding code without tests will fail
+the test run.
+
+A pre-commit hook runs ruff, pyrefly, and pytest on every commit. To
+enable it once per clone:
+
+```sh
+uv run pre-commit install
+```
+
+## Todo
+
+- fix double-counting of transaction count in summary overview
+- config file paths should be relative to finances root, not config file
+- add section for other _present_ .bean files
+- adapt cli to reference implementation, just much improved
+    - map out available tui options / paths and behavior
+    - reimplement those in better and much more modularly
+- add more expansive setup and 'help' modes (part of init) to reduce friction of getting started
+- pdf ocr input for provenance
+

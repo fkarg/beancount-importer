@@ -34,6 +34,7 @@ dev = [
     "ruff>=0.9",
     "mypy>=1.10",
     "xlwt>=1.3",
+    "pre-commit>=3.7",
 ]
 
 [tool.pytest.ini_options]
@@ -84,6 +85,18 @@ no-matching-overload = false  # pydantic/sqlmodel field type cannot be resolved 
 
 [tool.ruff.lint]
 select = ["E", "F", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line length — codebase deliberately keeps long descriptive lines
+    "B008",   # function-call defaults; pydantic Field() patterns trigger this
+    "SIM102", # collapsible nested ifs — the nested form often reads better
+              # when the outer/inner conditions express distinct concerns
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "B017",  # pytest.raises(Exception) is fine when the type is uninteresting
+    "E402",  # tests defer some imports until after fixture/path setup
+]
 
 [tool.mypy]
 strict = true

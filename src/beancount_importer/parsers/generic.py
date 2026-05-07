@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterator
+from collections.abc import Iterator
 
 from beancount_importer.config import BankConfig
 from beancount_importer.models import SourceTransaction
@@ -94,7 +94,7 @@ def _read_xls_rows(
         # `row_values` always returns `sheet.ncols` cells (xlrd pads short
         # rows with empty strings), so headers and values are the same length.
         values = [_cell_to_str(c).strip() for c in sheet.row_values(r)]
-        row = dict(zip(headers, values))
+        row = dict(zip(headers, values, strict=False))
         # Skip the blank separator row most banks insert between header and body.
         if not row.get(field_date, "").strip():
             continue
