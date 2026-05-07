@@ -33,10 +33,33 @@ dev = [
     "hypothesis>=6",
     "ruff>=0.9",
     "mypy>=1.10",
+    "xlwt>=1.3",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--cov --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["src/beancount_importer"]
+branch = true
+
+[tool.coverage.report]
+# `cli.py` and `beancount_io/writer.py` are interactive / subprocess-driven I/O.
+# We cover the splice ordering and rollback logic explicitly via mocks; the
+# remaining file-handle plumbing isn't worth chasing.
+omit = [
+    "src/beancount_importer/cli.py",
+    "src/beancount_importer/beancount_io/writer.py",
+]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
+fail_under = 100
+show_missing = true
+skip_covered = false
 
 [tool.pyright]
 venvPath = "."

@@ -116,7 +116,7 @@ class TestImportYearPreview:
             ],
         )
         assert result.exit_code == 0, result.output
-        assert "No source provenanace:" in result.output
+        assert "No source provenance:" in result.output
         assert "Transactions:" in result.output
 
 

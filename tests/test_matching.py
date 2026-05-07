@@ -399,6 +399,19 @@ class TestCrossBankInferredAmount:
         )
         assert score_candidate(txn, entry, max_date_days=14) == 0.0
 
+    def test_find_candidates_filters_below_min_score(self):
+        # An entry that would score above 0 but below min_score must be
+        # filtered out without raising.
+        txn = make_txn(payee="A", description="B", booking_date=date(2024, 1, 15))
+        # Far date (≈max_date_days), opposite text → low text+date proximity.
+        weak = make_entry(
+            payee="Z",
+            narration="Q",
+            date=date(2024, 1, 28),  # 13 days off → date proximity ≈ 0.07
+        )
+        # A high min_score guarantees `weak` is filtered out.
+        assert find_candidates(txn, [weak], min_score=0.95) == []
+
     def test_find_candidates_picks_inferred_match(self):
         txn = make_txn(
             amount=Decimal("-15.99"),
@@ -437,3 +450,129 @@ class TestMetadataDateProximity:
         # Default max_date_days=14 would normally reject this entry.
         score = score_candidate(txn, entry)
         assert score > 0.0
+
+
+# ── Hard-filter coverage for score_candidate ────────────────────────────────
+
+
+class TestScoreCandidateHardFilters:
+    def test_currency_mismatch_returns_zero(self):
+        txn = make_txn(currency="EUR")
+        entry = make_entry(currency="USD")
+        assert score_candidate(txn, entry) == 0.0
+
+    def test_amount_mismatch_returns_zero(self):
+        txn = make_txn(amount=Decimal("-15.99"))
+        entry = make_entry(amount=Decimal("-99.99"))
+        assert score_candidate(txn, entry) == 0.0
+
+    def test_inferred_absolute_amount_mismatch_returns_zero(self):
+        # Cross-bank transit entry with mismatched absolute amount: the
+        # |amount| comparison fails just like the strict-sign branch.
+        txn = make_txn(amount=Decimal("-10.00"))
+        entry = make_entry(amount=Decimal("20.00"), amount_inferred=True)
+        assert score_candidate(txn, entry) == 0.0
+
+    def test_include_reversed_sign_uses_absolute_compare(self):
+        # Without `include_reversed_sign`, opposite signs are rejected.
+        txn = make_txn(amount=Decimal("-10.00"))
+        entry = make_entry(amount=Decimal("10.00"))
+        assert score_candidate(txn, entry) == 0.0
+        # With it, |amounts| must agree — same date, currency → positive score.
+        assert score_candidate(txn, entry, include_reversed_sign=True) > 0.0
+
+
+class TestScoreCandidateBonuses:
+    def test_sepa_match_boosts_score(self):
+        """An exact SEPA reference match adds a big bonus, capped at 1.0.
+        Compared to the same scenario without SEPA, the score must be higher."""
+        # Use disjoint text + a date offset so the baseline score is well
+        # below 1.0 — otherwise the SEPA bonus saturates and can't be measured.
+        txn = make_txn(
+            sepa_reference="REF-001",
+            payee="Foo",
+            description="Bar",
+            booking_date=date(2024, 1, 15),
+        )
+        entry_with = make_entry(
+            payee="Baz",
+            narration="Qux",
+            date=date(2024, 1, 22),
+            metadata={"sepa_ref": "REF-001"},
+        )
+        entry_without = make_entry(
+            payee="Baz",
+            narration="Qux",
+            date=date(2024, 1, 22),
+        )
+        boosted = score_candidate(txn, entry_with)
+        baseline = score_candidate(txn, entry_without)
+        assert boosted > baseline
+        assert boosted <= 1.0
+
+    def test_sepa_reference_metadata_alternate_key(self):
+        # Some legacy ledgers store under `sepa_reference` instead of `sepa_ref`.
+        txn = make_txn(
+            sepa_reference="REF-002",
+            payee="Foo",
+            description="Bar",
+            booking_date=date(2024, 1, 15),
+        )
+        entry = make_entry(
+            payee="Baz",
+            narration="Qux",
+            date=date(2024, 1, 22),
+            metadata={"sepa_reference": "REF-002"},
+        )
+        baseline = score_candidate(
+            txn,
+            make_entry(payee="Baz", narration="Qux", date=date(2024, 1, 22)),
+        )
+        assert score_candidate(txn, entry) > baseline
+
+
+# ── PayPal counterpart: currency mismatch ───────────────────────────────────
+
+
+class TestPaypalCounterpartCurrency:
+    def test_currency_mismatch_skips_match(self):
+        bank = make_txn(amount=Decimal("-50"), currency="EUR")
+        pp = make_txn(
+            amount=Decimal("-50"),
+            currency="USD",
+            bank_key="paypal",
+            booking_date=date(2024, 1, 15),
+        )
+        assert find_paypal_counterpart(bank, [pp]) is None
+
+
+# ── Transfers: closest fallback when no expense/income posting exists ───────
+
+
+class TestPickOtherPostingFallback:
+    """Internal coverage for `_pick_other_posting`: when no Expenses/Income
+    posting exists, the function falls back to the first non-source posting."""
+
+    def test_synthesizes_with_non_expense_target(self, tmp_path):
+        # Two non-source legs, neither expense/income — fallback path picks
+        # the first one. Routed through reader.read_ledger so we exercise
+        # the function in its real call site.
+        from beancount_importer.beancount_io.reader import read_ledger
+
+        bean = tmp_path / "x.bean"
+        bean.write_text(
+            '2024-01-15 * "Payee" "Narr"\n'
+            '  Assets:B:SPK  -1.00 EUR\n'
+            '    paypal: 2024-01-15\n'
+            '  Assets:B:Other  1.00 EUR\n'
+        )
+        entries = read_ledger(
+            bean,
+            "Assets:B:PayPal",
+            synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
+        )
+        # The synthesized virtual entry's target_account should be the
+        # non-source `Assets:B:Other`.
+        synthesized = [e for e in entries if e.amount_inferred]
+        assert len(synthesized) == 1
+        assert synthesized[0].target_account == "Assets:B:Other"

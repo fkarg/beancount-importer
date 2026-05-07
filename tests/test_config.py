@@ -261,3 +261,70 @@ class TestMatchingConfig:
         cfg = Config.load(p)
         assert cfg.matching.min_score == 0.5
         assert cfg.matching.transfer_tolerance_days == 10
+
+
+class TestBankConfigSourceFilesDefault:
+    """Cover the `default_source_files` validator's edge paths: when the
+    incoming data is not a dict (Pydantic occasionally hands a model in)
+    or when no `output_file` was supplied to derive a default from."""
+
+    def test_pre_existing_source_files_preserved(self, tmp_path: Path):
+        # When `source_files` is explicitly supplied, the default-derivation
+        # block is skipped (the `not data.get("source_files")` check is False).
+        toml = textwrap.dedent("""\
+            [[banks]]
+            key = "spk"
+            display_name = "SPK"
+            account = "Assets:B:SPK"
+            file_glob = "SPK_*.CSV"
+            output_file = "transactions/{year}/SPK.bean"
+            source_files = [
+                "transactions/{year}/SPK.bean",
+                "transactions/{year}/Cash.bean",
+            ]
+
+            [banks.csv]
+            field_date = "Buchungstag"
+            field_amount = "Betrag"
+        """)
+        p = tmp_path / "cfg.toml"
+        p.write_text(toml)
+        cfg = Config.load(p)
+        assert len(cfg.banks[0].source_files) == 2
+
+    def test_revalidation_of_existing_model_skips_default(self):
+        # `default_source_files` runs in `mode="before"` and receives an
+        # already-validated `BankConfig` instance during nested model
+        # revalidation. The validator must short-circuit (the input is not
+        # a dict) rather than try to `.get(...)` on the model.
+        from beancount_importer.config import BankConfig, CsvConfig
+
+        original = BankConfig(
+            key="x",
+            display_name="X",
+            account="Assets:X",
+            file_glob="*.csv",
+            output_file="x.bean",
+            csv=CsvConfig(field_date="d", field_amount="a"),
+        )
+        # Round-trip the model through validation. Pydantic feeds the model
+        # itself (not a dict) into `mode=before` validators — exercising the
+        # `not isinstance(data, dict)` branch.
+        revalidated = BankConfig.model_validate(original)
+        assert revalidated.source_files == original.source_files
+
+    def test_dict_without_output_file_passes_through(self):
+        # If somehow a dict without `output_file` reaches the validator
+        # (constructing it directly via `model_validate` would fail later
+        # at field validation), the `if output is not None` short-circuits
+        # without raising.
+        from beancount_importer.config import BankConfig
+
+        # We invoke `model_validate` and expect the missing-required-field
+        # error from later validation — but the *validator* itself must
+        # not crash on the missing key. If it raised KeyError instead,
+        # pydantic's error message would mention KeyError rather than
+        # the missing-field summary.
+        with pytest.raises(Exception) as excinfo:
+            BankConfig.model_validate({"key": "x"})
+        assert "KeyError" not in str(excinfo.value)

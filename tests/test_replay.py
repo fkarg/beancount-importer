@@ -191,3 +191,43 @@ class TestDecisionLogPersistence:
         txn = make_txn(sepa_reference="X")
         log.record(txn, make_result(txn))
         assert log_path.exists()
+
+    def test_blank_lines_skipped_on_load(self, tmp_path: Path):
+        # A blank line between records (e.g., an editor inserted a stray newline)
+        # must not cause a parse error or erase the surrounding entries.
+        log_path = tmp_path / "d.jsonl"
+        log_path.write_text(
+            '{"sig": {"sepa_ref": "X"}, "decision": '
+            '{"action": "categorize", "postings": [{"account": "Expenses:X"}]}}\n'
+            '\n'  # blank line
+            '   \n'  # whitespace-only line
+            '{"sig": {"sepa_ref": "Y"}, "decision": '
+            '{"action": "categorize", "postings": [{"account": "Expenses:Y"}]}}\n'
+        )
+        log = DecisionLog(log_path)
+        assert log.lookup(make_txn(sepa_reference="X")) is not None
+        assert log.lookup(make_txn(sepa_reference="Y")) is not None
+
+    def test_record_without_decision_skipped_on_load(self, tmp_path: Path):
+        # A line with a `sig` but no `decision` (truncated write?) shouldn't
+        # be loaded into the index.
+        log_path = tmp_path / "d.jsonl"
+        log_path.write_text('{"sig": {"sepa_ref": "X"}}\n')
+        log = DecisionLog(log_path)
+        assert log.lookup(make_txn(sepa_reference="X")) is None
+
+    def test_hash_keyed_record_loads(self, tmp_path: Path):
+        # Cover the `else` branch of the sepa_ref ternary in _load.
+        from beancount_importer.replay import make_decision_signature
+
+        txn = make_txn(sepa_reference="")
+        sig = make_decision_signature(txn)
+        log_path = tmp_path / "d.jsonl"
+        log_path.write_text(
+            f'{{"sig": {{"hash": "{sig.content_hash}"}}, "decision": '
+            '{"action": "categorize", "postings": [{"account": "Expenses:Hashed"}]}}\n'
+        )
+        log = DecisionLog(log_path)
+        retrieved = log.lookup(txn)
+        assert retrieved is not None
+        assert retrieved.target_account == "Expenses:Hashed"

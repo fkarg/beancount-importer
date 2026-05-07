@@ -573,3 +573,654 @@ class TestBeanProvenanceStats:
         stats = compute_bean_provenance_stats(session, tmp_path)
         # No `main_bean` configured ⇒ expanded count is reported as zero.
         assert stats[("spk", 2024)].bean_expanded == 0
+
+    def test_csv_parse_failure_is_silently_skipped(self, tmp_path: Path):
+        # `compute_bean_provenance_stats` swallows CSV parse exceptions to
+        # keep the preview from blowing up on a malformed export.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "X" ""
+              Assets:B:SPK  -1.00 EUR
+              Expenses:X  1.00 EUR
+        """))
+        # CSV with a malformed date column → parser raises ValueError.
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "not-a-date;X;X;-1,00;EUR;\n"
+        )
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        # Must not raise — the stats still come back even though the CSV
+        # is unusable.
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        assert stats[("spk", 2024)].total_in_bean == 1
+
+
+# ── Subprocess-driven branches: bean-query expanded counts ───────────────────
+
+
+class TestExpandedCounts:
+    """`_expanded_counts` orchestrates `bean-query` per (bank, year) and is
+    the most subprocess-heavy bit of the pipeline. Mock `subprocess.run` and
+    `shutil.which` to drive each branch deterministically."""
+
+    def _setup(self, tmp_path: Path) -> tuple[ImportSession, Path]:
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "X" ""
+              Assets:B:SPK  -1.00 EUR
+              Expenses:X  1.00 EUR
+        """))
+        # Top-level bean file the subprocess "queries" against.
+        (tmp_path / "main.2024.bean").write_text("; placeholder\n")
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            main_bean="main.{year}.bean",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        return (
+            ImportSession(config=cfg, options=ImportOptions(year_filter=(2024,))),
+            tmp_path,
+        )
+
+    def test_returns_count_when_bean_query_succeeds(self, tmp_path: Path, monkeypatch):
+        import subprocess as sp
+        session, base = self._setup(tmp_path)
+
+        def fake_run(*args, **kwargs):
+            # Simulated bean-query output: a header line, separator, then a
+            # numeric count line.
+            class R:
+                returncode = 0
+                stdout = "count(date)\n----\n42\n"
+                stderr = ""
+            return R()
+
+        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
+        stats = compute_bean_provenance_stats(session, base)
+        assert stats[("spk", 2024)].bean_expanded == 42
+
+    def test_returns_zero_when_bean_query_missing(self, tmp_path: Path, monkeypatch):
+        session, base = self._setup(tmp_path)
+        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: None)
+        stats = compute_bean_provenance_stats(session, base)
+        assert stats[("spk", 2024)].bean_expanded == 0
+
+    def test_returns_zero_when_year_filter_none(self, tmp_path: Path, monkeypatch):
+        # No year filter ⇒ skip subprocess work entirely.
+        session, base = self._setup(tmp_path)
+        # Remove year filter
+        cfg = session.config
+        session_no_year = ImportSession(config=cfg, options=ImportOptions())
+        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        # Subprocess.run MUST NOT be called.
+        called = []
+        monkeypatch.setattr(
+            "beancount_importer.pipeline.subprocess.run",
+            lambda *a, **kw: called.append(a) or (_ for _ in ()).throw(AssertionError("should not run")),
+        )
+        stats = compute_bean_provenance_stats(session_no_year, base)
+        assert all(s.bean_expanded == 0 for s in stats.values())
+        assert called == []
+
+    def test_main_bean_missing_skips_year(self, tmp_path: Path, monkeypatch):
+        # `main_bean` is configured but the per-year file doesn't exist —
+        # that year's bean_expanded stays at 0.
+        session, base = self._setup(tmp_path)
+        # Delete the placeholder main bean
+        (base / "main.2024.bean").unlink()
+        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        called = []
+        monkeypatch.setattr(
+            "beancount_importer.pipeline.subprocess.run",
+            lambda *a, **kw: called.append(a),
+        )
+        stats = compute_bean_provenance_stats(session, base)
+        assert stats[("spk", 2024)].bean_expanded == 0
+        assert called == []
+
+    def test_bean_query_nonzero_returncode_skips_count(self, tmp_path: Path, monkeypatch):
+        session, base = self._setup(tmp_path)
+
+        def fake_run(*args, **kwargs):
+            class R:
+                returncode = 1
+                stdout = ""
+                stderr = "boom"
+            return R()
+
+        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
+        stats = compute_bean_provenance_stats(session, base)
+        assert stats[("spk", 2024)].bean_expanded == 0
+
+    def test_bean_query_timeout_swallowed(self, tmp_path: Path, monkeypatch):
+        import subprocess as sp
+        session, base = self._setup(tmp_path)
+
+        def raising(*args, **kwargs):
+            raise sp.TimeoutExpired(cmd="bean-query", timeout=30)
+
+        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", raising)
+        # Must not propagate the TimeoutExpired.
+        stats = compute_bean_provenance_stats(session, base)
+        assert stats[("spk", 2024)].bean_expanded == 0
+
+    def test_bean_query_filenotfound_swallowed(self, tmp_path: Path, monkeypatch):
+        # If `which` lies (bean-query was uninstalled between checks), the
+        # subprocess raises FileNotFoundError — that, too, is swallowed.
+        session, base = self._setup(tmp_path)
+
+        def raising(*args, **kwargs):
+            raise FileNotFoundError("bean-query")
+
+        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", raising)
+        stats = compute_bean_provenance_stats(session, base)
+        assert stats[("spk", 2024)].bean_expanded == 0
+
+    def test_bean_query_non_numeric_output_yields_zero(self, tmp_path: Path, monkeypatch):
+        # Output without a digit-only line (e.g. unexpected header format)
+        # leaves bean_expanded at 0 rather than crashing.
+        session, base = self._setup(tmp_path)
+
+        def fake_run(*a, **kw):
+            class R:
+                returncode = 0
+                stdout = "no numbers here\n----\nfoo\n"
+                stderr = ""
+            return R()
+
+        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
+        stats = compute_bean_provenance_stats(session, base)
+        assert stats[("spk", 2024)].bean_expanded == 0
+
+
+# ── CSV parse failure surfaces via reporter.on_error ─────────────────────────
+
+
+class TestPipelineParseError:
+    def test_parse_exception_routed_to_reporter(self, base_dir: Path):
+        """The pipeline must not crash when one of a bank's CSV files is
+        malformed — instead the parse failure is forwarded to
+        `reporter.on_error` so the user sees a single warning line."""
+        # Overwrite the well-formed CSV with one that breaks date parsing.
+        (base_dir / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "not-a-date;X;X;-1,00;EUR;\n"
+        )
+
+        captured: list[str] = []
+
+        class CapturingReporter:
+            def on_result(self, result):
+                pass
+
+            def on_progress(self, current, total, bank):
+                pass
+
+            def on_warning(self, message):
+                pass
+
+            def on_error(self, message):
+                captured.append(message)
+
+        session = make_session(base_dir)
+        results = run(session, base_dir, fixed_categorize(), CapturingReporter())
+        assert results == []  # no rows survived the parse
+        assert any("failed to parse" in m for m in captured)
+
+
+# ── NoopReporter: trivial methods are still callable ─────────────────────────
+
+
+class TestNoopReporter:
+    """Direct cover for `NoopReporter.on_warning` / `on_error` — the pipeline
+    happens not to invoke them in the existing tests, so we exercise them
+    explicitly so the no-op behavior is enforced rather than just inferred."""
+
+    def test_on_warning_does_nothing(self):
+        NoopReporter().on_warning("anything")  # no return, no raise
+
+    def test_on_error_does_nothing(self):
+        NoopReporter().on_error("anything")
+
+
+# ── Quit-then-second-bank: outer loop break ─────────────────────────────────
+
+
+class TestPipelineQuitMultiBank:
+    def test_quit_in_first_bank_stops_processing_second(self, tmp_path: Path):
+        # Two banks each with one CSV. First bank's only row triggers `quit`;
+        # the second bank's rows must NOT be processed.
+        write_spk_csv(tmp_path / "SPK_jan.csv")
+        n26_csv = tmp_path / "N26_jan.csv"
+        n26_csv.write_text("Date,Amount\n2024-02-01,-1.00\n")
+
+        cfg = Config(
+            banks=[
+                make_spk_bank(year_template_output=False),
+                BankConfig(
+                    key="n26",
+                    display_name="N26",
+                    account="Assets:B:N26",
+                    file_glob="N26_*.csv",
+                    output_file="n26.bean",
+                    csv=CsvConfig(field_date="Date", field_amount="Amount"),
+                ),
+            ],
+            matching=MatchingConfig(min_score=0.35),
+        )
+
+        # First call quits.
+        def quit_first(ctx):
+            return CategoryProposal(action="quit")
+
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, quit_first, NoopReporter())
+        # Only one txn processed (the first SPK row), then quit.
+        assert len(results) == 1
+        assert results[0].action == "quit"
+        assert results[0].source_txn.bank_key == "spk"
+
+
+# ── Auto-categorize + rule path (line 323/455) ──────────────────────────────
+
+
+class TestPipelineAutoCategorize:
+    def test_high_score_match_uses_rule_proposal(self, tmp_path: Path):
+        """When a candidate's score >= auto_threshold AND a rule matches,
+        the pipeline must skip the categorize_fn entirely and synthesize
+        the proposal from the rule directly."""
+        # Pre-existing ledger entry that exactly matches the new CSV row.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Netflix Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        # New CSV row identical except no SEPA reference (so dedup doesn't fire).
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "16.01.24;Netflix;Netflix Abo Feb;-15,99;EUR;\n"
+        )
+
+        called = []
+
+        def fail_categ(ctx):
+            called.append(ctx.txn)
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:From-Categ-Fn"),),
+            )
+
+        rule = CategorizationRule(
+            target_account="Expenses:Streaming",
+            payee_pattern="Netflix",
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(
+            config=cfg,
+            rules=(rule,),
+            options=ImportOptions(auto_threshold=0.5),
+        )
+        results = run(session, tmp_path, fail_categ, NoopReporter())
+        # The categorize fn should NOT have been called — auto-rule applied.
+        assert called == []
+        assert len(results) == 1
+
+
+# ── Skip-update-pattern: narration field falls through (line 448) ───────────
+
+
+class TestPipelineSkipPatternsNarration:
+    def test_narration_field_pattern_does_not_match_in_pipeline(self, base_dir: Path):
+        # `_matches_skip_pattern` walks each pattern but defers narration-field
+        # patterns to a separate code path (they need a matched ledger entry).
+        # Setting one shouldn't suppress txns that have no matched entry.
+        session = make_session(
+            base_dir,
+            skip_patterns=(SkipUpdatePattern(field="narration", pattern="anything"),),
+        )
+        results = run(session, base_dir, fixed_categorize(), NoopReporter())
+        # The narration pattern is skipped at this layer; all rows still
+        # produce categorize results.
+        assert all(r.action == "new" for r in results)
+
+
+# ── _derive_rule edge cases: no-pattern fallback (lines 473, 479-480, 482) ──
+
+
+class TestPipelineSaveAsRuleEdges:
+    def test_save_as_rule_drops_when_no_pattern_available(self, tmp_path: Path):
+        # CSV row with NO payee AND NO description → `_derive_rule` cannot
+        # synthesize a pattern, so save_as_rule silently has no effect.
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            # Empty payee and description columns
+            "15.01.24;;;-1,00;EUR;\n"
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:X"),),
+                save_as_rule=True,
+            )
+
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, categ, NoopReporter())
+        assert len(results) == 1
+        # save_as_rule was True but the rule could not be derived.
+        assert results[0].new_rule is None
+
+    def test_save_as_rule_uses_description_when_payee_empty(self, tmp_path: Path):
+        # CSV row with empty payee but non-empty description — derive_rule
+        # falls through to the description-pattern branch.
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;;Some narrative;-1,00;EUR;\n"
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Y"),),
+                save_as_rule=True,
+            )
+
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, categ, NoopReporter())
+        assert len(results) == 1
+        nr = results[0].new_rule
+        assert nr is not None
+        assert nr.description_pattern  # fall-through branch was used
+        assert not nr.payee_pattern
+
+    def test_save_as_rule_no_postings_returns_none(self, tmp_path: Path):
+        # Edge case: action="categorize" + save_as_rule=True + no postings →
+        # `_derive_rule`'s `if not proposal.postings: return None` branch.
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;X;X;-1,00;EUR;\n"
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(),  # no postings
+                save_as_rule=True,
+            )
+
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, categ, NoopReporter())
+        assert len(results) == 1
+        assert results[0].new_rule is None
+
+
+# ── Update flow: change detection + suppression (lines 511, 522-538) ─────────
+
+
+class TestPipelineUpdateChanges:
+    def _setup(self, tmp_path: Path) -> Path:
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "OldPayee" "old narration"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Old  15.99 EUR
+        """))
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "16.01.24;NewPayee;new narration;-15,99;EUR;\n"
+        )
+        return tmp_path
+
+    def _session_with(self, tmp_path: Path, **rule_kwargs) -> ImportSession:
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.0),  # Force a candidate to surface
+        )
+        if rule_kwargs:
+            rules = (CategorizationRule(**rule_kwargs),)
+        else:
+            rules = ()
+        return ImportSession(config=cfg, rules=rules, options=ImportOptions())
+
+    def test_payee_narration_account_diffs_proposed(self, tmp_path: Path):
+        base = self._setup(tmp_path)
+        session = self._session_with(base)
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:New"),),
+                payee="NewPayee",
+                narration="new narration",
+            )
+
+        results = run(session, base, categ, NoopReporter())
+        assert len(results) == 1
+        r = results[0]
+        assert r.action == "update"
+        fields = {c.field for c in r.proposed_changes}
+        assert "payee" in fields
+        assert "narration" in fields
+        assert "account" in fields
+
+    def test_suppress_payee_updates_drops_payee_change(self, tmp_path: Path):
+        base = self._setup(tmp_path)
+        session = self._session_with(
+            base,
+            target_account="Expenses:New",
+            payee_pattern="NewPayee",
+            suppress_payee_updates=True,
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:New"),),
+                payee="NewPayee",
+                narration="new narration",
+            )
+
+        results = run(session, base, categ, NoopReporter())
+        fields = {c.field for c in results[0].proposed_changes}
+        assert "payee" not in fields
+        assert "narration" in fields
+
+    def test_suppress_narration_updates_drops_narration_change(self, tmp_path: Path):
+        base = self._setup(tmp_path)
+        session = self._session_with(
+            base,
+            target_account="Expenses:New",
+            payee_pattern="NewPayee",
+            suppress_narration_updates=True,
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:New"),),
+                payee="NewPayee",
+                narration="new narration",
+            )
+
+        results = run(session, base, categ, NoopReporter())
+        fields = {c.field for c in results[0].proposed_changes}
+        assert "narration" not in fields
+        # payee + account changes still appear.
+        assert "payee" in fields
+        assert "account" in fields
+
+    def test_suppress_account_updates_drops_account_change(self, tmp_path: Path):
+        base = self._setup(tmp_path)
+        session = self._session_with(
+            base,
+            target_account="Expenses:New",
+            payee_pattern="NewPayee",
+            suppress_account_updates=True,
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:New"),),
+                payee="NewPayee",
+                narration="new narration",
+            )
+
+        results = run(session, base, categ, NoopReporter())
+        fields = {c.field for c in results[0].proposed_changes}
+        assert "account" not in fields
+        assert "payee" in fields
+        assert "narration" in fields
+
+    def test_suppress_all_returns_no_changes(self, tmp_path: Path):
+        base = self._setup(tmp_path)
+        session = self._session_with(
+            base,
+            target_account="Expenses:New",
+            payee_pattern="NewPayee",
+            suppress_updates=True,
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:New"),),
+                payee="NewPayee",
+                narration="new narration",
+            )
+
+        results = run(session, base, categ, NoopReporter())
+        assert results[0].proposed_changes == []
+
+
+# ── Format new entry with explicit posting amount (lines 558-559) ──────────
+
+
+class TestPipelineFormatNewEntry:
+    def test_explicit_posting_amount_emitted(self, tmp_path: Path):
+        # When a proposal supplies a Posting with an explicit amount, the
+        # rendered transaction should include that amount alongside the
+        # source-account leg.
+        write_spk_csv(tmp_path / "SPK_jan.csv")
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(
+                    Posting(
+                        account="Expenses:Split",
+                        amount=Decimal("10.00"),
+                        currency="EUR",
+                    ),
+                    Posting(account="Expenses:Other"),
+                ),
+            )
+
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, categ, NoopReporter())
+        # First result's text should contain the explicit posting line.
+        text = results[0].new_entry_text
+        assert "Expenses:Split" in text
+        assert "10.00 EUR" in text
+
+
+# ── Dedup-skip preserves tag advance (line 295) ──────────────────────────────
+
+
+class TestPipelineDedupSkip:
+    def test_already_imported_txn_skipped(self, tmp_path: Path):
+        # Existing entry with matching SEPA reference — dedup classifies the
+        # CSV row as duplicate, returning a "skip" result.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Netflix Abo"
+              sepa_ref: "NETFLIX-001"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;Netflix;Netflix Abo;-15,99;EUR;NETFLIX-001\n"
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 1
+        assert results[0].action == "skip"
+
+
+# ── _has_csv_match: continue when no candidate date is in tolerance ─────────
+
+
+class TestHasCsvMatch:
+    """`_has_csv_match` walks all CSV rows for an entry; cover the inner-
+    loop continue branches that the bigger tests above don't reach."""
+
+    def test_amount_mismatch_iterates_to_next_csv(self, tmp_path: Path):
+        # Two CSV rows — first one's amount doesn't match (continue), second
+        # one matches by amount + close date.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Match" ""
+              Assets:B:SPK  -10.00 EUR
+              Expenses:X  10.00 EUR
+        """))
+        # Two-row CSV: first row has different amount, second row matches.
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;Other;X;-99,99;EUR;\n"
+            "15.01.24;Match;X;-10,00;EUR;\n"
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # The matched bean entry has bean_unmatched=0 because the second
+        # CSV row matches it.
+        assert stats[("spk", 2024)].bean_unmatched == 0
+
+    def test_amount_match_but_date_too_far_continues(self, tmp_path: Path):
+        # Same amount, but every CSV row's date is far outside the tolerance
+        # window — the entry stays unmatched.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-06-01 * "Match" ""
+              Assets:B:SPK  -10.00 EUR
+              Expenses:X  10.00 EUR
+        """))
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;Far;X;-10,00;EUR;\n"
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        assert stats[("spk", 2024)].bean_unmatched == 1

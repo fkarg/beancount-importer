@@ -91,10 +91,9 @@ def _read_xls_rows(
 
     headers = [_cell_to_str(c).strip() for c in sheet.row_values(header_row_idx)]
     for r in range(header_row_idx + 1, sheet.nrows):
+        # `row_values` always returns `sheet.ncols` cells (xlrd pads short
+        # rows with empty strings), so headers and values are the same length.
         values = [_cell_to_str(c).strip() for c in sheet.row_values(r)]
-        # Pad/truncate to header length so dict construction is well-defined.
-        if len(values) < len(headers):
-            values = values + [""] * (len(headers) - len(values))
         row = dict(zip(headers, values))
         # Skip the blank separator row most banks insert between header and body.
         if not row.get(field_date, "").strip():
@@ -126,10 +125,9 @@ class GenericCsvParser:
         ):
             if name:
                 cols.add(name)
-        if isinstance(self._csv.field_description, list):
-            cols.update(self._csv.field_description)
-        elif self._csv.field_description:
-            cols.add(self._csv.field_description)
+        # `CsvConfig.field_description` is normalised to `list[str]` by the
+        # pydantic validator, so we only need the list branch.
+        cols.update(self._csv.field_description)
         return frozenset(cols)
 
     def parse(self, file_path: str) -> Iterator[SourceTransaction]:

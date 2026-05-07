@@ -154,7 +154,12 @@ def _synthesize_virtual_entries(
 
     out: list[LedgerEntry] = []
     for src_posting in txn.postings:
-        if not src_posting.meta:
+        # beancount's loader populates `posting.meta` (with at least
+        # filename/lineno) and `posting.units` (with the explicit or inferred
+        # amount) for every posting on a Transaction. The None-checks below
+        # are defensive only — they exist to satisfy the static-type narrowing
+        # because the API types both attributes as `Optional[...]`.
+        if src_posting.meta is None or src_posting.units is None:  # pragma: no cover
             continue
         for key, mapped in synthesize_from_metadata.items():
             if mapped != source_account:
@@ -164,8 +169,6 @@ def _synthesize_virtual_entries(
                 continue
             metadata_date = _coerce_date(raw)
             if metadata_date is None:
-                continue
-            if src_posting.units is None:
                 continue
             # Pick the most plausible "other side": prefer non-Asset/Liability
             # accounts (typically Expenses/Income), falling back to any

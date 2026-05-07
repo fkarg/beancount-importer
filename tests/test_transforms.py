@@ -99,6 +99,21 @@ class TestActualHook:
         out = ActualHook().apply(proposal, make_txn(), rule)
         assert "actual" not in out.metadata
 
+    def test_add_actual_date_without_extracted_metadata(self):
+        # rule.add_actual_date=True but no `_extracted_date` in proposal.metadata
+        # — apply() must short-circuit and return the proposal unchanged.
+        rule = make_rule(add_actual_date=True)
+        out = ActualHook().apply(make_proposal(), make_txn(), rule)
+        assert out.metadata == {}
+
+    def test_apply_called_without_applicable_rule_is_noop(self):
+        # Defensive: if apply() is invoked on a rule where applies_to() would
+        # return False (neither settle_days<0 nor add_actual_date), the hook
+        # must leave the proposal alone rather than write spurious metadata.
+        rule = make_rule()  # all transform fields default
+        out = ActualHook().apply(make_proposal(), make_txn(), rule)
+        assert out.metadata == {}
+
 
 class TestAmortizeHook:
     def test_applies_when_both_set(self):
@@ -162,5 +177,19 @@ class TestLoadTransforms:
         try:
             with pytest.raises(TypeError):
                 load_transforms(["bad_transform"])
+        finally:
+            sys.path.remove(str(tmp_path))
+
+    def test_hook_not_satisfying_protocol_raises(self, tmp_path):
+        # A module with a top-level `hook` attribute that is structurally
+        # incompatible with TransformHook (no `apply` / `applies_to`) must
+        # fail loudly at session start, not silently mis-route.
+        bad = tmp_path / "wrong_hook.py"
+        bad.write_text("hook = 'not a hook'\n")
+        import sys
+        sys.path.insert(0, str(tmp_path))
+        try:
+            with pytest.raises(TypeError, match="does not satisfy TransformHook"):
+                load_transforms(["wrong_hook"])
         finally:
             sys.path.remove(str(tmp_path))
