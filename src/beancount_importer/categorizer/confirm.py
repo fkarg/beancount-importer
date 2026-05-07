@@ -29,6 +29,7 @@ from beancount_importer.categorizer.screen import (
     hotkey,
     styled_account,
 )
+from beancount_importer.categorizer.modes.amortize import run as run_amortize
 from beancount_importer.categorizer.tag_menu import run as run_tag_menu
 from beancount_importer.models import (
     CategoryProposal,
@@ -171,18 +172,21 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
 def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
     """Hotkey row.
 
-    Step 10 adds `[t]` (tag menu). Other cross-screen affordances
-    (`[c]`, `[r]`, `[u]`, `[m]`) come online as their target screens
-    or sub-flows land in later steps.
+    Steps 10–11 add `[t]` (tag menu) and `[m]` (mode menu — currently
+    just amortize). The remaining cross-screen affordances (`[c]`,
+    `[r]`, `[u]`) come online as their target screens land.
     """
-    del ctx
+    is_debit = ctx.txn.amount < 0
     console.print(
         f"  {hotkey('enter')} confirm  "
         f"{hotkey('n')} narration  "
         f"{hotkey('p')} payee"
     )
+    # `[m]` only appears for debits — amortizing income makes no sense
+    # in any of the three plugin modes, so the menu would only mislead.
+    mode_part = f"  {hotkey('m')} amortize" if is_debit else ""
     console.print(
-        f"  {hotkey('t')} tag menu  "
+        f"  {hotkey('t')} tag menu{mode_part}  "
         f"{hotkey('s')} skip       "
         f"{hotkey('q')} quit"
     )
@@ -191,7 +195,8 @@ def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 
-_HOTKEYS: tuple[str, ...] = ("", "n", "p", "t", "s", "q")
+_HOTKEYS_DEBIT: tuple[str, ...] = ("", "n", "p", "t", "m", "s", "q")
+_HOTKEYS_CREDIT: tuple[str, ...] = ("", "n", "p", "t", "s", "q")
 
 
 def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
@@ -203,17 +208,18 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
     from dataclasses import replace
 
     proposal = ctx.proposal
+    keys = _HOTKEYS_DEBIT if ctx.txn.amount < 0 else _HOTKEYS_CREDIT
     while True:
         render(console, replace(ctx, proposal=proposal))
-        key = ask_hotkey(_HOTKEYS)
+        key = ask_hotkey(keys)
         if key == "":
             return ConfirmDecision(action="confirm", proposal=proposal)
         if key == "s":
             return ConfirmDecision(action="skip")
         if key == "q":
             return ConfirmDecision(action="quit")
-        # Edit hotkeys: mutate `proposal` and loop. `Prompt.ask`'s `choices`
-        # list keeps `key` inside this set — no fallthrough is reachable.
+        # Edit/menu hotkeys: mutate `proposal` and loop. `Prompt.ask`'s
+        # `choices` list keeps `key` inside this set — no fallthrough.
         if key == "n":
             current = proposal.narration or ctx.txn.description or ""
             new = Prompt.ask(f"narration [{current}]", default=current)
@@ -222,7 +228,9 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             current = proposal.payee or ctx.txn.payee or ""
             new = Prompt.ask(f"payee [{current}]", default=current)
             proposal = proposal.model_copy(update={"payee": new})
-        else:  # key == "t" — tag menu sub-prompt
+        elif key == "t":
             delta = run_tag_menu(console, ctx.current_active_tag)
             if delta is not None:
                 proposal = proposal.model_copy(update={"tag_state_delta": delta})
+        else:  # key == "m" — amortize mode (debits only)
+            proposal = run_amortize(console, proposal)
