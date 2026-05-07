@@ -96,6 +96,29 @@ class TestImportYearPreview:
         # should leave exactly 2 transactions accounted for.
         assert "CSV transactions:        2" in result.output
 
+    def test_preview_suppresses_per_row_ticker(self, project_dir: Path):
+        # The ticker prints one `…`/`✓`/`✎` line per row. Preview mode
+        # already produces a per-row summary table, so doubling that
+        # output up the scrollback is pure noise. Assert the ticker
+        # glyphs don't show up at the start of any output line.
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "2024",
+                "--config",
+                str(project_dir / "import_config.toml"),
+                "--preview",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        ticker_glyphs = ("✓", "↻", "…", "✎", "⚠")
+        for line in result.output.splitlines():
+            stripped = line.lstrip()
+            assert not stripped.startswith(ticker_glyphs), (
+                f"unexpected per-row ticker in preview output: {line!r}"
+            )
+
     def test_preview_shows_bean_provenance_when_ledger_present(
         self, project_dir: Path
     ):
@@ -121,6 +144,62 @@ class TestImportYearPreview:
         assert result.exit_code == 0, result.output
         assert "No CSV source:" in result.output
         assert "Transactions:" in result.output
+
+
+class TestRichReporter:
+    """Direct unit tests for the per-row reporter behaviour. The
+    end-to-end test above asserts the wiring; these isolate the flag.
+    """
+
+    def _result(self):
+        from datetime import date
+        from decimal import Decimal
+
+        from beancount_importer.models import (
+            CategoryProposal,
+            ImportResult,
+            Posting,
+            SourceTransaction,
+        )
+
+        return ImportResult(
+            source_txn=SourceTransaction(
+                booking_date=date(2024, 3, 1),
+                amount=Decimal("-12.50"),
+                currency="EUR",
+                payee="Test",
+                description="d",
+                bank_key="spk",
+            ),
+            action="new",
+            proposal=CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Food"),),
+            ),
+        )
+
+    def test_quiet_suppresses_on_result(self, capsys):
+        from beancount_importer.cli import RichReporter, console
+
+        reporter = RichReporter(quiet=True)
+        # Force a fresh capture buffer.
+        capsys.readouterr()
+        reporter.on_result(self._result())
+        # Rich console writes to stdout (via the module-level singleton),
+        # so capsys catches it. Quiet mode should produce nothing.
+        del console  # we only need the import to ensure side effects
+        out = capsys.readouterr().out
+        assert out == ""
+
+    def test_default_emits_ticker_line(self, capsys):
+        from beancount_importer.cli import RichReporter
+
+        reporter = RichReporter()
+        capsys.readouterr()
+        reporter.on_result(self._result())
+        out = capsys.readouterr().out
+        # `new` action with no rule renders the `(you)` suffix.
+        assert "(you)" in out
 
 
 class TestInit:

@@ -90,12 +90,21 @@ class RichReporter:
     the user knows where the run is without waiting for the summary.
     `format_line` picks the glyph + suffix from the result's action, and
     we print the markup string directly — append-only, no `Live` region.
+
+    `quiet=True` suppresses the per-row ticker. Used by `--preview`,
+    where the run produces a final summary table that already shows
+    every row's classification — the per-row ticker doubles the noise
+    without adding information. The bank-progress log still fires so
+    the user sees the run isn't hung.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, quiet: bool = False) -> None:
         self._last_bank: str = ""
+        self._quiet = quiet
 
     def on_result(self, result: ImportResult) -> None:
+        if self._quiet:
+            return
         from beancount_importer.categorizer.ticker import format_line
 
         console.print(format_line(result))
@@ -323,7 +332,7 @@ def main(
         options=options,
     )
 
-    reporter = RichReporter()
+    reporter = RichReporter(quiet=preview)
     categorize: CategorizeFn = (
         make_preview_categorizer()
         if preview
