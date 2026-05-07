@@ -82,13 +82,22 @@ def _save_tag_state(state: TagState, path: Path) -> None:
 
 
 class RichReporter:
-    """Reporter that prints one-line progress + summary lines via Rich."""
+    """Reporter that prints a one-line ticker per finalised result.
+
+    The ticker is the per-decision feedback the design doc calls for:
+    every transaction's outcome appears in scrollback as it happens, so
+    the user knows where the run is without waiting for the summary.
+    `format_line` picks the glyph + suffix from the result's action, and
+    we print the markup string directly — append-only, no `Live` region.
+    """
 
     def __init__(self) -> None:
         self._last_bank: str = ""
 
     def on_result(self, result: ImportResult) -> None:
-        del result  # individual results are summarized at the end
+        from beancount_importer.categorizer.ticker import format_line
+
+        console.print(format_line(result))
 
     def on_progress(self, current: int, total: int, bank: str) -> None:
         if bank != self._last_bank:
