@@ -34,24 +34,67 @@ def read_ledger(
     beancount plugin would synthesize at load time. See
     `_synthesize_virtual_entry` for the conventions.
     """
+    return read_ledger_multi(
+        path,
+        accounts=(source_account,),
+        metadata_date_keys=metadata_date_keys,
+        synthesize_from_metadata=synthesize_from_metadata,
+    )
+
+
+def read_ledger_multi(
+    path: Path,
+    *,
+    accounts: Iterable[str] | None = None,
+    account_prefixes: Iterable[str] | None = None,
+    metadata_date_keys: Iterable[str] = _DEFAULT_METADATA_DATE_KEYS,
+    synthesize_from_metadata: dict[str, str] | None = None,
+) -> list[LedgerEntry]:
+    """Read every bank-shaped posting in `path`, one LedgerEntry per match.
+
+    A posting is "in scope" when its account is in `accounts` or starts with
+    any prefix in `account_prefixes`. At least one of the two must be a
+    non-empty iterable; otherwise the call returns `[]`. A Transaction with
+    two in-scope legs (e.g. an SPK→PayPal transfer) yields two entries with
+    distinct `source_account` values.
+
+    Metadata synthesis still applies, but only for mapped accounts that are
+    themselves in scope — so a `paypal: 2024-01-17` hint synthesises a
+    PayPal-side LedgerEntry only when `Assets:B:PayPal` matches.
+    """
     if not path.exists():
         return []
 
+    explicit = set(accounts or ())
+    prefixes = tuple(account_prefixes or ())
+    if not explicit and not prefixes:
+        return []
+
+    def in_scope(account: str) -> bool:
+        if account in explicit:
+            return True
+        return bool(prefixes) and account.startswith(prefixes)
+
     entries, _errors, _options = load_file(str(path))
     results: list[LedgerEntry] = []
-
     date_keys = tuple(metadata_date_keys)
     synth_map = synthesize_from_metadata or {}
-    for entry in entries:
-        if not isinstance(entry, bc_data.Transaction):
+
+    for txn in entries:
+        if not isinstance(txn, bc_data.Transaction):
             continue
-        natural = _extract_entry(entry, source_account, str(path), date_keys)
-        if natural is not None:
-            results.append(natural)
-        for synthesized in _synthesize_virtual_entries(
-            entry, source_account, str(path), synth_map
-        ):
-            results.append(synthesized)
+        seen_accounts: set[str] = set()
+        for posting in txn.postings:
+            if posting.account in seen_accounts or not in_scope(posting.account):
+                continue
+            seen_accounts.add(posting.account)
+            natural = _extract_entry(txn, posting.account, str(path), date_keys)
+            if natural is not None:  # pragma: no branch  # pre-filtered
+                results.append(natural)
+        for mapped in {m for m in synth_map.values() if in_scope(m)}:
+            results.extend(
+                _synthesize_virtual_entries(txn, mapped, str(path), synth_map)
+            )
 
     return results
 
@@ -154,9 +197,6 @@ def _synthesize_virtual_entries(
       the scorer allows reversed-sign matches and the pipeline doesn't
       propose merge changes against it
     """
-    if not synthesize_from_metadata:
-        return []
-
     out: list[LedgerEntry] = []
     for src_posting in txn.postings:
         # beancount's loader populates `posting.meta` (with at least

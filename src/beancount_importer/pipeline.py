@@ -11,16 +11,18 @@ one `run()` call. The session itself is frozen.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-from beancount_importer.beancount_io.reader import read_ledger
+from beancount_importer.beancount_io.reader import read_ledger_multi
 from beancount_importer.beancount_io.writer import format_transaction
 from beancount_importer.config import BankConfig
 from beancount_importer.matching.dedup import is_duplicate
@@ -87,12 +89,12 @@ class NoopReporter:
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
 
-@dataclass(frozen=True)
-class _BankWork:
-    bank: BankConfig
-    parser: Parser
-    transactions: list[SourceTransaction]
-    existing_entries: list[LedgerEntry]
+# Ledger files whose contents are infrastructure (open/balance/pad assertions
+# and similar), not real transactions. Always excluded from the global outputs
+# sweep — even when a wrapper file like `main.bean` includes them, the
+# resulting entries are filtered out by source path so they don't double-count
+# in stats or surface as "no CSV source".
+_EXCLUDED_LEDGER_FILES = frozenset({"setup.bean"})
 
 
 def _build_parser(bank: BankConfig) -> Parser:
@@ -101,66 +103,62 @@ def _build_parser(bank: BankConfig) -> Parser:
     return GenericCsvParser(bank)
 
 
-def _resolve(base_dir: Path, template: str, year: int) -> Path:
-    return (base_dir / template.format(year=year)).resolve()
-
-
-def _load_existing(
-    bank: BankConfig,
+def _load_all_outputs(
     base_dir: Path,
-    years: tuple[int, ...] | None,
     transactions_dir: str,
-    metadata_date_keys: tuple[str, ...] = (),
+    *,
+    account_prefixes: Iterable[str],
+    extra_accounts: Iterable[str] = (),
+    metadata_date_keys: Iterable[str] = (),
     synthesize_from_metadata: dict[str, str] | None = None,
 ) -> list[LedgerEntry]:
-    """Load every already-imported entry for `bank`, across all years.
+    """Sweep `transactions_dir/**/*.bean` and return every bank-shaped entry.
 
-    Dedup needs to see the full ledger: CSVs straddle year boundaries (a 2024
-    Sparkasse export still includes Q4 2023), so loading only one year's
-    output_file would resurface real duplicates as "new" entries.
+    A posting is in scope when its account is in `extra_accounts` or starts
+    with one of `account_prefixes`. Each in-scope posting becomes one
+    `LedgerEntry`, so an SPK→PayPal transfer yields two entries (one per leg).
 
-    Two scan paths:
-    1. The bank's `source_files` template, expanded for each year in the
-       active filter — the conventional one-file-per-bank-per-year layout.
-       Skipped when `years` is None (all-years mode); the rglob below
-       already sweeps every year-folder under transactions_dir.
-    2. `transactions_dir/**/*.bean` — catches mixed-bank monthly files
-       (`2022-01.bean`, etc.) and historical years.
+    Reads are parallelized over a small thread pool — `beancount.loader.load_file`
+    dominates the wall-clock and releases the GIL inside its C parser.
+    `setup.bean` files are excluded both at the path level and on the
+    `entry.file_path` to handle entries reached via `include` wrappers.
+
+    Dedup by `(file_path, line_start, source_account)` collapses duplicates
+    surfacing through `include` wrappers without conflating distinct legs of
+    a cross-bank transfer (which carry the same line but different accounts).
     """
-    seen_paths: set[Path] = set()
-    entries: list[LedgerEntry] = []
-    read_kwargs: dict = {}
-    if metadata_date_keys:
-        read_kwargs["metadata_date_keys"] = metadata_date_keys
-    if synthesize_from_metadata:
-        read_kwargs["synthesize_from_metadata"] = synthesize_from_metadata
-
-    if years:
-        for year in years:
-            for src in bank.source_files:
-                path = _resolve(base_dir, src, year)
-                if path in seen_paths:
-                    continue
-                seen_paths.add(path)
-                if path.exists():
-                    entries.extend(read_ledger(path, bank.account, **read_kwargs))
-
     tx_root = (base_dir / transactions_dir).resolve()
-    if tx_root.exists():
-        for bean in tx_root.rglob("*.bean"):
-            if bean in seen_paths:
-                continue
-            seen_paths.add(bean)
-            entries.extend(read_ledger(bean, bank.account, **read_kwargs))
+    paths = sorted(
+        p for p in tx_root.rglob("*.bean") if p.name not in _EXCLUDED_LEDGER_FILES
+    ) if tx_root.exists() else []
+    if not paths:
+        return []
 
-    # Beancount's `load_file` resolves `include` directives, so wrappers
-    # like `main.bean` (which `include`s the per-bank files) re-surface
-    # the same transactions. The reader records each entry's *real*
-    # source `(file_path, line_start)`, so we dedupe here to collapse
-    # those duplicates without missing legitimate distinct entries.
-    deduped: dict[tuple[str, int], LedgerEntry] = {}
-    for entry in entries:
-        deduped.setdefault((entry.file_path, entry.line_start), entry)
+    prefixes = tuple(account_prefixes)
+    accounts = tuple(extra_accounts)
+    date_keys = tuple(metadata_date_keys)
+    synth_map = dict(synthesize_from_metadata or {})
+
+    def _read(path: Path) -> list[LedgerEntry]:
+        return read_ledger_multi(
+            path,
+            accounts=accounts,
+            account_prefixes=prefixes,
+            metadata_date_keys=date_keys,
+            synthesize_from_metadata=synth_map,
+        )
+
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+        per_path = list(pool.map(_read, paths))
+
+    deduped: dict[tuple[str, int, str], LedgerEntry] = {}
+    for entries in per_path:
+        for entry in entries:
+            if Path(entry.file_path).name in _EXCLUDED_LEDGER_FILES:
+                continue
+            deduped.setdefault(
+                (entry.file_path, entry.line_start, entry.source_account), entry
+            )
     return list(deduped.values())
 
 
@@ -176,6 +174,35 @@ def _select_banks(session: ImportSession) -> list[BankConfig]:
     if not bank_filter:
         return list(session.config.banks)
     return [b for b in session.config.banks if b.key == bank_filter]
+
+
+def _parse_all_inputs(
+    banks: list[BankConfig],
+    base_dir: Path,
+    year_filter: tuple[int, ...] | None,
+    reporter: Reporter | None,
+) -> list[SourceTransaction]:
+    """Parse every CSV across `banks` into a flat list, in deterministic order.
+
+    A `None` reporter swallows parse errors silently — used by the preview
+    path so a malformed CSV doesn't crash the report. With a reporter, errors
+    surface via `reporter.on_error`.
+    """
+    flat: list[SourceTransaction] = []
+    allowed = set(year_filter) if year_filter is not None else None
+    for bank in banks:
+        parser = _build_parser(bank)
+        for csv_file in _gather_csv_files(bank, base_dir):
+            try:
+                rows = list(parser.parse(str(csv_file)))
+            except Exception as exc:
+                if reporter is not None:
+                    reporter.on_error(f"{bank.key}: failed to parse {csv_file}: {exc}")
+                continue
+            if allowed is not None:
+                rows = [t for t in rows if t.booking_date.year in allowed]
+            flat.extend(rows)
+    return flat
 
 
 def run(
@@ -198,64 +225,59 @@ def run(
     year_filter = session.options.year_filter
 
     banks = _select_banks(session)
-    work: list[_BankWork] = []
-    for bank in banks:
-        parser = _build_parser(bank)
-        txns: list[SourceTransaction] = []
-        for csv_file in _gather_csv_files(bank, base_dir):
-            try:
-                txns.extend(parser.parse(str(csv_file)))
-            except Exception as exc:
-                reporter.on_error(f"{bank.key}: failed to parse {csv_file}: {exc}")
-        if year_filter is not None:
-            allowed = set(year_filter)
-            txns = [t for t in txns if t.booking_date.year in allowed]
-        existing = _load_existing(
-            bank,
-            base_dir,
-            year_filter,
-            config.transactions_dir,
-            metadata_date_keys=tuple(config.matching.metadata_date_keys),
-            synthesize_from_metadata=dict(config.matching.synthesize_from_metadata),
-        )
-        work.append(_BankWork(bank, parser, txns, existing))
+    inputs = _parse_all_inputs(banks, base_dir, year_filter, reporter)
+
+    # Single global sweep of every .bean under transactions_dir. The result is
+    # one entry per bank-shaped posting; matching looks up the per-account
+    # bucket below by `bank.account`. Cross-bank transit legs surface in their
+    # own buckets without per-bank rglobs.
+    bank_accounts = tuple({b.account for b in banks})
+    existing = _load_all_outputs(
+        base_dir,
+        config.transactions_dir,
+        account_prefixes=tuple(config.matching.internal_transfer_account_prefixes),
+        extra_accounts=bank_accounts,
+        metadata_date_keys=tuple(config.matching.metadata_date_keys),
+        synthesize_from_metadata=dict(config.matching.synthesize_from_metadata),
+    )
+    existing_by_account: dict[str, list[LedgerEntry]] = {}
+    for entry in existing:
+        existing_by_account.setdefault(entry.source_account, []).append(entry)
+
+    bank_account_by_key = {b.key: b.account for b in banks}
+    bank_by_key = {b.key: b for b in banks}
 
     transforms = load_transforms(config.transforms.enabled)
     working_rules: list[CategorizationRule] = list(session.rules)
     working_tag: ActiveTag | None = session.tag_state.active
 
-    total = sum(len(bw.transactions) for bw in work)
-    progress = 0
+    total = len(inputs)
     results: list[ImportResult] = []
-    quit_pending = False
 
-    for bw in work:
-        if quit_pending:
+    for progress, txn in enumerate(inputs, start=1):
+        reporter.on_progress(progress, total, txn.bank_key)
+
+        bank_cfg = bank_by_key[txn.bank_key]
+        bucket = existing_by_account.get(bank_account_by_key[txn.bank_key], [])
+        result, working_tag, working_rules = _process_transaction(
+            txn=txn,
+            bank=bank_cfg,
+            existing=bucket,
+            config=config,
+            working_rules=working_rules,
+            working_tag=working_tag,
+            transforms_hooks=transforms,
+            categorize_fn=categorize_fn,
+            decisions=decisions,
+            auto_threshold=session.options.auto_threshold,
+        )
+
+        decisions.record(txn, result)
+        reporter.on_result(result)
+        results.append(result)
+
+        if result.action == "quit":
             break
-        for txn in bw.transactions:
-            progress += 1
-            reporter.on_progress(progress, total, bw.bank.key)
-
-            result, working_tag, working_rules = _process_transaction(
-                txn=txn,
-                bank=bw.bank,
-                existing=bw.existing_entries,
-                config=config,
-                working_rules=working_rules,
-                working_tag=working_tag,
-                transforms_hooks=transforms,
-                categorize_fn=categorize_fn,
-                decisions=decisions,
-                auto_threshold=session.options.auto_threshold,
-            )
-
-            decisions.record(txn, result)
-            reporter.on_result(result)
-            results.append(result)
-
-            if result.action == "quit":
-                quit_pending = True
-                break
 
     return results
 
@@ -586,16 +608,17 @@ def _format_new_entry(
 
 @dataclass(frozen=True)
 class BeanProvenanceStats:
-    """Per-(bank, year) reverse-matching counts for the preview.
+    """Reverse-matching counts for one section in one year.
 
-    `total_in_bean`: existing ledger entries booked into this bank's account.
-    `bean_unmatched`: subset that have no matching CSV row across any bank.
-    `bean_expanded`: post-plugin transaction count from `bean-query`. Zero
-    when the count was not collected (no `main_bean` configured, file
-    missing, or `bean-query` unavailable).
+    `section` is either a configured bank's account (`Assets:B:SPK`) or the
+    relative path of the `.bean` file that holds non-configured entries
+    (e.g. `TR.bean`). File grouping collapses per-sub-account noise so a
+    user with one TR sub-account per share sees one TR section, not many.
+    Counts are deduped per Transaction; `bean_expanded` is bean-query's
+    post-plugin count, populated only for configured-bank sections.
     """
 
-    bank: str
+    section: str
     year: int
     total_in_bean: int = 0
     bean_unmatched: int = 0
@@ -630,90 +653,71 @@ def compute_bean_provenance_stats(
     session: ImportSession,
     base_dir: Path,
 ) -> dict[tuple[str, int], BeanProvenanceStats]:
-    """Per-(bank, year) bean-side stats for the preview.
+    """Per-(section, year) bean-side stats for preview and post-import summary.
 
-    Independent of `run()` to avoid widening the pipeline's return type.
-    Reuses the same loaders so the entries and CSV rows match exactly what
-    `run()` would have seen.
+    Reads every CSV across configured banks (the input universe) and every
+    `.bean` under `transactions_dir` (the output universe), then matches the
+    two by amount + date for each existing entry. Sections are:
+
+    - Each configured bank's account (`Assets:B:SPK`, …): one section per bank.
+    - Each `.bean` file containing entries whose accounts aren't tied to any
+      configured bank: one section per file, keyed by relative path.
+
+    Plus a year-aggregate sentinel `("", year)` that counts unique ledger
+    transactions across the year (deduped across cross-account legs).
     """
     config = session.config
     year_filter = session.options.year_filter
     banks = _select_banks(session)
 
-    csv_by_bank: dict[str, list[SourceTransaction]] = {}
-    bean_by_bank: dict[str, list[LedgerEntry]] = {}
+    all_csv = _parse_all_inputs(banks, base_dir, year_filter, reporter=None)
+    existing = _load_all_outputs(
+        base_dir,
+        config.transactions_dir,
+        account_prefixes=tuple(config.matching.internal_transfer_account_prefixes),
+        extra_accounts=tuple({b.account for b in banks}),
+        metadata_date_keys=tuple(config.matching.metadata_date_keys),
+        synthesize_from_metadata=dict(config.matching.synthesize_from_metadata),
+    )
 
-    for bank in banks:
-        parser = _build_parser(bank)
-        txns: list[SourceTransaction] = []
-        for csv_file in _gather_csv_files(bank, base_dir):
-            try:
-                txns.extend(parser.parse(str(csv_file)))
-            except Exception:
-                continue
-        if year_filter is not None:
-            allowed = set(year_filter)
-            txns = [t for t in txns if t.booking_date.year in allowed]
-        csv_by_bank[bank.key] = txns
-        bean_by_bank[bank.key] = _load_existing(
-            bank,
-            base_dir,
-            year_filter,
-            config.transactions_dir,
-            metadata_date_keys=tuple(config.matching.metadata_date_keys),
-            synthesize_from_metadata=dict(config.matching.synthesize_from_metadata),
-        )
-
-    all_csv: list[SourceTransaction] = [t for ts in csv_by_bank.values() for t in ts]
-
-    stats: dict[tuple[str, int], BeanProvenanceStats] = {}
+    bank_accounts = {b.account for b in banks}
+    tx_root = (base_dir / config.transactions_dir).resolve()
     expanded = _expanded_counts(config, base_dir, banks, year_filter)
 
-    # Track unique entries per year (across banks) to compute correct
-    # year-aggregate totals. A single Beancount transaction touching two
-    # bank accounts (e.g. a transfer) is returned once per bank by
-    # `_load_existing` — summing per-bank counts at year level would
-    # double-count it. We dedupe by (file_path, line_start), which
-    # uniquely identifies a transaction in the source ledger.
+    # Per-section, per-year buckets dedupe by (file_path, line_start) so a
+    # single transaction with multiple in-scope postings (e.g. a TR rebalance
+    # touching two sub-accounts) counts once. The same key underpins the
+    # cross-section year-aggregate at ("", year).
+    by_section: dict[tuple[str, int], dict[tuple[str, int], LedgerEntry]] = {}
     year_unique: dict[int, dict[tuple[str, int], LedgerEntry]] = {}
 
-    for bank in banks:
-        # Group entries by year, honouring the active year_filter.
-        years_present: dict[int, list[LedgerEntry]] = {}
-        for entry in bean_by_bank[bank.key]:
-            if year_filter is not None and entry.date.year not in year_filter:
-                continue
-            years_present.setdefault(entry.date.year, []).append(entry)
-            year_unique.setdefault(entry.date.year, {}).setdefault(
-                (entry.file_path, entry.line_start), entry
-            )
+    for entry in existing:
+        year = entry.date.year
+        if year_filter is not None and year not in year_filter:
+            continue
+        if entry.source_account in bank_accounts:
+            section = entry.source_account
+        else:
+            section = str(Path(entry.file_path).resolve().relative_to(tx_root))
+        line_key = (entry.file_path, entry.line_start)
+        by_section.setdefault((section, year), {}).setdefault(line_key, entry)
+        year_unique.setdefault(year, {}).setdefault(line_key, entry)
 
-        for year, entries in years_present.items():
-            unmatched = sum(1 for e in entries if not _has_csv_match(e, all_csv))
-            stats[(bank.key, year)] = BeanProvenanceStats(
-                bank=bank.key,
-                year=year,
-                total_in_bean=len(entries),
-                bean_unmatched=unmatched,
-                bean_expanded=expanded.get((bank.key, year), 0),
-            )
-
-    # Year-aggregate stats keyed by ("", year). Counts unique transactions
-    # rather than (bank, posting) pairs. `bean_expanded` is left at 0 here
-    # because the per-bank `bean-query` counts also include cross-bank
-    # transactions in each bank's tally and would similarly double-count
-    # if summed; we only know how to dedupe what we loaded ourselves.
-    for year, unique in year_unique.items():
-        entries = list(unique.values())
-        unmatched = sum(1 for e in entries if not _has_csv_match(e, all_csv))
-        stats[("", year)] = BeanProvenanceStats(
-            bank="",
+    def _stats(section: str, year: int, entries: list[LedgerEntry]) -> BeanProvenanceStats:
+        return BeanProvenanceStats(
+            section=section,
             year=year,
             total_in_bean=len(entries),
-            bean_unmatched=unmatched,
-            bean_expanded=0,
+            bean_unmatched=sum(1 for e in entries if not _has_csv_match(e, all_csv)),
+            bean_expanded=expanded.get((section, year), 0),
         )
 
+    stats: dict[tuple[str, int], BeanProvenanceStats] = {
+        (section, year): _stats(section, year, list(unique.values()))
+        for (section, year), unique in by_section.items()
+    }
+    for year, unique in year_unique.items():
+        stats[("", year)] = _stats("", year, list(unique.values()))
     return stats
 
 
@@ -723,47 +727,50 @@ def _expanded_counts(
     banks: list[BankConfig],
     year_filter: tuple[int, ...] | None,
 ) -> dict[tuple[str, int], int]:
-    """Run `bean-query` once per (bank, year) to get the plugin-expanded count.
+    """Run `bean-query` per (account, year) to get the plugin-expanded count.
 
-    Silently returns an empty mapping when `main_bean` is unset, the file
-    does not exist, or `bean-query` is missing. This is a "nice to have"
-    line in the preview; no error should derail the rest of the report.
+    Returns `{}` when `main_bean` is unset, no per-year file exists, or
+    `bean-query` isn't on PATH. Failures per call are swallowed — this is a
+    nice-to-have preview line, not load-bearing.
     """
     main_bean_template: str | None = getattr(config, "main_bean", None)
-    if not main_bean_template:
+    if not main_bean_template or year_filter is None:
         return {}
     if shutil.which("bean-query") is None:
         return {}
 
-    if year_filter is None:
-        return {}
-
-    counts: dict[tuple[str, int], int] = {}
+    jobs: list[tuple[str, int, Path]] = []
     for year in year_filter:
         main_bean_path = (base_dir / main_bean_template.format(year=year)).resolve()
-        if not main_bean_path.exists():
-            continue
-        for bank in banks:
-            query = (
-                f"SELECT count(date) WHERE date >= {year}-01-01"
-                f" AND date < {year + 1}-01-01"
-                f" AND account ~ '{bank.account}'"
-            )
-            try:
-                result = subprocess.run(
-                    ["bean-query", str(main_bean_path), query],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                continue
-            if result.returncode != 0:
-                continue
-            for line in result.stdout.strip().splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    counts[(bank.key, year)] = int(line)
-                    break
+        if main_bean_path.exists():
+            jobs.extend((bank.account, year, main_bean_path) for bank in banks)
+    if not jobs:
+        return {}
 
-    return counts
+    def _run_one(job: tuple[str, int, Path]) -> tuple[str, int, int] | None:
+        account, year, main_bean_path = job
+        query = (
+            f"SELECT count(date) WHERE date >= {year}-01-01"
+            f" AND date < {year + 1}-01-01"
+            f" AND account ~ '{account}'"
+        )
+        try:
+            result = subprocess.run(
+                ["bean-query", str(main_bean_path), query],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.strip().splitlines():
+            stripped = line.strip()
+            if stripped.isdigit():
+                return account, year, int(stripped)
+        return None
+
+    with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as pool:
+        outcomes = list(pool.map(_run_one, jobs))
+    return {(account, year): n for o in outcomes if o is not None for account, year, n in [o]}

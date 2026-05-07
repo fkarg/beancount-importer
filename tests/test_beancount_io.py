@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from beancount_importer.beancount_io.reader import read_ledger
+from beancount_importer.beancount_io.reader import read_ledger, read_ledger_multi
 from beancount_importer.beancount_io.writer import append_entry, format_transaction, splice_entries
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -337,6 +337,109 @@ class TestCoerceDate:
         # rather than raise.
         assert _coerce_date(12345) is None
         assert _coerce_date(None) is None
+
+
+class TestReadLedgerMulti:
+    """Multi-account variant: emits one entry per matching posting on a Transaction.
+
+    Matching is by explicit account membership OR by `account_prefixes`. Both
+    can be supplied together. With neither supplied, the call returns an empty
+    list (callers should always say what they want).
+    """
+
+    def _write(self, path: Path, content: str) -> None:
+        path.write_text(content)
+
+    def test_no_filters_returns_empty(self, tmp_path: Path):
+        bean = tmp_path / "x.bean"
+        self._write(
+            bean,
+            '2024-01-15 * "X" ""\n'
+            '  Assets:B:SPK  -1 EUR\n'
+            '  Expenses:Other  1 EUR\n',
+        )
+        assert read_ledger_multi(bean) == []
+
+    def test_missing_file_returns_empty(self, tmp_path: Path):
+        assert read_ledger_multi(
+            tmp_path / "nope.bean", account_prefixes=("Assets:B:",)
+        ) == []
+
+    def test_emits_one_entry_per_matching_posting(self, tmp_path: Path):
+        # SPK→N26 transfer has two bank-shaped legs; multi-mode exposes both.
+        bean = tmp_path / "x.bean"
+        self._write(
+            bean,
+            '2024-02-01 * "transfer" ""\n'
+            '  Assets:B:SPK  -100 EUR\n'
+            '  Assets:B:N26  100 EUR\n',
+        )
+        entries = read_ledger_multi(bean, account_prefixes=("Assets:B:",))
+        accounts = sorted(e.source_account for e in entries)
+        assert accounts == ["Assets:B:N26", "Assets:B:SPK"]
+
+    def test_explicit_accounts_take_precedence(self, tmp_path: Path):
+        bean = tmp_path / "x.bean"
+        self._write(
+            bean,
+            '2024-02-01 * "transfer" ""\n'
+            '  Assets:B:SPK  -100 EUR\n'
+            '  Assets:B:N26  100 EUR\n',
+        )
+        # No prefix; only SPK is explicitly named.
+        entries = read_ledger_multi(bean, accounts=("Assets:B:SPK",))
+        assert [e.source_account for e in entries] == ["Assets:B:SPK"]
+
+    def test_synthesis_only_for_in_scope_targets(self, tmp_path: Path):
+        bean = tmp_path / "x.bean"
+        self._write(
+            bean,
+            '2024-04-13 * "Google" ""\n'
+            '  Assets:B:SPK  -3.39 EUR\n'
+            '    paypal: 2024-04-11\n'
+            '  Expenses:Apps  3.39 EUR\n',
+        )
+        # PayPal not in scope → no synthesised entry.
+        entries = read_ledger_multi(
+            bean,
+            accounts=("Assets:B:SPK",),
+            synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
+        )
+        assert [e.source_account for e in entries] == ["Assets:B:SPK"]
+
+        # PayPal added to scope via prefix → SPK entry plus synthesised PayPal entry.
+        entries2 = read_ledger_multi(
+            bean,
+            account_prefixes=("Assets:B:",),
+            synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
+        )
+        accounts = sorted(e.source_account for e in entries2)
+        assert accounts == ["Assets:B:PayPal", "Assets:B:SPK"]
+
+    def test_synthesis_filter_skips_unmapped_keys(self, tmp_path: Path):
+        # Two synth keys mapping to different accounts; only one is in scope.
+        # Exercises `_synthesize_virtual_entries`'s `mapped != source_account`
+        # branch when the synth_map carries entries irrelevant to the current
+        # synthesis target.
+        bean = tmp_path / "x.bean"
+        self._write(
+            bean,
+            '2024-04-13 * "Google" ""\n'
+            '  Assets:B:SPK  -3.39 EUR\n'
+            '    paypal: 2024-04-11\n'
+            '  Expenses:Apps  3.39 EUR\n',
+        )
+        entries = read_ledger_multi(
+            bean,
+            accounts=("Assets:B:PayPal",),
+            synthesize_from_metadata={
+                "paypal": "Assets:B:PayPal",
+                "settle": "Assets:B:Other",  # not in scope, must be filtered
+            },
+        )
+        assert len(entries) == 1
+        assert entries[0].source_account == "Assets:B:PayPal"
+        assert entries[0].date == date(2024, 4, 11)
 
 
 # ── writer: format_transaction ───────────────────────────────────────────────

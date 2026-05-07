@@ -393,9 +393,10 @@ def main(
     _persist_tag_updates(results, tag_state, tags_path, dry_run=skip_persist)
     if preview:
         bean_stats = compute_bean_provenance_stats(session, base_dir)
-        _print_preview_table(results, bean_stats)
+        _print_preview_table(results, config, bean_stats)
     else:
-        _print_summary(results, dry_run=skip_persist)
+        bean_stats = compute_bean_provenance_stats(session, base_dir)
+        _print_summary(results, config, bean_stats, dry_run=skip_persist)
 
 
 # ── Result persistence ────────────────────────────────────────────────────────
@@ -514,11 +515,20 @@ def _aggregate_preview(
     results: list[ImportResult],
     bean_stats: dict[tuple[str, int], BeanProvenanceStats],
     year: int,
+    config: Config,
 ) -> dict[str, _PreviewStats]:
-    by_bank: dict[str, _PreviewStats] = {}
+    """Bucket counts by section identifier.
+
+    A section is either a configured bank's account (`Assets:B:SPK`) or, for
+    bean entries with no configured bank, the relative path of the `.bean`
+    file they live in. CSV-side rows always map to a bank → account; bean-side
+    keys come pre-bucketed from `compute_bean_provenance_stats`.
+    """
+    by_section: dict[str, _PreviewStats] = {}
+    bank_account = {b.key: b.account for b in config.banks}
     for r in results:
-        bank = r.source_txn.bank_key
-        s = by_bank.setdefault(bank, _PreviewStats())
+        section = bank_account.get(r.source_txn.bank_key, r.source_txn.bank_key)
+        s = by_section.setdefault(section, _PreviewStats())
         s.total += 1
         if r.action == "skip":
             if r.skip_reason == "skip_rule":
@@ -538,22 +548,46 @@ def _aggregate_preview(
             else:
                 s.import_manual += 1
 
-    # Fold in bean-side stats for every bank that has ledger entries for
-    # this year, even those without any CSV rows in the import set.
-    # Skip the year-aggregate sentinel (bank=="") — handled separately at
-    # year-total level by the caller.
-    for (bank_key, bean_year), prov in bean_stats.items():
-        if bean_year != year or bank_key == "":
+    # Fold in bean-side stats for every section with ledger entries this year,
+    # including file sections. The year-aggregate sentinel (section=="") is
+    # handled separately at year-total level by the caller.
+    for (section, bean_year), prov in bean_stats.items():
+        if bean_year != year or section == "":
             continue
-        s = by_bank.setdefault(bank_key, _PreviewStats())
+        s = by_section.setdefault(section, _PreviewStats())
         s.total_in_bean = prov.total_in_bean
         s.bean_unmatched = prov.bean_unmatched
         s.bean_expanded = prov.bean_expanded
-    return by_bank
+    return by_section
+
+
+def _section_label(section_id: str) -> str:
+    """Display label for a section.
+
+    Configured-bank sections are keyed by the bank's account (`Assets:B:SPK`
+    → `SPK`); file sections are keyed by the file's relative path
+    (`TR.bean` → `TR`, `2022-01.bean` → `2022-01`).
+    """
+    if ":" in section_id:
+        return section_id.rsplit(":", 1)[-1].upper()
+    return Path(section_id).stem
+
+
+def _ordered_sections(by_section: dict[str, _PreviewStats], config: Config) -> list[str]:
+    """Configured banks first (config order), then file sections alphabetical.
+
+    The familiar SPK/N26/PAYPAL ordering is preserved; non-configured ledger
+    files (TR.bean, 2022-01.bean, …) cluster at the bottom of each year.
+    """
+    configured = [b.account for b in config.banks if b.account in by_section]
+    seen = set(configured)
+    extras = sorted(s for s in by_section if s not in seen)
+    return configured + extras
 
 
 def _print_preview_table(
     results: list[ImportResult],
+    config: Config,
     bean_stats: dict[tuple[str, int], BeanProvenanceStats] | None = None,
 ) -> None:
     bean_stats = bean_stats or {}
@@ -653,11 +687,11 @@ def _print_preview_table(
     for year in sorted(by_year):
         console.print(f"\n  [bold magenta]── {year} ──[/]")
         year_results = by_year[year]
-        by_bank = _aggregate_preview(year_results, bean_stats, year)
+        by_section = _aggregate_preview(year_results, bean_stats, year, config)
         year_total = _PreviewStats()
-        for bank in sorted(by_bank):
-            section(bank.upper(), by_bank[bank], indent="    ")
-            year_total.add(by_bank[bank])
+        for section_id in _ordered_sections(by_section, config):
+            section(_section_label(section_id), by_section[section_id], indent="    ")
+            year_total.add(by_section[section_id])
         # Inject year-aggregate bean stats (deduped across banks) — the
         # add() loop above only sums CSV-side counts.
         year_agg = bean_stats.get(("", year))
@@ -682,7 +716,13 @@ def _print_preview_table(
         console.print(f"  [green]→ {auto} transaction(s) would auto-apply via rules[/]")
 
 
-def _print_summary(results: list[ImportResult], *, dry_run: bool) -> None:
+def _print_summary(
+    results: list[ImportResult],
+    config: Config,
+    bean_stats: dict[tuple[str, int], BeanProvenanceStats],
+    *,
+    dry_run: bool,
+) -> None:
     counts: dict[str, int] = {}
     for r in results:
         action = r.action
@@ -692,6 +732,32 @@ def _print_summary(results: list[ImportResult], *, dry_run: bool) -> None:
     rendered = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     prefix = "[yellow]dry-run[/] " if dry_run else ""
     console.print(f"\n{prefix}done: {rendered or 'no transactions'}")
+
+    # One hint per section with unmatched ledger entries. Same data the
+    # preview surfaces, kept short for the interactive summary so users see
+    # at a glance how much of the ledger has no CSV provenance.
+    by_section_unmatched: dict[str, int] = {}
+    for (section, _year), prov in bean_stats.items():
+        if section == "" or not prov.bean_unmatched:
+            continue
+        by_section_unmatched[section] = (
+            by_section_unmatched.get(section, 0) + prov.bean_unmatched
+        )
+    if by_section_unmatched:
+        configured_order = [b.account for b in config.banks]
+        ordered = sorted(
+            by_section_unmatched,
+            key=lambda s: (
+                configured_order.index(s) if s in configured_order else len(configured_order),
+                s,
+            ),
+        )
+        for section in ordered:
+            label = _section_label(section)
+            n = by_section_unmatched[section]
+            console.print(
+                f"  [magenta]→ {n} {label} transaction(s) have no CSV source[/]"
+            )
 
 
 _STARTER_CONFIG = """\

@@ -483,6 +483,125 @@ class TestBeanProvenanceStats:
     def _bank(self) -> BankConfig:
         return make_spk_bank(year_template_output=False)
 
+    def test_non_configured_file_collapses_to_one_section(self, tmp_path: Path):
+        # TR.bean lives alongside SPK.bean but no [[banks]] entry registers
+        # any TR account. Several sub-accounts (one per share) all live in
+        # the same file — they collapse into a single TR.bean section keyed
+        # by relative file path, so per-share noise stays out of the preview.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        (tmp_path / "transactions" / "TR.bean").write_text(textwrap.dedent("""\
+            2024-03-01 * "Trade Republic" "Dividend AAPL"
+              Assets:B:TR:AAPL  +1.50 EUR
+              Income:Dividend  -1.50 EUR
+
+            2024-04-01 * "Trade Republic" "Buy GOOG"
+              Assets:B:TR:GOOG  -50.00 EUR
+              Assets:Investment  50.00 EUR
+        """))
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # All TR sub-accounts collapse into the TR.bean file section.
+        assert ("TR.bean", 2024) in stats
+        assert stats[("TR.bean", 2024)].total_in_bean == 2
+        assert stats[("TR.bean", 2024)].bean_unmatched == 2
+        # No per-account section for AAPL/GOOG/etc. — file grouping wins.
+        assert ("Assets:B:TR:AAPL", 2024) not in stats
+        assert ("Assets:B:TR:GOOG", 2024) not in stats
+        # Configured SPK section unaffected.
+        assert stats[("Assets:B:SPK", 2024)].total_in_bean == 1
+
+    def test_monthly_mixed_bank_file_splits_by_configured_account(self, tmp_path: Path):
+        # Pre-2024 layouts use month-named files (`2022-01.bean`) carrying
+        # postings from multiple banks. The SPK leg attributes to the SPK
+        # bank section; the (non-configured) N26 leg falls into the file
+        # section since N26 isn't in this test's config.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "2022-01.bean").write_text(textwrap.dedent("""\
+            2022-01-05 * "X" ""
+              Assets:B:SPK  -10.00 EUR
+              Expenses:X  10.00 EUR
+
+            2022-01-10 * "Y" ""
+              Assets:B:N26  -5.00 EUR
+              Expenses:Y  5.00 EUR
+        """))
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # SPK leg → configured-bank section.
+        assert stats[("Assets:B:SPK", 2022)].total_in_bean == 1
+        # N26 leg (non-configured) → file section.
+        assert stats[("2022-01.bean", 2022)].total_in_bean == 1
+        # Year-aggregate counts unique transactions, not (section, posting) pairs.
+        assert stats[("", 2022)].total_in_bean == 2
+
+    def test_setup_bean_files_are_excluded(self, tmp_path: Path):
+        # Setup files carry open/pad/balance directives and the occasional
+        # bootstrap transaction that the user doesn't want surfaced as
+        # "no CSV source" noise. They're filtered both when read directly
+        # and when reached via an `include` from a wrapper file (where
+        # beancount's loader resolves them transparently).
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "setup.bean").write_text(textwrap.dedent("""\
+            2024-01-01 * "Bootstrap" "Initial balance"
+              Assets:B:SPK  +1000.00 EUR
+              Equity:Opening-Balances  -1000.00 EUR
+        """))
+        (tmp_path / "transactions" / "main.bean").write_text(
+            'include "setup.bean"\n'
+        )
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-02-01 * "Real" "transaction"
+              Assets:B:SPK  -10.00 EUR
+              Expenses:X  10.00 EUR
+        """))
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # Only the SPK.bean transaction is counted — the setup.bean bootstrap
+        # entry is filtered, and the include wrapper doesn't smuggle it back.
+        assert stats[("Assets:B:SPK", 2024)].total_in_bean == 1
+        assert ("setup.bean", 2024) not in stats
+
+    def test_multi_posting_in_file_section_dedupes_by_line(self, tmp_path: Path):
+        # A single transaction with two non-configured legs (e.g. a TR
+        # rebalance touching two sub-accounts) yields two LedgerEntry
+        # records, but the file section dedupes by (file_path, line_start)
+        # so the count reflects unique transactions.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "TR.bean").write_text(textwrap.dedent("""\
+            2024-03-01 * "Trade Republic" "Rebalance"
+              Assets:B:TR:AAPL  -100.00 EUR
+              Assets:B:TR:GOOG  +100.00 EUR
+        """))
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # One transaction in TR.bean, even though two postings match the prefix.
+        assert stats[("TR.bean", 2024)].total_in_bean == 1
+
     def test_counts_total_bean_entries_per_year(self, tmp_path: Path):
         # Two SPK ledger entries in 2024, one in 2023.
         (tmp_path / "transactions").mkdir()
@@ -507,10 +626,10 @@ class TestBeanProvenanceStats:
         )
         session = ImportSession(config=cfg, options=ImportOptions())
         stats = compute_bean_provenance_stats(session, tmp_path)
-        assert stats[("spk", 2024)].total_in_bean == 2
-        assert stats[("spk", 2024)].bean_unmatched == 2
-        assert stats[("spk", 2023)].total_in_bean == 1
-        assert stats[("spk", 2023)].bean_unmatched == 1
+        assert stats[("Assets:B:SPK", 2024)].total_in_bean == 2
+        assert stats[("Assets:B:SPK", 2024)].bean_unmatched == 2
+        assert stats[("Assets:B:SPK", 2023)].total_in_bean == 1
+        assert stats[("Assets:B:SPK", 2023)].bean_unmatched == 1
 
     def test_csv_match_reduces_unmatched(self, tmp_path: Path):
         (tmp_path / "transactions").mkdir()
@@ -532,8 +651,8 @@ class TestBeanProvenanceStats:
         )
         session = ImportSession(config=cfg, options=ImportOptions())
         stats = compute_bean_provenance_stats(session, tmp_path)
-        assert stats[("spk", 2024)].total_in_bean == 2
-        assert stats[("spk", 2024)].bean_unmatched == 1
+        assert stats[("Assets:B:SPK", 2024)].total_in_bean == 2
+        assert stats[("Assets:B:SPK", 2024)].bean_unmatched == 1
 
     def test_year_filter_scopes_results(self, tmp_path: Path):
         (tmp_path / "transactions").mkdir()
@@ -554,8 +673,8 @@ class TestBeanProvenanceStats:
         opts = ImportOptions(year_filter=(2024,))
         session = ImportSession(config=cfg, options=opts)
         stats = compute_bean_provenance_stats(session, tmp_path)
-        assert ("spk", 2024) in stats
-        assert ("spk", 2023) not in stats
+        assert ("Assets:B:SPK", 2024) in stats
+        assert ("Assets:B:SPK", 2023) not in stats
 
     def test_expanded_count_skipped_without_main_bean(self, tmp_path: Path):
         (tmp_path / "transactions").mkdir()
@@ -572,7 +691,7 @@ class TestBeanProvenanceStats:
         session = ImportSession(config=cfg, options=ImportOptions())
         stats = compute_bean_provenance_stats(session, tmp_path)
         # No `main_bean` configured ⇒ expanded count is reported as zero.
-        assert stats[("spk", 2024)].bean_expanded == 0
+        assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
     def test_csv_parse_failure_is_silently_skipped(self, tmp_path: Path):
         # `compute_bean_provenance_stats` swallows CSV parse exceptions to
@@ -597,7 +716,7 @@ class TestBeanProvenanceStats:
         # Must not raise — the stats still come back even though the CSV
         # is unusable.
         stats = compute_bean_provenance_stats(session, tmp_path)
-        assert stats[("spk", 2024)].total_in_bean == 1
+        assert stats[("Assets:B:SPK", 2024)].total_in_bean == 1
 
     def test_dedupes_entries_surfaced_via_include_wrappers(self, tmp_path: Path):
         # `main.bean` (a wrapper) `include`s the per-bank ledger, and an
@@ -630,7 +749,7 @@ class TestBeanProvenanceStats:
         session = ImportSession(config=cfg, options=ImportOptions())
         stats = compute_bean_provenance_stats(session, tmp_path)
         # Without dedup this would be 6 (2 entries × 3 wrapper files).
-        assert stats[("spk", 2024)].total_in_bean == 2
+        assert stats[("Assets:B:SPK", 2024)].total_in_bean == 2
 
     def test_year_aggregate_dedupes_cross_bank_transactions(self, tmp_path: Path):
         # A single ledger transaction posting to TWO bank accounts (a transfer)
@@ -660,8 +779,8 @@ class TestBeanProvenanceStats:
         session = ImportSession(config=cfg, options=ImportOptions())
         stats = compute_bean_provenance_stats(session, tmp_path)
         # Per-bank: each bank is touched by the one transaction.
-        assert stats[("spk", 2024)].total_in_bean == 1
-        assert stats[("dkb", 2024)].total_in_bean == 1
+        assert stats[("Assets:B:SPK", 2024)].total_in_bean == 1
+        assert stats[("Assets:B:DKB", 2024)].total_in_bean == 1
         # Year-aggregate (sentinel bank=""): unique ledger transactions only.
         assert stats[("", 2024)].total_in_bean == 1
         assert stats[("", 2024)].bean_unmatched == 1
@@ -710,13 +829,13 @@ class TestExpandedCounts:
         monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
         monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
         stats = compute_bean_provenance_stats(session, base)
-        assert stats[("spk", 2024)].bean_expanded == 42
+        assert stats[("Assets:B:SPK", 2024)].bean_expanded == 42
 
     def test_returns_zero_when_bean_query_missing(self, tmp_path: Path, monkeypatch):
         session, base = self._setup(tmp_path)
         monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: None)
         stats = compute_bean_provenance_stats(session, base)
-        assert stats[("spk", 2024)].bean_expanded == 0
+        assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
     def test_returns_zero_when_year_filter_none(self, tmp_path: Path, monkeypatch):
         # No year filter ⇒ skip subprocess work entirely.
@@ -748,7 +867,7 @@ class TestExpandedCounts:
             lambda *a, **kw: called.append(a),
         )
         stats = compute_bean_provenance_stats(session, base)
-        assert stats[("spk", 2024)].bean_expanded == 0
+        assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
         assert called == []
 
     def test_bean_query_nonzero_returncode_skips_count(self, tmp_path: Path, monkeypatch):
@@ -764,7 +883,7 @@ class TestExpandedCounts:
         monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
         monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
         stats = compute_bean_provenance_stats(session, base)
-        assert stats[("spk", 2024)].bean_expanded == 0
+        assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
     def test_bean_query_timeout_swallowed(self, tmp_path: Path, monkeypatch):
         import subprocess as sp
@@ -777,7 +896,7 @@ class TestExpandedCounts:
         monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", raising)
         # Must not propagate the TimeoutExpired.
         stats = compute_bean_provenance_stats(session, base)
-        assert stats[("spk", 2024)].bean_expanded == 0
+        assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
     def test_bean_query_filenotfound_swallowed(self, tmp_path: Path, monkeypatch):
         # If `which` lies (bean-query was uninstalled between checks), the
@@ -790,7 +909,7 @@ class TestExpandedCounts:
         monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
         monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", raising)
         stats = compute_bean_provenance_stats(session, base)
-        assert stats[("spk", 2024)].bean_expanded == 0
+        assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
     def test_bean_query_non_numeric_output_yields_zero(self, tmp_path: Path, monkeypatch):
         # Output without a digit-only line (e.g. unexpected header format)
@@ -807,7 +926,7 @@ class TestExpandedCounts:
         monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
         monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
         stats = compute_bean_provenance_stats(session, base)
-        assert stats[("spk", 2024)].bean_expanded == 0
+        assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
 
 # ── CSV parse failure surfaces via reporter.on_error ─────────────────────────
@@ -1259,7 +1378,7 @@ class TestHasCsvMatch:
         stats = compute_bean_provenance_stats(session, tmp_path)
         # The matched bean entry has bean_unmatched=0 because the second
         # CSV row matches it.
-        assert stats[("spk", 2024)].bean_unmatched == 0
+        assert stats[("Assets:B:SPK", 2024)].bean_unmatched == 0
 
     def test_amount_match_but_date_too_far_continues(self, tmp_path: Path):
         # Same amount, but every CSV row's date is far outside the tolerance
@@ -1281,4 +1400,4 @@ class TestHasCsvMatch:
         )
         session = ImportSession(config=cfg, options=ImportOptions())
         stats = compute_bean_provenance_stats(session, tmp_path)
-        assert stats[("spk", 2024)].bean_unmatched == 1
+        assert stats[("Assets:B:SPK", 2024)].bean_unmatched == 1
