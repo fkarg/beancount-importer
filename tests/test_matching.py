@@ -179,6 +179,41 @@ class TestIsDuplicate:
         e = make_entry(amount=Decimal("-20"), narration="other")
         assert not is_duplicate(t1, [e])
 
+    def test_detects_content_match_on_cash_withdrawal(self):
+        # Real-world regression: cash withdrawal at SPK ATM has no SEPA
+        # ref, falls back to the content hash. Previously the txn hash
+        # used `bank_key="spk"` while the entry hash used
+        # `source_account="Assets:B:SPK"` — different strings, so the
+        # hashes never matched and dedup quietly missed every cash row.
+        # Verify the content path now matches across the bank/account
+        # naming gap.
+        txn = make_txn(
+            sepa_reference="",
+            booking_date=date(2024, 12, 23),
+            amount=Decimal("-240.00"),
+            payee="GA NR00003062 BLZ72051210 1",
+            description="23.12/13.45UHR AICHACH BARGELDAUSZAHLUNG",
+            bank_key="spk",
+        )
+        entry = make_entry(
+            date=date(2024, 12, 23),
+            amount=Decimal("-240.00"),
+            payee="GA NR00003062 BLZ72051210 1",
+            narration="23.12/13.45UHR AICHACH BARGELDAUSZAHLUNG",
+            source_account="Assets:B:SPK",
+        )
+        assert is_duplicate(txn, [entry])
+
+    def test_detects_content_match_when_payee_only_differs_in_capitalisation(self):
+        # Sanity: hashes are case-sensitive (we don't normalise here —
+        # that's the scorer's job). If a user lowercased the payee in
+        # the bean file, dedup should NOT fire and the matcher's fuzzy
+        # path takes over. Keeps the contract honest about what dedup
+        # buys you (exact match, fast path).
+        txn = make_txn(sepa_reference="", payee="NETFLIX")
+        entry = make_entry(payee="netflix")
+        assert not is_duplicate(txn, [entry])
+
 
 # ── transfers: heuristic ─────────────────────────────────────────────────────
 
