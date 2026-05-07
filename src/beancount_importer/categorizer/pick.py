@@ -169,7 +169,7 @@ def run(console: Console, ctx: PickContext) -> PickDecision:
                 action="pick", account=ctx.suggestions[int(key) - 1]
             )
         if key == "l":
-            picked = _paged_list(console, ctx.all_accounts)
+            picked = _full_list(console, ctx.all_accounts)
             if picked is not None:
                 return PickDecision(action="pick", account=picked)
             continue
@@ -187,72 +187,76 @@ def run(console: Console, ctx: PickContext) -> PickDecision:
 # ── Sub-prompts ───────────────────────────────────────────────────────────────
 
 
-_PAGE_SIZE = 10
+def _full_list(console: Console, accounts: Iterable[str]) -> str | None:
+    """Show every `accounts` entry at once in an alphabetical column grid.
 
+    Earlier this was 10-per-page paging, but the typical user has ~100
+    accounts and wants to *scan* visually for the one they need —
+    paging makes that much harder than it has to be. Terminal scroll
+    handles overflow if the list is huge.
 
-def _paged_list(console: Console, accounts: Iterable[str]) -> str | None:
-    """Show `accounts` ten at a time; user picks by index or cancels.
-
-    Pages are 1-indexed in display but 0-indexed internally. Returns the
-    chosen account or `None` if the user backed out (`x`).
-
-    Enter (empty input) advances to the next page when one exists. On
-    the last page, Enter is a no-op that re-renders the page so the
-    user sees the hotkey row again — the silent `default="x"` cancel
-    bit one user mid-flight (they pressed Enter expecting "next", got
-    booted to the parent screen with no hint of why).
+    Input is free-text rather than `Prompt.ask(choices=…)` because
+    indices may be three digits (>9 accounts blows the single-key cap).
+    `[x]` cancels, `[enter]` redraws (so the user can refresh after a
+    typo warning), any positive integer in range picks that entry.
     """
-    items = list(accounts)
+    items = sorted(accounts)
     if not items:
         console.print("  [dim](no accounts loaded)[/]")
         return None
-    pages = max(1, (len(items) + _PAGE_SIZE - 1) // _PAGE_SIZE)
-    page = 0
     while True:
-        start = page * _PAGE_SIZE
-        chunk = items[start : start + _PAGE_SIZE]
-        console.print(f"  [dim]Page {page + 1}/{pages}[/]")
-        for i, account in enumerate(chunk, start=1):
-            console.print(f"    {hotkey(str(i))} {styled_account(account)}")
-        # Always include the empty string so Enter is a known choice; what
-        # we *do* with it depends on whether there's a next page.
-        page_keys: list[str] = [""] + [str(i) for i in range(1, len(chunk) + 1)] + ["x"]
-        has_next = page + 1 < pages
-        has_prev = page > 0
-        if has_prev:
-            page_keys.append("p")
-        if has_next:
-            page_keys.append("n")
-        prompt_extra = []
-        if has_prev:
-            prompt_extra.append(f"{hotkey('p')} prev")
-        if has_next:
-            prompt_extra.append(f"{hotkey('enter/n')} next")
-        else:
-            prompt_extra.append(f"{hotkey('enter')} stay")
-        prompt_extra.append(f"{hotkey('x')} cancel")
+        _render_column_grid(console, items)
         console.print(
-            "  " + "  ".join([f"{hotkey('1-' + str(len(chunk)))} pick"] + prompt_extra)
+            f"  {hotkey('1-' + str(len(items)))} pick   "
+            f"{hotkey('enter')} redraw   {hotkey('x')} cancel"
         )
-        key = Prompt.ask(
-            ">",
-            choices=page_keys,
-            default="",
-            show_choices=False,
-            show_default=False,
+        raw = Prompt.ask(
+            ">", default="", show_default=False
         ).strip()
-        if key == "x":
+        if raw == "x":
             return None
-        if key == "p":
-            page -= 1
+        if raw == "":
             continue
-        if key == "n" or (key == "" and has_next):
-            page += 1
+        try:
+            idx = int(raw)
+        except ValueError:
+            console.print(f"  [yellow]not a number: {raw!r}[/]")
             continue
-        if key == "":
-            # Last page, Enter pressed — redraw and re-prompt.
+        if not 1 <= idx <= len(items):
+            console.print(
+                f"  [yellow]index {idx} out of range (1-{len(items)})[/]"
+            )
             continue
-        return chunk[int(key) - 1]
+        return items[idx - 1]
+
+
+def _render_column_grid(console: Console, items: list[str]) -> None:
+    """Lay `items` out column-major so reading top-to-bottom is alphabetical.
+
+    Column count adapts to terminal width with the longest account name
+    setting cell width. Column-major (vs. row-major) means columns 1, 2,
+    3 contain items 1..r, r+1..2r, 2r+1..3r — so a user scanning a
+    sorted list moves their eyes down a column, not zig-zag across rows.
+    """
+    n_digits = len(str(len(items)))
+    max_acc_len = max(len(a) for a in items)
+    # `[NN] ◆ ` = n_digits + 6 chars overhead; trailing pad keeps cells
+    # from running into each other.
+    cell_width = n_digits + 6 + max_acc_len + 2
+    n_cols = max(1, (console.width - 2) // cell_width)
+    n_rows = (len(items) + n_cols - 1) // n_cols
+    for row in range(n_rows):
+        cells = []
+        for col in range(n_cols):
+            idx = col * n_rows + row
+            if idx >= len(items):
+                continue
+            label = f"[cyan]\\[{idx + 1:>{n_digits}}][/]"
+            cells.append(
+                f"{label} {styled_account(items[idx]):<{max_acc_len}}"
+            )
+        console.print("  " + "  ".join(cells))
+    console.print()
 
 
 def _write_custom(console: Console, known: tuple[str, ...]) -> str | None:
@@ -280,7 +284,7 @@ def _transfer_to_own(
 ) -> str | None:
     """List Assets/Liabilities accounts (any side of any entry) and pick one.
 
-    Reuses `_paged_list`'s shape — same paging UX, narrower input pool.
+    Reuses `_full_list`'s shape — same column grid, narrower input pool.
     """
     seen: dict[str, None] = {}
     for entry in entries:
@@ -290,4 +294,4 @@ def _transfer_to_own(
     if not seen:
         console.print("  [dim](no own-account history yet)[/]")
         return None
-    return _paged_list(console, sorted(seen))
+    return _full_list(console, sorted(seen))

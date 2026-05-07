@@ -197,25 +197,45 @@ class TestRun:
         assert decision.action == "pick"
         assert decision.account == "Expenses:Cat1"
 
-    def test_l_paging_n_then_pick(self, monkeypatch):
-        # 15 accounts → 2 pages. Press `l`, then `n` to go to page 2,
-        # then `5` to pick the 5th item on page 2 (index 14 overall).
+    def test_l_pick_high_index_uses_multi_digit_input(self, monkeypatch):
+        # 15 accounts in a single column grid. The accounts get sorted
+        # alphabetically; "Expenses:Cat14" sorts BEFORE "Expenses:Cat2"
+        # lexicographically — so "Cat14" is at index 6 in the sorted list.
         full_pool = tuple(f"Expenses:Cat{i}" for i in range(15))
         monkeypatch.setattr(
-            "rich.prompt.Prompt.ask", _scripted("l", "n", "5")
+            "rich.prompt.Prompt.ask", _scripted("l", "6")
         )
         decision = run(_console(), _ctx(all_accounts=full_pool))
         assert decision.action == "pick"
-        assert decision.account == "Expenses:Cat14"
+        assert decision.account == sorted(full_pool)[5]
 
-    def test_l_paging_p_returns_to_first_page(self, monkeypatch):
-        full_pool = tuple(f"Expenses:Cat{i}" for i in range(15))
+    def test_l_invalid_input_warns_and_reprompts(self, monkeypatch):
+        # Non-numeric input shows a warning and re-prompts; subsequent
+        # valid pick resolves.
         monkeypatch.setattr(
-            "rich.prompt.Prompt.ask",
-            _scripted("l", "n", "p", "1"),
+            "rich.prompt.Prompt.ask", _scripted("l", "abc", "1")
         )
-        decision = run(_console(), _ctx(all_accounts=full_pool))
-        assert decision.account == "Expenses:Cat0"
+        console = _console()
+        decision = run(console, _ctx())
+        assert decision.action == "pick"
+        assert "not a number" in console.export_text()
+
+    def test_l_index_out_of_range_warns_and_reprompts(self, monkeypatch):
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("l", "999", "1")
+        )
+        console = _console()
+        decision = run(console, _ctx())
+        assert decision.action == "pick"
+        assert "out of range" in console.export_text()
+
+    def test_l_enter_redraws_then_user_picks(self, monkeypatch):
+        # Empty input on the full list redraws (no-op) and re-prompts.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("l", "", "1")
+        )
+        decision = run(_console(), _ctx())
+        assert decision.action == "pick"
 
     def test_l_cancel_returns_to_hotkey_loop(self, monkeypatch):
         # `x` cancels paging; subsequent `s` resolves the run.
@@ -277,42 +297,35 @@ class TestRun:
         assert run(_console(), _ctx(existing=())).action == "skip"
 
 
-# ── Pager UX regressions ──────────────────────────────────────────────────────
+# ── Listing UX regressions ────────────────────────────────────────────────────
 
 
-class TestPagerEnterSemantics:
-    """Enter on the pager must advance to the next page (or stay), never
-    silently cancel back to Screen 2 — see the on-call bug report where
-    a user pressed Enter expecting `next` and got dumped to a hotkey
-    prompt that didn't accept `n` because they were no longer in the
-    pager.
+class TestFullListLayout:
+    """The single-page column grid replaces the old 10-per-page pager.
+    The on-call bug that drove the redesign: a user pressed Enter
+    expecting "next page" and got silently cancelled back to Screen 2.
+    No paging means no Enter ambiguity to begin with.
     """
 
-    def test_enter_on_first_page_advances_to_next(self, monkeypatch):
-        # 15 accounts → 2 pages. `l` to enter, Enter to advance, `5`
-        # picks the 5th item on page 2 (overall index 14).
-        full_pool = tuple(f"Expenses:Cat{i}" for i in range(15))
-        monkeypatch.setattr(
-            "rich.prompt.Prompt.ask", _scripted("l", "", "5")
-        )
-        decision = run(_console(), _ctx(all_accounts=full_pool))
-        assert decision.action == "pick"
-        assert decision.account == "Expenses:Cat14"
+    def test_accounts_are_sorted_alphabetically(self):
+        # Listing must be alphabetical so the user can scan visually
+        # for the account they want before typing the index.
+        full_pool = ("Expenses:Zzz", "Expenses:Aaa", "Expenses:Mmm")
+        monkeypatch_pool = sorted(full_pool)
 
-    def test_enter_on_last_page_is_noop_then_user_picks(self, monkeypatch):
-        # 15 accounts: page 1 is full, page 2 has 5. Enter on page 2 (the
-        # last page) re-renders without cancelling; the next prompt picks.
-        full_pool = tuple(f"Expenses:Cat{i}" for i in range(15))
-        monkeypatch.setattr(
-            "rich.prompt.Prompt.ask", _scripted("l", "n", "", "1")
-        )
-        decision = run(_console(), _ctx(all_accounts=full_pool))
-        assert decision.action == "pick"
-        # First item on page 2 is Cat10.
-        assert decision.account == "Expenses:Cat10"
+        # Render path through the [l] entry: the order shown matches
+        # `sorted(full_pool)`. Pick #1 — should be Expenses:Aaa.
+        import pytest
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "rich.prompt.Prompt.ask", _scripted("l", "1")
+            )
+            decision = run(_console(), _ctx(all_accounts=full_pool))
+        assert decision.account == monkeypatch_pool[0]
 
     def test_explicit_x_still_cancels(self, monkeypatch):
-        # Sanity: the documented cancel still works after the default change.
+        # Sanity: cancel from the column grid still drops back to Screen 2.
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask", _scripted("l", "x", "s")
         )
