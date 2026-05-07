@@ -286,6 +286,31 @@ class TestRun:
         assert decision.proposal.narration == "New narration"
         assert decision.proposal.payee == "New payee"
 
+    def test_t_opens_tag_menu_and_stamps_delta(self, monkeypatch):
+        # `t` → tag menu mode `2` (always) → tag name "italy-trip" → enter.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask",
+            _scripted("t", "2", "italy-trip", ""),
+        )
+        decision = run(_console(), _ctx())
+        assert decision.action == "confirm"
+        assert decision.proposal is not None
+        delta = decision.proposal.tag_state_delta
+        assert delta is not None
+        assert delta.op == "set"
+        assert delta.new_state is not None
+        assert delta.new_state.tag == "italy-trip"
+
+    def test_t_then_cancel_leaves_proposal_untouched(self, monkeypatch):
+        # `t` → cancel (`5`) → enter. tag_state_delta stays None.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("t", "5", "")
+        )
+        decision = run(_console(), _ctx())
+        assert decision.action == "confirm"
+        assert decision.proposal is not None
+        assert decision.proposal.tag_state_delta is None
+
     def test_edit_then_skip_discards_edit(self, monkeypatch):
         # Skip after editing should not write — caller honours `action` only.
         monkeypatch.setattr(

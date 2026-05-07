@@ -29,12 +29,14 @@ from beancount_importer.categorizer.screen import (
     hotkey,
     styled_account,
 )
+from beancount_importer.categorizer.tag_menu import run as run_tag_menu
 from beancount_importer.models import (
     CategoryProposal,
     LedgerEntry,
     SourceTransaction,
 )
 from beancount_importer.rules.models import CategorizationRule
+from beancount_importer.rules.tags import ActiveTag
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,9 @@ class ConfirmContext:
     year: int = 0
     active_tag: str | None = None
     tag_remaining: int | None = None
+    # Full ActiveTag (mode/until) for the [t] sub-menu's "active" header;
+    # the string variant above drives the per-screen state header only.
+    current_active_tag: ActiveTag | None = None
     similar_upcoming: int = 0
 
 
@@ -164,24 +169,29 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
 
 
 def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
-    """Hotkey row scaled to Step 2's slice: enter / n / p / s / q.
+    """Hotkey row.
 
-    Cross-screen affordances (`[c]`, `[t]`, `[r]`, `[u]`, `[m]`) come
-    online as the screens they hand off to land in later steps.
+    Step 10 adds `[t]` (tag menu). Other cross-screen affordances
+    (`[c]`, `[r]`, `[u]`, `[m]`) come online as their target screens
+    or sub-flows land in later steps.
     """
-    del ctx  # kind-conditional rows arrive once `[u]` etc. ship
+    del ctx
     console.print(
         f"  {hotkey('enter')} confirm  "
         f"{hotkey('n')} narration  "
         f"{hotkey('p')} payee"
     )
-    console.print(f"                   {hotkey('s')} skip       {hotkey('q')} quit")
+    console.print(
+        f"  {hotkey('t')} tag menu  "
+        f"{hotkey('s')} skip       "
+        f"{hotkey('q')} quit"
+    )
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 
-_HOTKEYS: tuple[str, ...] = ("", "n", "p", "s", "q")
+_HOTKEYS: tuple[str, ...] = ("", "n", "p", "t", "s", "q")
 
 
 def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
@@ -208,7 +218,11 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             current = proposal.narration or ctx.txn.description or ""
             new = Prompt.ask(f"narration [{current}]", default=current)
             proposal = proposal.model_copy(update={"narration": new})
-        else:  # key == "p"
+        elif key == "p":
             current = proposal.payee or ctx.txn.payee or ""
             new = Prompt.ask(f"payee [{current}]", default=current)
             proposal = proposal.model_copy(update={"payee": new})
+        else:  # key == "t" — tag menu sub-prompt
+            delta = run_tag_menu(console, ctx.current_active_tag)
+            if delta is not None:
+                proposal = proposal.model_copy(update={"tag_state_delta": delta})

@@ -474,6 +474,17 @@ def _process_transaction(
     if rule is not None:
         proposal = apply_transforms(transforms_hooks, proposal, txn, rule)
 
+    # 6b. Apply a user-driven tag-state delta (Screen 1's `[t]` hotkey).
+    # The proposal arrives with `tag_state_delta` set; we mutate working_tag
+    # before the auto-stamp step so this txn picks up the new tag. The
+    # delta also surfaces on the result (step 9) for persistence.
+    user_tag_delta = proposal.tag_state_delta
+    if user_tag_delta is not None:
+        if user_tag_delta.op == "set":
+            working_tag = user_tag_delta.new_state
+        elif user_tag_delta.op == "clear":
+            working_tag = None
+
     # 7. Apply active tag (if any and applicable) when proposal didn't set one.
     if working_tag is not None and proposal.tag is None and working_tag.applies_to(txn.booking_date):
         proposal = proposal.model_copy(update={"tag": working_tag.tag})
@@ -486,10 +497,14 @@ def _process_transaction(
         if new_rule is not None:
             new_rules_list = [*working_rules, new_rule]
 
-    # 9. Compute tag-state delta for "once" / expired "duration".
+    # 9. Compute tag-state delta. User intent dominates: a user `set`/`clear`
+    # is recorded verbatim. Otherwise we fall back to the auto-clear that
+    # fires when `once` mode expires or `duration` runs past `until_date`.
     next_tag = _advance_tag(working_tag, txn.booking_date)
     tag_delta: TagStateDelta | None = None
-    if next_tag != working_tag and working_tag is not None:
+    if user_tag_delta is not None:
+        tag_delta = user_tag_delta
+    elif next_tag != working_tag and working_tag is not None:
         tag_delta = TagStateDelta(op="clear")
 
     result = _build_result(

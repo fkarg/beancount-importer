@@ -248,6 +248,7 @@ def _run_confirm(
         year=ctx.txn.booking_date.year,
         active_tag=ctx.active_tag.tag if ctx.active_tag else None,
         tag_remaining=_tag_remaining(ctx),
+        current_active_tag=ctx.active_tag,
     )
     decision = run_confirm(console, confirm_ctx)
     return _confirm_to_proposal(decision)
