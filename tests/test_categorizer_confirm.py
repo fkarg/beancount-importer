@@ -204,7 +204,14 @@ class TestRender:
         con = _console()
         render(con, _ctx())
         out = con.export_text()
-        for hotkey in ("[enter] confirm", "[n] narration", "[p] payee", "[s] skip", "[q] quit"):
+        for hotkey in (
+            "[enter] confirm",
+            "[n] narration",
+            "[p] payee",
+            "[c] change account",
+            "[s] skip",
+            "[q] quit",
+        ):
             assert hotkey in out, f"missing hotkey row entry: {hotkey}"
 
     def test_active_tag_without_remaining_omits_left_suffix(self):
@@ -319,3 +326,17 @@ class TestRun:
         decision = run(_console(), _ctx())
         assert decision.action == "skip"
         assert decision.proposal is None
+
+    def test_c_returns_change_account_with_current_proposal(self, monkeypatch):
+        # `[c]` is a transition action — Screen 1 hands back the in-flight
+        # proposal so the host can preserve narration/payee edits across
+        # the Screen 2 round-trip.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask",
+            _scripted("n", "Coffee Roma", "c"),
+        )
+        decision = run(_console(), _ctx())
+        assert decision.action == "change_account"
+        assert decision.proposal is not None
+        # Edit-before-[c] preserved.
+        assert decision.proposal.narration == "Coffee Roma"

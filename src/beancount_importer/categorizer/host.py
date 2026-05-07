@@ -235,23 +235,46 @@ def _run_confirm(
     kind: str,
     matched_entry,
 ) -> CategoryProposal:
-    """Render Screen 1 and translate its decision into a `CategoryProposal`."""
-    confirm_ctx = ConfirmContext(
-        txn=ctx.txn,
-        proposal=proposal,
-        bank_account=ctx.source_account,
-        kind=kind,  # type: ignore[arg-type]
-        matched_rule=ctx.matched_rule,
-        matched_entry=matched_entry,
-        progress=ctx.progress,
-        bank_key=ctx.txn.bank_key,
-        year=ctx.txn.booking_date.year,
-        active_tag=ctx.active_tag.tag if ctx.active_tag else None,
-        tag_remaining=_tag_remaining(ctx),
-        current_active_tag=ctx.active_tag,
-    )
-    decision = run_confirm(console, confirm_ctx)
-    return _confirm_to_proposal(decision)
+    """Render Screen 1 and translate its decision into a `CategoryProposal`.
+
+    Loops on `change_account`: Screen 1 → Screen 2 → Screen 1 (with
+    `kind="fresh_pick"` and `matched_entry=None` since the user
+    deliberately overrode whatever produced the seed). The user's
+    in-flight edits (narration, payee, tag) carry across via the
+    proposal returned from Screen 1.
+    """
+    while True:
+        confirm_ctx = ConfirmContext(
+            txn=ctx.txn,
+            proposal=proposal,
+            bank_account=ctx.source_account,
+            kind=kind,  # type: ignore[arg-type]
+            matched_rule=ctx.matched_rule,
+            matched_entry=matched_entry,
+            progress=ctx.progress,
+            bank_key=ctx.txn.bank_key,
+            year=ctx.txn.booking_date.year,
+            active_tag=ctx.active_tag.tag if ctx.active_tag else None,
+            tag_remaining=_tag_remaining(ctx),
+            current_active_tag=ctx.active_tag,
+        )
+        decision = run_confirm(console, confirm_ctx)
+        if decision.action != "change_account":
+            return _confirm_to_proposal(decision)
+        # `[c]` round-trip: pick a new account, then re-render Screen 1.
+        # Skip / quit on Screen 2 short-circuits the whole categorize call.
+        pick = _ask_pick(console, ctx)
+        if pick.action == "skip":
+            return CategoryProposal(action="skip")
+        if pick.action == "quit":
+            return CategoryProposal(action="quit")
+        assert pick.account is not None
+        assert decision.proposal is not None
+        proposal = decision.proposal.model_copy(
+            update={"postings": (Posting(account=pick.account),)}
+        )
+        kind = "fresh_pick"
+        matched_entry = None
 
 
 def _confirm_to_proposal(decision: ConfirmDecision) -> CategoryProposal:

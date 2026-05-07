@@ -201,6 +201,82 @@ class TestPickThenConfirm:
         assert "Matched rule" not in out
 
 
+# ── Screen 1 [c] change account → Screen 2 → Screen 1 ────────────────────────
+
+
+class TestChangeAccount:
+    def test_c_round_trip_replaces_target_account(self, monkeypatch):
+        # Auto-matched rule → Screen 1 → user presses [c] → Screen 2 → user
+        # picks #1 (Expenses:Food) → Screen 1 with the new target → Enter.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("c", "1", "")
+        )
+        rule = CategorizationRule(
+            payee_pattern="Starbucks", target_account="Expenses:Coffee"
+        )
+        existing = (_entry("Expenses:Food"),)
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(
+            _ctx(matched_rule=rule, existing_entries=existing)
+        )
+        assert proposal.action == "categorize"
+        # User overrode the rule's target.
+        assert proposal.target_account == "Expenses:Food"
+
+    def test_c_preserves_narration_and_payee_edits(self, monkeypatch):
+        # Edit narration + payee on Screen 1, press [c], pick a new
+        # account on Screen 2 — edits must survive the round-trip.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask",
+            _scripted(
+                "n", "Coffee Roma",
+                "p", "Starbucks Italia",
+                "c", "1", "",
+            ),
+        )
+        rule = CategorizationRule(
+            payee_pattern="Starbucks", target_account="Expenses:Coffee"
+        )
+        existing = (_entry("Expenses:Food"),)
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(
+            _ctx(matched_rule=rule, existing_entries=existing)
+        )
+        assert proposal.narration == "Coffee Roma"
+        assert proposal.payee == "Starbucks Italia"
+        assert proposal.target_account == "Expenses:Food"
+
+    def test_c_then_pick_skip_short_circuits(self, monkeypatch):
+        # User opens Screen 2 with [c], then bails with `s` — the whole
+        # categorize call returns skip (caller sees "user backed out").
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("c", "s")
+        )
+        rule = CategorizationRule(
+            payee_pattern="Starbucks", target_account="Expenses:Coffee"
+        )
+        existing = (_entry("Expenses:Food"),)
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(
+            _ctx(matched_rule=rule, existing_entries=existing)
+        )
+        assert proposal.action == "skip"
+
+    def test_c_then_pick_quit_short_circuits(self, monkeypatch):
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("c", "q")
+        )
+        rule = CategorizationRule(
+            payee_pattern="Starbucks", target_account="Expenses:Coffee"
+        )
+        existing = (_entry("Expenses:Food"),)
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(
+            _ctx(matched_rule=rule, existing_entries=existing)
+        )
+        assert proposal.action == "quit"
+
+
 # ── Tag-state plumbing ────────────────────────────────────────────────────────
 
 

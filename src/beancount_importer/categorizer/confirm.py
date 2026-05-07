@@ -71,13 +71,15 @@ class ConfirmContext:
 class ConfirmDecision:
     """Returned from `run`. The categorizer consumes `proposal` for
     `confirm`; for navigation actions (`change_account`, `open_*`) the
-    caller transitions to the appropriate screen.
+    caller transitions to the appropriate screen and is responsible for
+    looping back here with an updated context.
 
-    Only one transition action ships in Step 2 — the rest land in the
-    later steps that build their target screens.
+    `change_account` carries the in-flight `proposal` so the host can
+    preserve the user's narration/payee/tag edits across the round-trip
+    to Screen 2.
     """
 
-    action: Literal["confirm", "skip", "quit"]
+    action: Literal["confirm", "skip", "quit", "change_account"]
     proposal: CategoryProposal | None = None
 
 
@@ -172,15 +174,16 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
 def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
     """Hotkey row.
 
-    Steps 10–11 add `[t]` (tag menu) and `[m]` (mode menu — currently
-    just amortize). The remaining cross-screen affordances (`[c]`,
-    `[r]`, `[u]`) come online as their target screens land.
+    `[c]` (change account) lands here once Screen 2 wiring exists in
+    the host. `[r]` (rule editor) and `[u]` (fix matched rule) come
+    online as their target screens land.
     """
     is_debit = ctx.txn.amount < 0
     console.print(
         f"  {hotkey('enter')} confirm  "
         f"{hotkey('n')} narration  "
-        f"{hotkey('p')} payee"
+        f"{hotkey('p')} payee  "
+        f"{hotkey('c')} change account"
     )
     # `[m]` only appears for debits — amortizing income makes no sense
     # in any of the three plugin modes, so the menu would only mislead.
@@ -195,8 +198,8 @@ def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 
-_HOTKEYS_DEBIT: tuple[str, ...] = ("", "n", "p", "t", "m", "s", "q")
-_HOTKEYS_CREDIT: tuple[str, ...] = ("", "n", "p", "t", "s", "q")
+_HOTKEYS_DEBIT: tuple[str, ...] = ("", "n", "p", "c", "t", "m", "s", "q")
+_HOTKEYS_CREDIT: tuple[str, ...] = ("", "n", "p", "c", "t", "s", "q")
 
 
 def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
@@ -218,6 +221,10 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             return ConfirmDecision(action="skip")
         if key == "q":
             return ConfirmDecision(action="quit")
+        if key == "c":
+            # Hand control to the host — it owns Screen 2 plumbing
+            # (suggestions, all_accounts) which Screen 1 doesn't.
+            return ConfirmDecision(action="change_account", proposal=proposal)
         # Edit/menu hotkeys: mutate `proposal` and loop. `Prompt.ask`'s
         # `choices` list keeps `key` inside this set — no fallthrough.
         if key == "n":

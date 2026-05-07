@@ -240,7 +240,7 @@ def test_confirm_run_always_terminates_with_typed_decision(seed: int):
         responder = _patched_prompt(mp, seed)
         decision = run_confirm(_console(), _confirm_ctx())
     assert isinstance(decision, ConfirmDecision)
-    assert decision.action in {"confirm", "skip", "quit"}
+    assert decision.action in {"confirm", "skip", "quit", "change_account"}
     assert responder.calls <= _MAX_PROMPTS
 
 
