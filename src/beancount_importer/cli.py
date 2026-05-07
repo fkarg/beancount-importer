@@ -467,15 +467,18 @@ class _PreviewStats:
         return self.import_auto + self.import_manual
 
     def add(self, other: _PreviewStats) -> None:
+        """Sum CSV-side counts only. Bean-side counts are NOT accumulated
+        here: a single ledger transaction touching two bank accounts is
+        loaded once per bank and would be double-counted at year/overall
+        level. The year aggregate (computed in `compute_bean_provenance_stats`
+        keyed by ``("", year)``) is injected at year totals instead.
+        """
         self.total += other.total
         self.matched += other.matched
         self.update_auto += other.update_auto
         self.update_manual += other.update_manual
         self.import_auto += other.import_auto
         self.import_manual += other.import_manual
-        self.total_in_bean += other.total_in_bean
-        self.bean_unmatched += other.bean_unmatched
-        self.bean_expanded += other.bean_expanded
 
 
 def _aggregate_preview(
@@ -505,8 +508,10 @@ def _aggregate_preview(
 
     # Fold in bean-side stats for every bank that has ledger entries for
     # this year, even those without any CSV rows in the import set.
+    # Skip the year-aggregate sentinel (bank=="") — handled separately at
+    # year-total level by the caller.
     for (bank_key, bean_year), prov in bean_stats.items():
-        if bean_year != year:
+        if bean_year != year or bank_key == "":
             continue
         s = by_bank.setdefault(bank_key, _PreviewStats())
         s.total_in_bean = prov.total_in_bean
@@ -598,8 +603,19 @@ def _print_preview_table(
         for bank in sorted(by_bank):
             section(bank.upper(), by_bank[bank], indent="    ")
             year_total.add(by_bank[bank])
+        # Inject year-aggregate bean stats (deduped across banks) — the
+        # add() loop above only sums CSV-side counts.
+        year_agg = bean_stats.get(("", year))
+        if year_agg is not None:
+            year_total.total_in_bean = year_agg.total_in_bean
+            year_total.bean_unmatched = year_agg.bean_unmatched
+            # bean_expanded is left at 0: per-bank `bean-query` counts
+            # also double-count cross-bank transactions and we don't
+            # have a deduped year-level count.
         section(f"{year} TOTAL", year_total, indent="    ")
         overall.add(year_total)
+        overall.total_in_bean += year_total.total_in_bean
+        overall.bean_unmatched += year_total.bean_unmatched
 
     if len(by_year) > 1:
         console.print("\n  [bold magenta]── OVERALL ──[/]")

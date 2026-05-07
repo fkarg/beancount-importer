@@ -599,6 +599,73 @@ class TestBeanProvenanceStats:
         stats = compute_bean_provenance_stats(session, tmp_path)
         assert stats[("spk", 2024)].total_in_bean == 1
 
+    def test_dedupes_entries_surfaced_via_include_wrappers(self, tmp_path: Path):
+        # `main.bean` (a wrapper) `include`s the per-bank ledger, and an
+        # outer `all.bean` includes every year's `main.bean`. Beancount's
+        # `load_file` resolves those includes, so each wrapper file
+        # re-surfaces the same SPK transactions. The reader records each
+        # entry's real source (file, line), so `_load_existing` collapses
+        # the duplicates and per-bank counts reflect the true ledger.
+        (tmp_path / "transactions" / "2024").mkdir(parents=True)
+        (tmp_path / "transactions" / "2024" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+
+            2024-02-01 * "Cash" "withdraw"
+              Assets:B:SPK  -50.00 EUR
+              Expenses:Cash  50.00 EUR
+        """))
+        (tmp_path / "transactions" / "2024" / "main.bean").write_text(
+            'include "SPK.bean"\n'
+        )
+        (tmp_path / "transactions" / "all.bean").write_text(
+            'include "2024/main.bean"\n'
+        )
+        cfg = Config(
+            banks=[self._bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # Without dedup this would be 6 (2 entries × 3 wrapper files).
+        assert stats[("spk", 2024)].total_in_bean == 2
+
+    def test_year_aggregate_dedupes_cross_bank_transactions(self, tmp_path: Path):
+        # A single ledger transaction posting to TWO bank accounts (a transfer)
+        # is loaded once per bank by `_load_existing`, so per-bank counts are
+        # correct (each bank IS touched by one entry). But a year-level total
+        # must NOT sum those — it represents one underlying transaction.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "ledger.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Transfer" "SPK to DKB"
+              Assets:B:SPK  -100.00 EUR
+              Assets:B:DKB  +100.00 EUR
+        """))
+        spk = make_spk_bank(year_template_output=False)
+        dkb = BankConfig(
+            key="dkb",
+            display_name="DKB",
+            account="Assets:B:DKB",
+            file_glob="DKB_*.csv",
+            output_file="dkb.bean",
+            csv=spk.csv,
+        )
+        cfg = Config(
+            banks=[spk, dkb],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # Per-bank: each bank is touched by the one transaction.
+        assert stats[("spk", 2024)].total_in_bean == 1
+        assert stats[("dkb", 2024)].total_in_bean == 1
+        # Year-aggregate (sentinel bank=""): unique ledger transactions only.
+        assert stats[("", 2024)].total_in_bean == 1
+        assert stats[("", 2024)].bean_unmatched == 1
+
 
 # ── Subprocess-driven branches: bean-query expanded counts ───────────────────
 

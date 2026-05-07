@@ -89,6 +89,13 @@ def _extract_entry(
 
     meta = dict(txn.meta)
     line_start = meta.pop("lineno", 0)
+    # Beancount's loader records the *real* source file in `meta["filename"]`
+    # — different from `file_path` when the entry was reached via an
+    # `include` directive in a wrapper file. Using the real source means
+    # callers can dedupe entries that surface multiple times (once
+    # directly, once via `main.bean`, once via `all.bean`, etc.).
+    real_filename = meta.pop("filename", None)
+    resolved_path = str(real_filename) if real_filename else file_path
 
     # Collect posting-level metadata (e.g. sepa_ref, actual, paypal) and any
     # alternate dates the user's plugins recognise.
@@ -106,7 +113,6 @@ def _extract_entry(
             if k not in meta:
                 meta[k] = str(v)
 
-    meta.pop("filename", None)
     meta.pop("lineno", None)
 
     return LedgerEntry(
@@ -120,7 +126,7 @@ def _extract_entry(
         currency=currency,
         metadata={k: str(v) for k, v in meta.items()},
         line_start=line_start,
-        file_path=file_path,
+        file_path=resolved_path,
         amount_inferred=amount_inferred,
         metadata_dates=tuple(dict.fromkeys(metadata_dates)),  # de-dup, preserve order
     )
@@ -179,6 +185,12 @@ def _synthesize_virtual_entries(
 
             amount = Decimal(str(src_posting.units.number))
             currency = src_posting.units.currency
+            # Use the posting's own filename/lineno: it points to the
+            # *actual* source file (across `include` wrappers) and to a
+            # distinct line per posting, so different synthesized entries
+            # from the same parent transaction get distinct identities.
+            posting_filename = src_posting.meta.get("filename") if src_posting.meta else None
+            posting_lineno = src_posting.meta.get("lineno") if src_posting.meta else None
             out.append(
                 LedgerEntry(
                     date=metadata_date,
@@ -190,8 +202,8 @@ def _synthesize_virtual_entries(
                     amount=amount,
                     currency=currency,
                     metadata={"synthesized_from": key},
-                    line_start=int(txn.meta.get("lineno", 0)) if txn.meta else 0,
-                    file_path=file_path,
+                    line_start=int(posting_lineno) if posting_lineno else 0,
+                    file_path=str(posting_filename) if posting_filename else file_path,
                     amount_inferred=True,
                     metadata_dates=(metadata_date,),
                 )

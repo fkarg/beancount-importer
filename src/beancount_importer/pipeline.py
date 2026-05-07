@@ -153,7 +153,15 @@ def _load_existing(
             seen_paths.add(bean)
             entries.extend(read_ledger(bean, bank.account, **read_kwargs))
 
-    return entries
+    # Beancount's `load_file` resolves `include` directives, so wrappers
+    # like `main.bean` (which `include`s the per-bank files) re-surface
+    # the same transactions. The reader records each entry's *real*
+    # source `(file_path, line_start)`, so we dedupe here to collapse
+    # those duplicates without missing legitimate distinct entries.
+    deduped: dict[tuple[str, int], LedgerEntry] = {}
+    for entry in entries:
+        deduped.setdefault((entry.file_path, entry.line_start), entry)
+    return list(deduped.values())
 
 
 def _gather_csv_files(bank: BankConfig, base_dir: Path) -> list[Path]:
@@ -657,6 +665,14 @@ def compute_bean_provenance_stats(
     stats: dict[tuple[str, int], BeanProvenanceStats] = {}
     expanded = _expanded_counts(config, base_dir, banks, year_filter)
 
+    # Track unique entries per year (across banks) to compute correct
+    # year-aggregate totals. A single Beancount transaction touching two
+    # bank accounts (e.g. a transfer) is returned once per bank by
+    # `_load_existing` — summing per-bank counts at year level would
+    # double-count it. We dedupe by (file_path, line_start), which
+    # uniquely identifies a transaction in the source ledger.
+    year_unique: dict[int, dict[tuple[str, int], LedgerEntry]] = {}
+
     for bank in banks:
         # Group entries by year, honouring the active year_filter.
         years_present: dict[int, list[LedgerEntry]] = {}
@@ -664,6 +680,9 @@ def compute_bean_provenance_stats(
             if year_filter is not None and entry.date.year not in year_filter:
                 continue
             years_present.setdefault(entry.date.year, []).append(entry)
+            year_unique.setdefault(entry.date.year, {}).setdefault(
+                (entry.file_path, entry.line_start), entry
+            )
 
         for year, entries in years_present.items():
             unmatched = sum(1 for e in entries if not _has_csv_match(e, all_csv))
@@ -674,6 +693,22 @@ def compute_bean_provenance_stats(
                 bean_unmatched=unmatched,
                 bean_expanded=expanded.get((bank.key, year), 0),
             )
+
+    # Year-aggregate stats keyed by ("", year). Counts unique transactions
+    # rather than (bank, posting) pairs. `bean_expanded` is left at 0 here
+    # because the per-bank `bean-query` counts also include cross-bank
+    # transactions in each bank's tally and would similarly double-count
+    # if summed; we only know how to dedupe what we loaded ourselves.
+    for year, unique in year_unique.items():
+        entries = list(unique.values())
+        unmatched = sum(1 for e in entries if not _has_csv_match(e, all_csv))
+        stats[("", year)] = BeanProvenanceStats(
+            bank="",
+            year=year,
+            total_in_bean=len(entries),
+            bean_unmatched=unmatched,
+            bean_expanded=0,
+        )
 
     return stats
 
