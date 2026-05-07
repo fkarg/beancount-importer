@@ -55,7 +55,13 @@ from beancount_importer.transforms import apply_transforms, load_transforms
 
 
 class CategorizeContext(BaseModel):
-    """Inputs supplied to a CategorizeFn for one transaction."""
+    """Inputs supplied to a CategorizeFn for one transaction.
+
+    `existing_entries` is the full ledger universe across all banks; the
+    categorizer can derive ranked account suggestions from it via
+    `matching.account_suggest.rank_accounts`. `account_hints` is a
+    pre-computed shortcut populated by the pipeline.
+    """
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
@@ -65,6 +71,7 @@ class CategorizeContext(BaseModel):
     matched_rule: CategorizationRule | None = None
     account_hints: tuple[str, ...] = ()
     active_tag: ActiveTag | None = None
+    existing_entries: tuple[LedgerEntry, ...] = ()
 
 
 CategorizeFn = Callable[[CategorizeContext], CategoryProposal]
@@ -398,12 +405,20 @@ def _process_transaction(
     ):
         proposal = _proposal_from_rule(rule)
     else:
+        from beancount_importer.matching.account_suggest import rank_accounts
+
+        suggested = rule.target_account if rule is not None else None
+        hints, _ = rank_accounts(
+            txn, candidates, existing_all, suggested_target=suggested
+        )
         context = CategorizeContext(
             txn=txn,
             rules=tuple(working_rules),
             candidates=tuple(candidates),
             matched_rule=rule,
+            account_hints=tuple(hints),
             active_tag=working_tag,
+            existing_entries=tuple(existing_all),
         )
         proposal = categorize_fn(context)
 

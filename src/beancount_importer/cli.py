@@ -158,14 +158,35 @@ def make_preview_categorizer() -> object:
     return _fn
 
 
+def _render_account_suggestions(hints: tuple[str, ...]) -> Table | None:
+    """Render the top-N ranked account suggestions as a numbered table."""
+    if not hints:
+        return None
+    table = Table(title="suggestions", show_header=False, expand=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("account")
+    for i, account in enumerate(hints, start=1):
+        table.add_row(str(i), account)
+    return table
+
+
 def make_interactive_categorizer() -> object:
-    """Returns a callable matching `CategorizeFn` that prompts via Rich."""
+    """Returns a callable matching `CategorizeFn` that prompts via Rich.
+
+    Adds a numbered pick over `ctx.account_hints` (populated by the pipeline
+    via `rank_accounts`) so the common case is a single keystroke. Typing a
+    non-numeric value falls through to free-form account entry; the matched
+    rule's target (if any) remains the default.
+    """
 
     def _fn(ctx: CategorizeContext) -> CategoryProposal:
         console.print(_render_txn_panel(ctx.txn))
         candidates_table = _render_candidates(ctx)
         if candidates_table is not None:
             console.print(candidates_table)
+        suggestions_table = _render_account_suggestions(ctx.account_hints)
+        if suggestions_table is not None:
+            console.print(suggestions_table)
         if ctx.matched_rule is not None:
             console.print(
                 f"[green]rule match[/]: → {ctx.matched_rule.target_account}"
@@ -190,7 +211,11 @@ def make_interactive_categorizer() -> object:
         default_account = (
             ctx.matched_rule.target_account if ctx.matched_rule else "Expenses:Unknown"
         )
-        account = Prompt.ask("target account", default=default_account)
+        raw = Prompt.ask(
+            "target account [dim](number from suggestions or full account)[/]",
+            default=default_account,
+        )
+        account = _resolve_account_pick(raw, ctx.account_hints)
         save_as_rule = False
         if ctx.matched_rule is None:
             save_as_rule = Confirm.ask("save as rule?", default=False)
@@ -201,6 +226,21 @@ def make_interactive_categorizer() -> object:
         )
 
     return _fn
+
+
+def _resolve_account_pick(raw: str, hints: tuple[str, ...]) -> str:
+    """Map a numeric pick onto the suggestion list; otherwise return as-is.
+
+    Out-of-range numbers fall through to literal interpretation so that
+    e.g. `2024` (a year typed by mistake) becomes a free-form account name
+    rather than silently selecting the second suggestion.
+    """
+    raw = raw.strip()
+    if raw.isdigit() and hints:
+        idx = int(raw)
+        if 1 <= idx <= len(hints):
+            return hints[idx - 1]
+    return raw
 
 
 # ── Path resolution ───────────────────────────────────────────────────────────
