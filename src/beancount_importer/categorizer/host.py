@@ -110,10 +110,10 @@ def make_screen_merge_fn(
             tag_remaining=_merge_tag_remaining(ctx),
         )
         decision = run_collision(console, coll_ctx)
-        # Screen 3 currently exposes update / keep / block / skip / quit.
-        # `import_new` would need a transition back to Screens 1/2 (which
-        # the host can't do from inside a `MergeFn` cleanly without
-        # widening the contract). Reserve the action; defer the wiring.
+        # `import_new` doesn't re-route through Screens 1/2 — by the
+        # time we reach the merge prompt, Screen 1 has already produced
+        # a proposal. The pipeline emits that proposal as a fresh entry
+        # alongside the matched one (see `_apply_merge_decision`).
         return MergeDecision(action=decision.action)
 
     return _fn

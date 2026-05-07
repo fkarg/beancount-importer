@@ -111,6 +111,7 @@ class TestRender:
         for hotkey in (
             "[enter] update",
             "[k] keep existing",
+            "[i] import as new",
             "[b] block future updates",
             "[s] skip",
             "[q] quit",
@@ -183,3 +184,10 @@ class TestRun:
     def test_q_returns_quit(self, monkeypatch):
         monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("q"))
         assert run(_console(), _ctx()).action == "quit"
+
+    def test_i_returns_import_new(self, monkeypatch):
+        # `[i]` lets the user spit out the new proposal as a fresh entry
+        # alongside the matched one — used when the auto-match grabbed
+        # an unrelated transaction that looks similar.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("i"))
+        assert run(_console(), _ctx()).action == "import_new"

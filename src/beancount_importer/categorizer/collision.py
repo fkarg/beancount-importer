@@ -125,24 +125,30 @@ def _render_diff(console: Console, changes: list[ProposedChange]) -> None:
 
 
 def _render_hotkeys(console: Console) -> None:
-    """Hotkey row for Step 2's slice. `[i] import_new` defers to a later
-    step (it routes back through Screen 1/2 which haven't shipped yet) —
-    same for `[c] change account`. Both letters stay reserved.
+    """Hotkey row.
+
+    `[i] import as new` covers the case where the matched entry isn't
+    actually the same transaction — the diff is too large or the user
+    spots that two real-world events happen to look similar. The
+    pipeline emits the existing proposal as a new entry alongside the
+    matched one; no re-categorize loop is needed because Screen 1
+    already produced the proposal we're about to import.
     """
     console.print(
         f"  {hotkey('enter')} update   "
         f"{hotkey('k')} keep existing   "
-        f"{hotkey('b')} block future updates"
+        f"{hotkey('i')} import as new"
     )
     console.print(
-        f"                  {hotkey('s')} skip       {hotkey('q')} quit"
+        f"  {hotkey('b')} block future updates   "
+        f"{hotkey('s')} skip       {hotkey('q')} quit"
     )
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 
-_HOTKEYS: tuple[str, ...] = ("", "k", "b", "s", "q")
+_HOTKEYS: tuple[str, ...] = ("", "k", "i", "b", "s", "q")
 
 
 def run(console: Console, ctx: CollisionContext) -> CollisionDecision:
@@ -155,6 +161,8 @@ def run(console: Console, ctx: CollisionContext) -> CollisionDecision:
         return CollisionDecision(action="update")
     if key == "k":
         return CollisionDecision(action="keep")
+    if key == "i":
+        return CollisionDecision(action="import_new")
     if key == "b":
         return CollisionDecision(action="block")
     if key == "s":
