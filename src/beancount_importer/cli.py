@@ -36,6 +36,7 @@ from beancount_importer.pipeline import (
     run as run_pipeline,
 )
 from beancount_importer.replay import DecisionLog
+from beancount_importer.transforms.amortize import AMORTIZE_TYPES, amortize_metadata
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.storage import load_rules, save_rules
 from beancount_importer.rules.tags import ActiveTag, TagState
@@ -219,13 +220,57 @@ def make_interactive_categorizer() -> object:
         save_as_rule = False
         if ctx.matched_rule is None:
             save_as_rule = Confirm.ask("save as rule?", default=False)
-        return CategoryProposal(
+        proposal = CategoryProposal(
             action="categorize",
             postings=(Posting(account=account),),
             save_as_rule=save_as_rule,
         )
+        # Amortize is opt-in per-transaction. Skip the prompt entirely for
+        # credits — amortizing income is rare and confusing.
+        if ctx.txn.amount < 0 and Confirm.ask(
+            "amortize this transaction?", default=False
+        ):
+            proposal = _prompt_amortize(proposal)
+        return proposal
 
     return _fn
+
+
+def _augment_with_amortize(
+    proposal: CategoryProposal, amortize_type: str, months: int
+) -> CategoryProposal:
+    """Stamp `proposal`'s metadata with the amortize key/months pair.
+
+    Wraps `amortize_metadata` with the proposal merge so the prompt code
+    stays linear. Pure function — no I/O.
+    """
+    extra = amortize_metadata(amortize_type, months)
+    return proposal.model_copy(
+        update={"metadata": {**proposal.metadata, **extra}}
+    )
+
+
+def _prompt_amortize(proposal: CategoryProposal) -> CategoryProposal:
+    """Interactive amortize: pick a type, pick a number of months.
+
+    Returns the proposal unchanged on invalid month input — better to
+    write a non-amortized entry than to abort the user's whole categorize
+    decision over a typo.
+    """
+    a_type = Prompt.ask(
+        "amortize type",
+        choices=list(AMORTIZE_TYPES),
+        default="amortize_months",
+    )
+    months_raw = Prompt.ask("months", default="12")
+    try:
+        months = int(months_raw.strip())
+        if months < 1:
+            raise ValueError
+    except ValueError:
+        console.print("[yellow]invalid month count — skipping amortize[/]")
+        return proposal
+    return _augment_with_amortize(proposal, a_type, months)
 
 
 def _resolve_account_pick(raw: str, hints: tuple[str, ...]) -> str:
