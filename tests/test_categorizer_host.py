@@ -276,6 +276,34 @@ class TestChangeAccount:
         )
         assert proposal.action == "quit"
 
+    def test_c_then_l_opens_full_column_grid(self, monkeypatch):
+        # End-to-end: [c] on Screen 1, [l] on Screen 2 → column grid,
+        # numeric pick, then [enter] confirm. Verifies the column grid
+        # is reachable from inside a [c] round-trip.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask",
+            _scripted("c", "l", "1", ""),
+        )
+        rule = CategorizationRule(
+            payee_pattern="Starbucks", target_account="Expenses:Coffee"
+        )
+        # Multiple existing entries → all_accounts pool is populated.
+        existing = (
+            _entry("Expenses:Food"),
+            _entry("Expenses:Travel"),
+            _entry("Expenses:Coffee"),
+        )
+        console = _console()
+        categorizer = make_screen_categorizer(console)
+        proposal = categorizer(
+            _ctx(matched_rule=rule, existing_entries=existing)
+        )
+        assert proposal.action == "categorize"
+        # Picked the alphabetically-first account from the column grid.
+        out = console.export_text()
+        # Column grid uses the [N] numeric label format.
+        assert "[1]" in out
+
 
 # ── Tag-state plumbing ────────────────────────────────────────────────────────
 
