@@ -17,8 +17,7 @@ from dataclasses import dataclass
 
 from rich.console import Console
 
-
-_RULE_WIDTH = 73
+from beancount_importer.categorizer.screen import RULE_WIDTH
 
 
 @dataclass(frozen=True)
@@ -33,7 +32,7 @@ class HeaderContext:
 
 def render_header(console: Console, ctx: HeaderContext) -> None:
     """Print the rule-header-rule sandwich. Pure I/O."""
-    rule = "─" * _RULE_WIDTH
+    rule = "─" * RULE_WIDTH
     console.print(rule)
 
     current, total = ctx.progress
@@ -42,7 +41,7 @@ def render_header(console: Console, ctx: HeaderContext) -> None:
     parts.append(_format_tag(ctx))
     body = "  ".join(parts)
     # Right-align the glyph by padding the body up to (RULE_WIDTH - 2).
-    pad = max(1, _RULE_WIDTH - len(_strip_markup(body)) - 1 - len(ctx.glyph))
+    pad = max(1, RULE_WIDTH - len(_strip_markup(body)) - 1 - len(ctx.glyph))
     console.print(f" {body}{' ' * pad}{ctx.glyph}")
     console.print(rule)
 

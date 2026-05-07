@@ -16,10 +16,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 from rich.console import Console
-from rich.prompt import Prompt
 
 from beancount_importer.categorizer.header import HeaderContext, render_header
-from beancount_importer.matching.account_suggest import account_glyph
+from beancount_importer.categorizer.screen import (
+    ask_hotkey,
+    bottom_rule,
+    hotkey,
+    styled_account,
+)
 from beancount_importer.models import (
     CategoryProposal,
     LedgerEntry,
@@ -61,12 +65,6 @@ class CollisionDecision:
 # ── Render ────────────────────────────────────────────────────────────────────
 
 
-def _styled_account(account: str) -> str:
-    """Glyph + space + account name. See `confirm._styled_account` for notes."""
-    glyph, style = account_glyph(account)
-    return f"[{style}]{glyph} {account}[/]"
-
-
 def render(console: Console, ctx: CollisionContext) -> None:
     """Append one collision block. Pure I/O."""
     header = HeaderContext(
@@ -91,7 +89,7 @@ def render(console: Console, ctx: CollisionContext) -> None:
     console.print()
     _render_diff(console, ctx.proposed_changes)
     _render_hotkeys(console)
-    console.print("─" * 73)
+    bottom_rule(console)
 
 
 def _render_existing_entry(console: Console, entry: LedgerEntry) -> None:
@@ -107,11 +105,11 @@ def _render_existing_entry(console: Console, entry: LedgerEntry) -> None:
         f'{payee_part}"{entry.narration}"'
     )
     console.print(
-        f"      {_styled_account(entry.source_account)}"
+        f"      {styled_account(entry.source_account)}"
         f"            {entry.amount} {entry.currency}"
     )
     if entry.target_account:
-        console.print(f"      {_styled_account(entry.target_account)}")
+        console.print(f"      {styled_account(entry.target_account)}")
 
 
 def _render_diff(console: Console, changes: list[ProposedChange]) -> None:
@@ -126,30 +124,25 @@ def _render_diff(console: Console, changes: list[ProposedChange]) -> None:
     console.print()
 
 
-def _hotkey(letter: str) -> str:
-    """Render `[<letter>]` as literal text styled cyan (escape brackets)."""
-    return rf"[cyan]\[{letter}][/]"
-
-
 def _render_hotkeys(console: Console) -> None:
     """Hotkey row for Step 2's slice. `[i] import_new` defers to a later
     step (it routes back through Screen 1/2 which haven't shipped yet) —
     same for `[c] change account`. Both letters stay reserved.
     """
     console.print(
-        f"  {_hotkey('enter')} update   "
-        f"{_hotkey('k')} keep existing   "
-        f"{_hotkey('b')} block future updates"
+        f"  {hotkey('enter')} update   "
+        f"{hotkey('k')} keep existing   "
+        f"{hotkey('b')} block future updates"
     )
     console.print(
-        f"                  {_hotkey('s')} skip       {_hotkey('q')} quit"
+        f"                  {hotkey('s')} skip       {hotkey('q')} quit"
     )
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 
-_HOTKEYS = ("", "k", "b", "s", "q")
+_HOTKEYS: tuple[str, ...] = ("", "k", "b", "s", "q")
 
 
 def run(console: Console, ctx: CollisionContext) -> CollisionDecision:
@@ -157,13 +150,7 @@ def run(console: Console, ctx: CollisionContext) -> CollisionDecision:
     this screen; the diff itself is the decision aid.
     """
     render(console, ctx)
-    key = Prompt.ask(
-        ">",
-        choices=list(_HOTKEYS),
-        default="",
-        show_choices=False,
-        show_default=False,
-    ).strip()
+    key = ask_hotkey(_HOTKEYS)
     if key == "":
         return CollisionDecision(action="update")
     if key == "k":

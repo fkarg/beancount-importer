@@ -23,7 +23,12 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from beancount_importer.categorizer.header import HeaderContext, render_header
-from beancount_importer.matching.account_suggest import account_glyph
+from beancount_importer.categorizer.screen import (
+    ask_hotkey,
+    bottom_rule,
+    hotkey,
+    styled_account,
+)
 from beancount_importer.models import (
     CategoryProposal,
     LedgerEntry,
@@ -78,18 +83,6 @@ def _format_amount(txn: SourceTransaction) -> str:
     return f"{sign}{txn.amount} {txn.currency}"
 
 
-def _styled_account(account: str) -> str:
-    """Glyph + space + account name, wrapped in a Rich style tag.
-
-    Callers replace empty strings with `"?"` before passing in, so the
-    style+glyph here always wraps a non-empty name. If the prefix isn't
-    one of the known account classes, `account_glyph` returns the neutral
-    dot/white pair.
-    """
-    glyph, style = account_glyph(account)
-    return f"[{style}]{glyph} {account}[/]"
-
-
 def render(console: Console, ctx: ConfirmContext) -> None:
     """Append one proposal block to the console output. Pure I/O."""
     header = HeaderContext(
@@ -106,14 +99,14 @@ def render(console: Console, ctx: ConfirmContext) -> None:
     # show a bare `?` rather than gluing the neutral glyph onto a literal
     # "?" string. The user reads this as "still missing", not "neutral class".
     target_str = (
-        _styled_account(ctx.proposal.target_account)
+        styled_account(ctx.proposal.target_account)
         if ctx.proposal.target_account
         else "?"
     )
     headline = (
         f"  [bold]{ctx.txn.booking_date.isoformat()}[/]   "
         f"[bold]{_format_amount(ctx.txn)}[/]   "
-        f"{_styled_account(ctx.bank_account)}  →  {target_str}"
+        f"{styled_account(ctx.bank_account)}  →  {target_str}"
     )
     console.print(headline)
     console.print()
@@ -122,7 +115,7 @@ def render(console: Console, ctx: ConfirmContext) -> None:
     _render_raw_block(console, ctx)
     _render_will_write_block(console, ctx)
     _render_hotkeys(console, ctx)
-    console.print("─" * 73)
+    bottom_rule(console)
 
 
 def _render_provenance(console: Console, ctx: ConfirmContext) -> None:
@@ -160,7 +153,7 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
     p = ctx.proposal
     payee_out = p.payee or ctx.txn.payee or ""
     narr_out = p.narration or ctx.txn.description or ""
-    target = _styled_account(p.target_account) if p.target_account else "?"
+    target = styled_account(p.target_account) if p.target_account else "?"
     console.print("  Will write:")
     console.print(f'    narration:    "{narr_out}"')
     console.print(f'    payee:        "{payee_out}"')
@@ -168,15 +161,6 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
     if p.tag:
         console.print(f"    tag:          [magenta]#{p.tag}[/]")
     console.print()
-
-
-def _hotkey(letter: str) -> str:
-    """Render `[<letter>]` as literal text styled cyan.
-
-    Rich's markup parser treats `[…]` as a tag opener; the backslash-bracket
-    escape produces a literal `[` while keeping the surrounding `[cyan]` tag.
-    """
-    return rf"[cyan]\[{letter}][/]"
 
 
 def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
@@ -187,17 +171,17 @@ def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
     """
     del ctx  # kind-conditional rows arrive once `[u]` etc. ship
     console.print(
-        f"  {_hotkey('enter')} confirm  "
-        f"{_hotkey('n')} narration  "
-        f"{_hotkey('p')} payee"
+        f"  {hotkey('enter')} confirm  "
+        f"{hotkey('n')} narration  "
+        f"{hotkey('p')} payee"
     )
-    console.print(f"                   {_hotkey('s')} skip       {_hotkey('q')} quit")
+    console.print(f"                   {hotkey('s')} skip       {hotkey('q')} quit")
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 
-_HOTKEYS = ("", "n", "p", "s", "q")
+_HOTKEYS: tuple[str, ...] = ("", "n", "p", "s", "q")
 
 
 def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
@@ -206,10 +190,12 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
     Edits update the proposal in-place (frozen-model `model_copy`) and
     re-render below the previous block. Empty input means Enter.
     """
+    from dataclasses import replace
+
     proposal = ctx.proposal
     while True:
-        render(console, _replace(ctx, proposal=proposal))
-        key = _ask_hotkey(console)
+        render(console, replace(ctx, proposal=proposal))
+        key = ask_hotkey(_HOTKEYS)
         if key == "":
             return ConfirmDecision(action="confirm", proposal=proposal)
         if key == "s":
@@ -226,21 +212,3 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             current = proposal.payee or ctx.txn.payee or ""
             new = Prompt.ask(f"payee [{current}]", default=current)
             proposal = proposal.model_copy(update={"payee": new})
-
-
-def _ask_hotkey(console: Console) -> str:
-    del console  # Prompt.ask drives the same console implicitly
-    return Prompt.ask(
-        ">",
-        choices=list(_HOTKEYS),
-        default="",
-        show_choices=False,
-        show_default=False,
-    ).strip()
-
-
-def _replace(ctx: ConfirmContext, **changes) -> ConfirmContext:
-    """`dataclass.replace` shim — kept local so the import stays minimal."""
-    from dataclasses import replace
-
-    return replace(ctx, **changes)
