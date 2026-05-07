@@ -72,6 +72,10 @@ class CategorizeContext(BaseModel):
     account_hints: tuple[str, ...] = ()
     active_tag: ActiveTag | None = None
     existing_entries: tuple[LedgerEntry, ...] = ()
+    # Source-side account (e.g. `Assets:B:SPK`) and run progress; needed by
+    # the screen-driven categorizer to render the headline + state header.
+    source_account: str = ""
+    progress: tuple[int, int] = (0, 0)
 
 
 CategorizeFn = Callable[[CategorizeContext], CategoryProposal]
@@ -293,6 +297,7 @@ def run(
             categorize_fn=categorize_fn,
             decisions=decisions,
             auto_threshold=session.options.auto_threshold,
+            progress=(progress, total),
         )
 
         decisions.record(txn, result)
@@ -323,6 +328,7 @@ def _process_transaction(
     categorize_fn: CategorizeFn,
     decisions: DecisionLog,
     auto_threshold: float | None,
+    progress: tuple[int, int] = (0, 0),
 ) -> tuple[ImportResult, ActiveTag | None, list[CategorizationRule]]:
     """Process one txn, returning the result + updated tag + updated rules list."""
 
@@ -419,6 +425,8 @@ def _process_transaction(
             account_hints=tuple(hints),
             active_tag=working_tag,
             existing_entries=tuple(existing_all),
+            source_account=bank.account,
+            progress=progress,
         )
         proposal = categorize_fn(context)
 

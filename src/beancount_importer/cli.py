@@ -17,8 +17,6 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from beancount_importer.beancount_io.writer import append_entry, apply_update
@@ -27,7 +25,6 @@ from beancount_importer.models import (
     CategoryProposal,
     ImportResult,
     Posting,
-    SourceTransaction,
 )
 from beancount_importer.pipeline import (
     BeanProvenanceStats,
@@ -35,8 +32,8 @@ from beancount_importer.pipeline import (
     compute_bean_provenance_stats,
     run as run_pipeline,
 )
+from beancount_importer.categorizer.host import make_screen_categorizer
 from beancount_importer.replay import DecisionLog
-from beancount_importer.transforms.amortize import AMORTIZE_TYPES, amortize_metadata
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.storage import load_rules, save_rules
 from beancount_importer.rules.tags import ActiveTag, TagState
@@ -112,35 +109,6 @@ class RichReporter:
 # ── Interactive categorizer ───────────────────────────────────────────────────
 
 
-def _render_txn_panel(txn: SourceTransaction) -> Panel:
-    parts = [
-        f"[bold]{txn.booking_date}[/]  {txn.amount} {txn.currency}",
-        f"payee:       {txn.payee or '—'}",
-        f"description: {txn.description or '—'}",
-        f"bank:        {txn.bank_key}",
-    ]
-    if txn.sepa_reference:
-        parts.append(f"sepa:        {txn.sepa_reference}")
-    return Panel("\n".join(parts), title="transaction", border_style="cyan")
-
-
-def _render_candidates(ctx: CategorizeContext) -> Table | None:
-    if not ctx.candidates:
-        return None
-    table = Table(title="candidates")
-    table.add_column("#", justify="right")
-    table.add_column("score", justify="right")
-    table.add_column("date")
-    table.add_column("payee/narration")
-    table.add_column("target")
-    for i, (entry, score) in enumerate(ctx.candidates, start=1):
-        descr = entry.payee or entry.narration
-        table.add_row(
-            str(i), f"{score:.2f}", str(entry.date), descr, entry.target_account
-        )
-    return table
-
-
 def make_preview_categorizer() -> object:
     """Non-interactive categorizer used by `--preview`.
 
@@ -171,133 +139,6 @@ def make_preview_categorizer() -> object:
     return _fn
 
 
-def _render_account_suggestions(hints: tuple[str, ...]) -> Table | None:
-    """Render the top-N ranked account suggestions as a numbered table."""
-    if not hints:
-        return None
-    table = Table(title="suggestions", show_header=False, expand=False)
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("account")
-    for i, account in enumerate(hints, start=1):
-        table.add_row(str(i), account)
-    return table
-
-
-def make_interactive_categorizer() -> object:
-    """Returns a callable matching `CategorizeFn` that prompts via Rich.
-
-    Adds a numbered pick over `ctx.account_hints` (populated by the pipeline
-    via `rank_accounts`) so the common case is a single keystroke. Typing a
-    non-numeric value falls through to free-form account entry; the matched
-    rule's target (if any) remains the default.
-    """
-
-    def _fn(ctx: CategorizeContext) -> CategoryProposal:
-        console.print(_render_txn_panel(ctx.txn))
-        candidates_table = _render_candidates(ctx)
-        if candidates_table is not None:
-            console.print(candidates_table)
-        suggestions_table = _render_account_suggestions(ctx.account_hints)
-        if suggestions_table is not None:
-            console.print(suggestions_table)
-        if ctx.matched_rule is not None:
-            console.print(
-                f"[green]rule match[/]: → {ctx.matched_rule.target_account}"
-                + (
-                    f"  (payee={ctx.matched_rule.payee_pattern!r})"
-                    if ctx.matched_rule.payee_pattern
-                    else ""
-                )
-            )
-
-        action = Prompt.ask(
-            "[bold]action[/]",
-            choices=["c", "s", "q"],
-            default="c",
-            show_choices=True,
-        )
-        if action == "s":
-            return CategoryProposal(action="skip")
-        if action == "q":
-            return CategoryProposal(action="quit")
-
-        default_account = (
-            ctx.matched_rule.target_account if ctx.matched_rule else "Expenses:Unknown"
-        )
-        raw = Prompt.ask(
-            "target account [dim](number from suggestions or full account)[/]",
-            default=default_account,
-        )
-        account = _resolve_account_pick(raw, ctx.account_hints)
-        save_as_rule = False
-        if ctx.matched_rule is None:
-            save_as_rule = Confirm.ask("save as rule?", default=False)
-        proposal = CategoryProposal(
-            action="categorize",
-            postings=(Posting(account=account),),
-            save_as_rule=save_as_rule,
-        )
-        # Amortize is opt-in per-transaction. Skip the prompt entirely for
-        # credits — amortizing income is rare and confusing.
-        if ctx.txn.amount < 0 and Confirm.ask(
-            "amortize this transaction?", default=False
-        ):
-            proposal = _prompt_amortize(proposal)
-        return proposal
-
-    return _fn
-
-
-def _augment_with_amortize(
-    proposal: CategoryProposal, amortize_type: str, months: int
-) -> CategoryProposal:
-    """Stamp `proposal`'s metadata with the amortize key/months pair.
-
-    Wraps `amortize_metadata` with the proposal merge so the prompt code
-    stays linear. Pure function — no I/O.
-    """
-    extra = amortize_metadata(amortize_type, months)
-    return proposal.model_copy(
-        update={"metadata": {**proposal.metadata, **extra}}
-    )
-
-
-def _prompt_amortize(proposal: CategoryProposal) -> CategoryProposal:
-    """Interactive amortize: pick a type, pick a number of months.
-
-    Returns the proposal unchanged on invalid month input — better to
-    write a non-amortized entry than to abort the user's whole categorize
-    decision over a typo.
-    """
-    a_type = Prompt.ask(
-        "amortize type",
-        choices=list(AMORTIZE_TYPES),
-        default="amortize_months",
-    )
-    months_raw = Prompt.ask("months", default="12")
-    try:
-        months = int(months_raw.strip())
-        if months < 1:
-            raise ValueError
-    except ValueError:
-        console.print("[yellow]invalid month count — skipping amortize[/]")
-        return proposal
-    return _augment_with_amortize(proposal, a_type, months)
-
-
-def _resolve_account_pick(raw: str, hints: tuple[str, ...]) -> str:
-    """Map a numeric pick onto the suggestion list; otherwise return as-is.
-
-    Out-of-range numbers fall through to literal interpretation so that
-    e.g. `2024` (a year typed by mistake) becomes a free-form account name
-    rather than silently selecting the second suggestion.
-    """
-    raw = raw.strip()
-    if raw.isdigit() and hints:
-        idx = int(raw)
-        if 1 <= idx <= len(hints):
-            return hints[idx - 1]
-    return raw
 
 
 # ── Path resolution ───────────────────────────────────────────────────────────
@@ -480,7 +321,7 @@ def main(
 
     reporter = RichReporter()
     categorize = (
-        make_preview_categorizer() if preview else make_interactive_categorizer()
+        make_preview_categorizer() if preview else make_screen_categorizer(console)
     )
     results = run_pipeline(session, base_dir, categorize, reporter, decisions=decisions)  # type: ignore[arg-type]
 
