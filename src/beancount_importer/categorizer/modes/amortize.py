@@ -48,10 +48,12 @@ def run(console: Console, proposal: CategoryProposal) -> CategoryProposal:
     surprises after Enter", and a typo here shouldn't burn a transaction.
     """
     render(console)
+    # No Enter default: same reasoning as tag_menu — the screen has no
+    # "obvious" pick, and a silent cancel-on-Enter is exactly the bug
+    # we hit on the pager.
     key = Prompt.ask(
         ">",
         choices=list(_HOTKEYS),
-        default="4",
         show_choices=False,
         show_default=False,
     ).strip()

@@ -275,3 +275,79 @@ class TestRun:
             "rich.prompt.Prompt.ask", _scripted("o", "s")
         )
         assert run(_console(), _ctx(existing=())).action == "skip"
+
+
+# ── Pager UX regressions ──────────────────────────────────────────────────────
+
+
+class TestPagerEnterSemantics:
+    """Enter on the pager must advance to the next page (or stay), never
+    silently cancel back to Screen 2 — see the on-call bug report where
+    a user pressed Enter expecting `next` and got dumped to a hotkey
+    prompt that didn't accept `n` because they were no longer in the
+    pager.
+    """
+
+    def test_enter_on_first_page_advances_to_next(self, monkeypatch):
+        # 15 accounts → 2 pages. `l` to enter, Enter to advance, `5`
+        # picks the 5th item on page 2 (overall index 14).
+        full_pool = tuple(f"Expenses:Cat{i}" for i in range(15))
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("l", "", "5")
+        )
+        decision = run(_console(), _ctx(all_accounts=full_pool))
+        assert decision.action == "pick"
+        assert decision.account == "Expenses:Cat14"
+
+    def test_enter_on_last_page_is_noop_then_user_picks(self, monkeypatch):
+        # 15 accounts: page 1 is full, page 2 has 5. Enter on page 2 (the
+        # last page) re-renders without cancelling; the next prompt picks.
+        full_pool = tuple(f"Expenses:Cat{i}" for i in range(15))
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("l", "n", "", "1")
+        )
+        decision = run(_console(), _ctx(all_accounts=full_pool))
+        assert decision.action == "pick"
+        # First item on page 2 is Cat10.
+        assert decision.account == "Expenses:Cat10"
+
+    def test_explicit_x_still_cancels(self, monkeypatch):
+        # Sanity: the documented cancel still works after the default change.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("l", "x", "s")
+        )
+        assert run(_console(), _ctx()).action == "skip"
+
+
+class TestRedrawAfterCancel:
+    def test_screen2_redraws_after_pager_cancel(self, monkeypatch):
+        # After cancelling the pager with `x`, the user should see the
+        # Screen 2 hotkey row again (so they know what their options
+        # are). Tests for the visible re-render of "list all accounts".
+        full_pool = tuple(f"Expenses:Cat{i}" for i in range(15))
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("l", "x", "s")
+        )
+        console = _console()
+        run(console, _ctx(all_accounts=full_pool))
+        # The hotkey row appears at least twice — once before the pager,
+        # once after returning to Screen 2.
+        assert console.export_text().count("[l] list all accounts") >= 2
+
+    def test_screen2_redraws_after_w_empty_input(self, monkeypatch):
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("w", "", "s")
+        )
+        console = _console()
+        run(console, _ctx())
+        assert console.export_text().count("[l] list all accounts") >= 2
+
+    def test_screen2_redraws_after_o_with_no_history(self, monkeypatch):
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("o", "s")
+        )
+        console = _console()
+        run(console, _ctx(existing=()))
+        # After the `[o]` sub-prompt prints "(no own-account history yet)"
+        # and returns, Screen 2 should redraw before the next prompt.
+        assert console.export_text().count("[l] list all accounts") >= 2

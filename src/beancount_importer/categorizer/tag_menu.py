@@ -53,12 +53,15 @@ def run(console: Console, current: ActiveTag | None) -> TagStateDelta | None:
     `None` is distinct from `TagStateDelta(op="noop")`: returning None
     signals "the user backed out, do not record any change". A noop
     would still flow through the proposal and replay.
+
+    No Enter default — the menu has no "obvious" choice (the user
+    came here to *do* something), and silently cancelling on Enter
+    would mirror the pager bug we just fixed.
     """
     render(console, current)
     key = Prompt.ask(
         ">",
         choices=list(_HOTKEYS),
-        default="5",
         show_choices=False,
         show_default=False,
     ).strip()

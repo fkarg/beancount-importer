@@ -152,9 +152,13 @@ def _build_hotkeys(ctx: PickContext) -> tuple[str, ...]:
 def run(console: Console, ctx: PickContext) -> PickDecision:
     """Render → prompt → handle. Each path either picks an account or
     transitions to a sub-prompt that does.
+
+    Re-renders Screen 2 after every sub-prompt cancel so the user's
+    landing view is always the hotkey row, never the tail of a list
+    they just backed out of.
     """
-    render(console, ctx)
     while True:
+        render(console, ctx)
         key = ask_hotkey(_build_hotkeys(ctx))
         if key == "s":
             return PickDecision(action="skip")
@@ -168,8 +172,6 @@ def run(console: Console, ctx: PickContext) -> PickDecision:
             picked = _paged_list(console, ctx.all_accounts)
             if picked is not None:
                 return PickDecision(action="pick", account=picked)
-            # User cancelled the paging; redraw isn't necessary —
-            # `Prompt.ask` re-asks the hotkey choice immediately.
             continue
         if key == "w":
             picked = _write_custom(console, ctx.all_accounts)
@@ -193,6 +195,12 @@ def _paged_list(console: Console, accounts: Iterable[str]) -> str | None:
 
     Pages are 1-indexed in display but 0-indexed internally. Returns the
     chosen account or `None` if the user backed out (`x`).
+
+    Enter (empty input) advances to the next page when one exists. On
+    the last page, Enter is a no-op that re-renders the page so the
+    user sees the hotkey row again — the silent `default="x"` cancel
+    bit one user mid-flight (they pressed Enter expecting "next", got
+    booted to the parent screen with no hint of why).
     """
     items = list(accounts)
     if not items:
@@ -206,16 +214,22 @@ def _paged_list(console: Console, accounts: Iterable[str]) -> str | None:
         console.print(f"  [dim]Page {page + 1}/{pages}[/]")
         for i, account in enumerate(chunk, start=1):
             console.print(f"    {hotkey(str(i))} {styled_account(account)}")
-        page_keys: list[str] = [str(i) for i in range(1, len(chunk) + 1)] + ["x"]
-        if page > 0:
+        # Always include the empty string so Enter is a known choice; what
+        # we *do* with it depends on whether there's a next page.
+        page_keys: list[str] = [""] + [str(i) for i in range(1, len(chunk) + 1)] + ["x"]
+        has_next = page + 1 < pages
+        has_prev = page > 0
+        if has_prev:
             page_keys.append("p")
-        if page + 1 < pages:
+        if has_next:
             page_keys.append("n")
         prompt_extra = []
-        if "p" in page_keys:
+        if has_prev:
             prompt_extra.append(f"{hotkey('p')} prev")
-        if "n" in page_keys:
-            prompt_extra.append(f"{hotkey('n')} next")
+        if has_next:
+            prompt_extra.append(f"{hotkey('enter/n')} next")
+        else:
+            prompt_extra.append(f"{hotkey('enter')} stay")
         prompt_extra.append(f"{hotkey('x')} cancel")
         console.print(
             "  " + "  ".join([f"{hotkey('1-' + str(len(chunk)))} pick"] + prompt_extra)
@@ -223,7 +237,7 @@ def _paged_list(console: Console, accounts: Iterable[str]) -> str | None:
         key = Prompt.ask(
             ">",
             choices=page_keys,
-            default="x",
+            default="",
             show_choices=False,
             show_default=False,
         ).strip()
@@ -232,8 +246,11 @@ def _paged_list(console: Console, accounts: Iterable[str]) -> str | None:
         if key == "p":
             page -= 1
             continue
-        if key == "n":
+        if key == "n" or (key == "" and has_next):
             page += 1
+            continue
+        if key == "":
+            # Last page, Enter pressed — redraw and re-prompt.
             continue
         return chunk[int(key) - 1]
 
