@@ -130,15 +130,15 @@ class Config(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     banks: list[BankConfig] = []
-    # Everything below is resolved relative to the config file's parent
-    # directory. The CLI defaults that directory to `.beancount-importer/`,
-    # so a project root has only that single dotted folder plus the user's
-    # own `transactions/` and `documents/`.
-    rules_file: str = "rules.json"
-    decisions_file: str = "decisions.jsonl"
-    tag_state_file: str = "tag_state.json"
-    documents_dir: str = "../documents"
-    transactions_dir: str = "../transactions"
+    # Everything below is resolved relative to the *finances root* — the
+    # parent of `.beancount-importer/` in the standard layout (or whatever
+    # the CLI computed via `--root` / CWD fallback). State files keep living
+    # inside `.beancount-importer/`; the defaults spell out that prefix.
+    rules_file: str = ".beancount-importer/rules.json"
+    decisions_file: str = ".beancount-importer/decisions.jsonl"
+    tag_state_file: str = ".beancount-importer/tag_state.json"
+    documents_dir: str = "documents"
+    transactions_dir: str = "transactions"
     # Path to the top-level beancount file used by `bean-query` to compute
     # the plugin-expanded transaction count shown in the preview. May contain
     # `{year}` for per-year main files. Optional — the count is skipped if

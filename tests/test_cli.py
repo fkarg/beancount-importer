@@ -28,7 +28,7 @@ CONFIG_TOML = textwrap.dedent("""\
     key = "spk"
     display_name = "Sparkasse"
     account = "Assets:B:SPK"
-    file_glob = "SPK_*.csv"
+    file_glob = "documents/SPK_*.csv"
     output_file = "transactions/{year}/SPK.bean"
 
     [banks.csv]
@@ -54,7 +54,10 @@ SPK_CSV = textwrap.dedent("""\
 @pytest.fixture
 def project_dir(tmp_path: Path) -> Path:
     (tmp_path / "import_config.toml").write_text(CONFIG_TOML)
-    (tmp_path / "SPK_jan.csv").write_text(SPK_CSV)
+    docs = tmp_path / "documents"
+    docs.mkdir()
+    (docs / "SPK_jan.csv").write_text(SPK_CSV)
+    (tmp_path / "transactions").mkdir()
     return tmp_path
 
 

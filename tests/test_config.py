@@ -87,9 +87,9 @@ class TestConfigLoad:
 
     def test_defaults(self, toml_file: Path):
         cfg = Config.load(toml_file)
-        assert cfg.rules_file == "rules.json"
-        assert cfg.decisions_file == "decisions.jsonl"
-        assert cfg.tag_state_file == "tag_state.json"
+        assert cfg.rules_file == ".beancount-importer/rules.json"
+        assert cfg.decisions_file == ".beancount-importer/decisions.jsonl"
+        assert cfg.tag_state_file == ".beancount-importer/tag_state.json"
 
     def test_missing_file_raises(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError):

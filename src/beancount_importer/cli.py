@@ -47,7 +47,7 @@ app = typer.Typer(
     add_completion=False,
     help="Modular beancount CSV importer.",
 )
-console = Console()
+console = Console(highlight=False)
 
 
 # ── Tag-state persistence ─────────────────────────────────────────────────────
@@ -267,6 +267,18 @@ def main(
         Path,
         typer.Option("--config", "-c", help="Path to the importer config TOML"),
     ] = Path(".beancount-importer/config.toml"),
+    root: Annotated[
+        Path | None,
+        typer.Option(
+            "--root",
+            "-R",
+            help=(
+                "Override the finances root used to resolve relative paths in the "
+                "config. Defaults to the parent of `.beancount-importer/` when the "
+                "config lives there, otherwise the current working directory."
+            ),
+        ),
+    ] = None,
     bank: Annotated[
         str | None,
         typer.Option("--bank", "-b", help="Only process this bank key"),
@@ -336,7 +348,8 @@ def main(
         raise typer.Exit(code=2)
 
     config = Config.load(config_path)
-    base_dir = config_path.resolve().parent
+    base_dir = _resolve_finances_root(config_path, root)
+    _validate_paths(config, config_path, base_dir)
 
     rules_path = base_dir / config.rules_file
     decisions_path = base_dir / config.decisions_file
@@ -645,16 +658,16 @@ def _print_summary(results: list[ImportResult], *, dry_run: bool) -> None:
 
 _STARTER_CONFIG = """\
 # Starter configuration for beancount-importer.
-# All paths in this file are resolved relative to the config file's directory
-# (i.e. .beancount-importer/), so `../transactions` and `../documents` point
-# to siblings of that folder.
+# All paths in this file are resolved relative to the *finances root* —
+# the parent of `.beancount-importer/` in the standard layout, or whatever
+# you pass via `--root`. State files keep living inside the dotted folder.
 # Add one [[banks]] section per bank. {year} is substituted at run time.
 
-rules_file = "rules.json"
-decisions_file = "decisions.jsonl"
-tag_state_file = "tag_state.json"
-documents_dir = "../documents"
-transactions_dir = "../transactions"
+rules_file = ".beancount-importer/rules.json"
+decisions_file = ".beancount-importer/decisions.jsonl"
+tag_state_file = ".beancount-importer/tag_state.json"
+documents_dir = "documents"
+transactions_dir = "transactions"
 
 [matching]
 min_score = 0.35
@@ -663,8 +676,8 @@ min_score = 0.35
 # key = "spk"
 # display_name = "Sparkasse"
 # account = "Assets:B:SPK"
-# file_glob = "SPK_*.csv"
-# output_file = "../transactions/{year}/SPK.bean"
+# file_glob = "documents/**/SPK_*.csv"
+# output_file = "transactions/{year}/SPK.bean"
 #
 # [banks.csv]
 # delimiter = ";"
@@ -677,6 +690,99 @@ min_score = 0.35
 # field_description = "Verwendungszweck"
 # field_sepa_reference = "Kundenreferenz"
 """
+
+
+# ── Path resolution + preflight validation ───────────────────────────────────
+
+
+def _resolve_finances_root(config_path: Path, override: Path | None) -> Path:
+    """Pick the directory that relative paths in the TOML resolve against.
+
+    Priority: explicit `--root` override > parent of `.beancount-importer/`
+    when the config lives there > the config file's own parent directory.
+    """
+    if override is not None:
+        return override.resolve()
+    cfg = config_path.resolve()
+    if cfg.parent.name == ".beancount-importer" and cfg.name == "config.toml":
+        return cfg.parent.parent
+    return cfg.parent
+
+
+def _validate_paths(config: Config, config_path: Path, base_dir: Path) -> None:
+    """Fail fast when required directories don't exist.
+
+    On failure: print a colored "Resolved configuration" table with absolute
+    paths and green/red markers, then exit. State files are dim — they're
+    created on demand and not blocking. Per-bank file_globs report their
+    absolute glob root and a match count (0 is dim, not red).
+    """
+    transactions_abs = (base_dir / config.transactions_dir).resolve()
+    documents_abs = (base_dir / config.documents_dir).resolve()
+
+    errors: list[str] = []
+    if not transactions_abs.is_dir():
+        errors.append(f"transactions_dir does not exist: {transactions_abs}")
+    if not documents_abs.is_dir():
+        errors.append(f"documents_dir does not exist: {documents_abs}")
+    if not errors:
+        return
+
+    table = Table(title="Resolved configuration", show_header=False, expand=False)
+    table.add_column("key", style="bold")
+    table.add_column("value")
+
+    def _row(label: str, path: Path, *, exists: bool, dim: bool = False) -> None:
+        if dim:
+            marker = "[dim]·[/]"
+            value = f"[dim]{path}[/]"
+        elif exists:
+            marker = "[green]✓[/]"
+            value = str(path)
+        else:
+            marker = "[red]✗[/]"
+            value = f"[red]{path}[/]"
+        table.add_row(label, f"{marker} {value}")
+
+    table.add_row("config", str(config_path.resolve()))
+    table.add_row("finances root", str(base_dir))
+    _row("transactions_dir", transactions_abs, exists=transactions_abs.is_dir())
+    _row("documents_dir", documents_abs, exists=documents_abs.is_dir())
+    _row(
+        "rules_file",
+        (base_dir / config.rules_file).resolve(),
+        exists=True,
+        dim=True,
+    )
+    _row(
+        "decisions_file",
+        (base_dir / config.decisions_file).resolve(),
+        exists=True,
+        dim=True,
+    )
+    _row(
+        "tag_state_file",
+        (base_dir / config.tag_state_file).resolve(),
+        exists=True,
+        dim=True,
+    )
+    for bank in config.banks:
+        glob_matches = list(base_dir.glob(bank.file_glob, case_sensitive=False))
+        n = len(glob_matches)
+        marker = "[dim]·[/]" if n == 0 else "[green]✓[/]"
+        table.add_row(
+            f"banks.{bank.key}.file_glob",
+            f"{marker} {bank.file_glob}  [dim]({n} match{'es' if n != 1 else ''})[/]",
+        )
+        table.add_row(
+            f"banks.{bank.key}.output_file",
+            f"[dim]·[/] [dim]{(base_dir / bank.output_file).resolve()}[/]",
+        )
+
+    console.print(table)
+    for err in errors:
+        console.print(f"[red]error:[/] {err}")
+    raise typer.Exit(code=2)
 
 
 if __name__ == "__main__":

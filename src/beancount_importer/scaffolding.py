@@ -123,15 +123,15 @@ _LEGACY_CSV_DEFAULTS: dict[str, dict[str, Any]] = {
 _LEGACY_FILE_GLOBS: dict[str, str] = {
     # `**/` recurses through year-subdirs (`documents/2024/SPK_*.CSV` etc.)
     # since the legacy importer organized CSV exports per year.
-    "spk": "../documents/**/SPK_*.CSV",
+    "spk": "documents/**/SPK_*.CSV",
     # N26 exports through history have been both `N26_<year>.csv` and the
     # older `n26-<year>.csv` shape — case_sensitive=False at glob time means
     # `N26_*.csv` matches both casings, but we still need the underscore form
     # to match the modern exports the user actually has on disk.
-    "n26": "../documents/**/N26_*.csv",
-    "paypal": "../documents/**/PayPal_*.csv",
-    "cash": "../documents/cash.csv",
-    "zinia": "../documents/**/Zinia_*.xls",
+    "n26": "documents/**/N26_*.csv",
+    "paypal": "documents/**/PayPal_*.csv",
+    "cash": "documents/cash.csv",
+    "zinia": "documents/**/Zinia_*.xls",
 }
 
 
@@ -233,8 +233,10 @@ def _detect_active_banks(project_dir: Path) -> list[str]:
     txdir = project_dir / "transactions"
 
     for key in _LEGACY_BANK_ACCOUNTS:
-        glob = _LEGACY_FILE_GLOBS.get(key, f"{key}_*.csv")
-        has_csv = bool(list(docs.glob(f"**/{glob}"))) if docs.exists() else False
+        # Globs are now project-root relative (e.g. `documents/**/SPK_*.CSV`),
+        # so glob from the project dir directly.
+        glob = _LEGACY_FILE_GLOBS.get(key, f"documents/{key}_*.csv")
+        has_csv = bool(list(project_dir.glob(glob))) if docs.exists() else False
         has_bean = False
         if txdir.exists():
             has_bean = bool(list(txdir.glob(f"**/{key.upper()}.bean")))
@@ -289,20 +291,20 @@ def _build_config_toml(
             "key": key,
             "display_name": key.upper(),
             "account": _LEGACY_BANK_ACCOUNTS[key],
-            "file_glob": _LEGACY_FILE_GLOBS.get(key, f"{key}_*.csv"),
-            # Paths in the TOML are resolved relative to the config file's
-            # directory (`.beancount-importer/`), so transactions/ and
-            # documents/ are referenced as siblings via `..`.
-            "output_file": f"../transactions/{{year}}/{key.upper()}.bean",
+            "file_glob": _LEGACY_FILE_GLOBS.get(key, f"documents/{key}_*.csv"),
+            # Paths in the TOML are resolved relative to the finances root
+            # (the parent of `.beancount-importer/`), so transactions/ and
+            # documents/ are referenced directly.
+            "output_file": f"transactions/{{year}}/{key.upper()}.bean",
             "csv": dict(csv_defaults),
         })
 
     config: dict[str, Any] = {
-        "rules_file": "rules.json",
-        "decisions_file": "decisions.jsonl",
-        "tag_state_file": "tag_state.json",
-        "documents_dir": "../documents",
-        "transactions_dir": "../transactions",
+        "rules_file": ".beancount-importer/rules.json",
+        "decisions_file": ".beancount-importer/decisions.jsonl",
+        "tag_state_file": ".beancount-importer/tag_state.json",
+        "documents_dir": "documents",
+        "transactions_dir": "transactions",
         "matching": {
             "min_score": 0.35,
             "min_delta": 0.15,
