@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from hypothesis import given, strategies as st
 
-from beancount_importer.matching.account_suggest import rank_accounts
+from beancount_importer.matching.account_suggest import account_glyph, rank_accounts
 from beancount_importer.models import LedgerEntry, SourceTransaction
 
 
@@ -143,3 +143,35 @@ class TestRankAccounts:
         )
         assert top[0] == "Expenses:Food"
         assert top.count("Expenses:Food") == 1
+
+
+class TestAccountGlyph:
+    def test_each_class_has_distinct_glyph(self):
+        glyphs = {
+            account_glyph("Expenses:Food")[0],
+            account_glyph("Income:Salary")[0],
+            account_glyph("Assets:B:SPK")[0],
+            account_glyph("Liabilities:CreditCard:Visa")[0],
+            account_glyph("Equity:Opening-Balances")[0],
+        }
+        # Five classes, five distinct glyphs — visual orientation depends on it.
+        assert len(glyphs) == 5
+
+    def test_each_class_has_distinct_style(self):
+        styles = {
+            account_glyph("Expenses:Food")[1],
+            account_glyph("Income:Salary")[1],
+            account_glyph("Assets:B:SPK")[1],
+            account_glyph("Liabilities:CreditCard:Visa")[1],
+            account_glyph("Equity:Opening-Balances")[1],
+        }
+        assert len(styles) == 5
+
+    def test_unknown_prefix_returns_neutral_marker(self):
+        glyph, style = account_glyph("WeirdRoot:Sub")
+        assert glyph == "\u00b7"  # mid-dot
+        assert style == "white"
+
+    def test_helper_is_pure(self):
+        # Two calls with the same input return identical tuples.
+        assert account_glyph("Expenses:Food") == account_glyph("Expenses:Food")

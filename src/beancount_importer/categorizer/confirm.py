@@ -1,0 +1,246 @@
+"""Screen 1 — Confirm proposal.
+
+Three entry contexts share one screen:
+- `auto_matched`: a categorization rule fired
+- `top_candidate`: an existing ledger entry's target was reused
+- `fresh_pick`: the user just picked a category on Screen 2
+
+The hotkey row adapts to the context (`[u] fix rule` only when a rule
+matched, `💡 N similar upcoming` only on `fresh_pick`), but the body
+shape is identical: header → headline → optional provenance → raw
+fields → "Will write" block → hotkey row.
+
+Edits append a fresh proposal block; the screen never clears. Tests
+capture `console.export_text()` and assert structural elements.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+from rich.console import Console
+from rich.prompt import Prompt
+
+from beancount_importer.categorizer.header import HeaderContext, render_header
+from beancount_importer.matching.account_suggest import account_glyph
+from beancount_importer.models import (
+    CategoryProposal,
+    LedgerEntry,
+    SourceTransaction,
+)
+from beancount_importer.rules.models import CategorizationRule
+
+
+@dataclass(frozen=True)
+class ConfirmContext:
+    """Inputs for one Screen-1 invocation.
+
+    `bank_account` is the source-side account (e.g. `Assets:B:SPK`) used
+    to render the headline arrow. `kind` selects the provenance line.
+    `similar_upcoming` populates the `💡` hint on `fresh_pick`; ignored
+    on the other kinds.
+    """
+
+    txn: SourceTransaction
+    proposal: CategoryProposal
+    bank_account: str
+    kind: Literal["auto_matched", "top_candidate", "fresh_pick"]
+    matched_rule: CategorizationRule | None = None
+    matched_entry: LedgerEntry | None = None
+    progress: tuple[int, int] = (0, 0)
+    bank_key: str = ""
+    year: int = 0
+    active_tag: str | None = None
+    tag_remaining: int | None = None
+    similar_upcoming: int = 0
+
+
+@dataclass(frozen=True)
+class ConfirmDecision:
+    """Returned from `run`. The categorizer consumes `proposal` for
+    `confirm`; for navigation actions (`change_account`, `open_*`) the
+    caller transitions to the appropriate screen.
+
+    Only one transition action ships in Step 2 — the rest land in the
+    later steps that build their target screens.
+    """
+
+    action: Literal["confirm", "skip", "quit"]
+    proposal: CategoryProposal | None = None
+
+
+# ── Render ────────────────────────────────────────────────────────────────────
+
+
+def _format_amount(txn: SourceTransaction) -> str:
+    sign = "+" if txn.amount > 0 else ""
+    return f"{sign}{txn.amount} {txn.currency}"
+
+
+def _styled_account(account: str) -> str:
+    """Glyph + space + account name, wrapped in a Rich style tag.
+
+    Callers replace empty strings with `"?"` before passing in, so the
+    style+glyph here always wraps a non-empty name. If the prefix isn't
+    one of the known account classes, `account_glyph` returns the neutral
+    dot/white pair.
+    """
+    glyph, style = account_glyph(account)
+    return f"[{style}]{glyph} {account}[/]"
+
+
+def render(console: Console, ctx: ConfirmContext) -> None:
+    """Append one proposal block to the console output. Pure I/O."""
+    header = HeaderContext(
+        progress=ctx.progress,
+        bank_key=ctx.bank_key,
+        year=ctx.year,
+        active_tag=ctx.active_tag,
+        tag_remaining=ctx.tag_remaining,
+        glyph="✎",
+    )
+    render_header(console, header)
+
+    # When the proposal has no target (degenerate state — empty postings),
+    # show a bare `?` rather than gluing the neutral glyph onto a literal
+    # "?" string. The user reads this as "still missing", not "neutral class".
+    target_str = (
+        _styled_account(ctx.proposal.target_account)
+        if ctx.proposal.target_account
+        else "?"
+    )
+    headline = (
+        f"  [bold]{ctx.txn.booking_date.isoformat()}[/]   "
+        f"[bold]{_format_amount(ctx.txn)}[/]   "
+        f"{_styled_account(ctx.bank_account)}  →  {target_str}"
+    )
+    console.print(headline)
+    console.print()
+
+    _render_provenance(console, ctx)
+    _render_raw_block(console, ctx)
+    _render_will_write_block(console, ctx)
+    _render_hotkeys(console, ctx)
+    console.print("─" * 73)
+
+
+def _render_provenance(console: Console, ctx: ConfirmContext) -> None:
+    if ctx.kind == "auto_matched" and ctx.matched_rule is not None:
+        rule = ctx.matched_rule
+        pattern = rule.payee_pattern or rule.description_pattern or ""
+        field = "payee" if rule.payee_pattern else "description"
+        console.print(
+            f"  Matched rule: [cyan]/{pattern}/[/]  (in {field})"
+        )
+        console.print()
+    elif ctx.kind == "top_candidate" and ctx.matched_entry is not None:
+        console.print(
+            f"  Reusing target from existing entry on "
+            f"[dim]{ctx.matched_entry.date.isoformat()}[/]"
+        )
+        console.print()
+    elif ctx.kind == "fresh_pick" and ctx.similar_upcoming > 0:
+        console.print(
+            f"  💡 [cyan]{ctx.similar_upcoming}[/] more similar transactions upcoming"
+        )
+        console.print()
+
+
+def _render_raw_block(console: Console, ctx: ConfirmContext) -> None:
+    payee = ctx.txn.payee or "—"
+    description = ctx.txn.description or "—"
+    console.print("  Raw:")
+    console.print(f"    payee:        [dim]{payee}[/]")
+    console.print(f"    description:  [dim]{description}[/]")
+    console.print()
+
+
+def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
+    p = ctx.proposal
+    payee_out = p.payee or ctx.txn.payee or ""
+    narr_out = p.narration or ctx.txn.description or ""
+    target = _styled_account(p.target_account) if p.target_account else "?"
+    console.print("  Will write:")
+    console.print(f'    narration:    "{narr_out}"')
+    console.print(f'    payee:        "{payee_out}"')
+    console.print(f"    category:     {target}")
+    if p.tag:
+        console.print(f"    tag:          [magenta]#{p.tag}[/]")
+    console.print()
+
+
+def _hotkey(letter: str) -> str:
+    """Render `[<letter>]` as literal text styled cyan.
+
+    Rich's markup parser treats `[…]` as a tag opener; the backslash-bracket
+    escape produces a literal `[` while keeping the surrounding `[cyan]` tag.
+    """
+    return rf"[cyan]\[{letter}][/]"
+
+
+def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
+    """Hotkey row scaled to Step 2's slice: enter / n / p / s / q.
+
+    Cross-screen affordances (`[c]`, `[t]`, `[r]`, `[u]`, `[m]`) come
+    online as the screens they hand off to land in later steps.
+    """
+    del ctx  # kind-conditional rows arrive once `[u]` etc. ship
+    console.print(
+        f"  {_hotkey('enter')} confirm  "
+        f"{_hotkey('n')} narration  "
+        f"{_hotkey('p')} payee"
+    )
+    console.print(f"                   {_hotkey('s')} skip       {_hotkey('q')} quit")
+
+
+# ── Run loop ──────────────────────────────────────────────────────────────────
+
+
+_HOTKEYS = ("", "n", "p", "s", "q")
+
+
+def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
+    """Render → prompt → handle → loop until commit/skip/quit.
+
+    Edits update the proposal in-place (frozen-model `model_copy`) and
+    re-render below the previous block. Empty input means Enter.
+    """
+    proposal = ctx.proposal
+    while True:
+        render(console, _replace(ctx, proposal=proposal))
+        key = _ask_hotkey(console)
+        if key == "":
+            return ConfirmDecision(action="confirm", proposal=proposal)
+        if key == "s":
+            return ConfirmDecision(action="skip")
+        if key == "q":
+            return ConfirmDecision(action="quit")
+        # Edit hotkeys: mutate `proposal` and loop. `Prompt.ask`'s `choices`
+        # list keeps `key` inside this set — no fallthrough is reachable.
+        if key == "n":
+            current = proposal.narration or ctx.txn.description or ""
+            new = Prompt.ask(f"narration [{current}]", default=current)
+            proposal = proposal.model_copy(update={"narration": new})
+        else:  # key == "p"
+            current = proposal.payee or ctx.txn.payee or ""
+            new = Prompt.ask(f"payee [{current}]", default=current)
+            proposal = proposal.model_copy(update={"payee": new})
+
+
+def _ask_hotkey(console: Console) -> str:
+    del console  # Prompt.ask drives the same console implicitly
+    return Prompt.ask(
+        ">",
+        choices=list(_HOTKEYS),
+        default="",
+        show_choices=False,
+        show_default=False,
+    ).strip()
+
+
+def _replace(ctx: ConfirmContext, **changes) -> ConfirmContext:
+    """`dataclass.replace` shim — kept local so the import stays minimal."""
+    from dataclasses import replace
+
+    return replace(ctx, **changes)

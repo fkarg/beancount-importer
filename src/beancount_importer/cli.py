@@ -48,7 +48,10 @@ app = typer.Typer(
     add_completion=False,
     help="Modular beancount CSV importer.",
 )
-console = Console(highlight=False)
+# `emoji=False` is essential: account paths like `Assets:B:SPK` and
+# `Liabilities:CreditCard:Visa` contain `:X:` substrings that Rich's emoji
+# subsystem would otherwise rewrite into emoji glyphs.
+console = Console(highlight=False, emoji=False)
 
 
 # ── Tag-state persistence ─────────────────────────────────────────────────────

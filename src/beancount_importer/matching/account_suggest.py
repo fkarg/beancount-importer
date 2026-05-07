@@ -23,6 +23,35 @@ from collections.abc import Iterable
 from beancount_importer.models import LedgerEntry, SourceTransaction
 
 
+# Account-class → (glyph, Rich style) table. The single source of truth for
+# the visual grammar described in `docs/ux-design.md`. Glyphs carry the same
+# information as colors so red/green-blind users still get orientation.
+# Rich style strings are kept as raw values; callers use them in markup like
+# `f"[{style}]{glyph} {account}[/]"` rather than constructing `Style` objects.
+_ACCOUNT_GLYPHS: tuple[tuple[str, str, str], ...] = (
+    # (prefix, glyph, rich style)
+    ("Expenses:",    "↓", "red"),
+    ("Income:",      "↑", "green"),
+    ("Assets:",      "◆", "blue"),
+    ("Liabilities:", "⊟", "yellow"),
+    ("Equity:",      "⊕", "magenta"),
+)
+_DEFAULT_GLYPH = ("·", "white")
+
+
+def account_glyph(account: str) -> tuple[str, str]:
+    """Return `(glyph, rich_style)` for `account`, classified by prefix.
+
+    Unknown prefixes get a neutral mid-dot glyph and white style — they still
+    render, but without a class commitment. The caller decides how to compose
+    glyph + style with the account name (typically as Rich markup).
+    """
+    for prefix, glyph, style in _ACCOUNT_GLYPHS:
+        if account.startswith(prefix):
+            return glyph, style
+    return _DEFAULT_GLYPH
+
+
 def rank_accounts(
     txn: SourceTransaction,
     candidates: Iterable[tuple[LedgerEntry, float]],
