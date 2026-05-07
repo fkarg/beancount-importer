@@ -146,6 +146,92 @@ class TestImportYearPreview:
         assert "Transactions:" in result.output
 
 
+class TestKeyboardInterruptRollback:
+    """Ctrl+C must skip ledger writes (already true) AND roll back the
+    decisions JSONL appended in-flight. Without the rollback, the
+    user's interrupted choices would replay as confirmed next run —
+    contradicting the `[q] saves, Ctrl+C does not` contract.
+    """
+
+    def test_interrupt_during_pipeline_rolls_back_decisions(
+        self, project_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Simulate Ctrl+C by patching the pipeline runner to write a
+        # decision via the passed-in DecisionLog and then raise.
+        from beancount_importer.models import (
+            CategoryProposal,
+            ImportResult,
+            Posting,
+            SourceTransaction,
+        )
+        from datetime import date as _date
+        from decimal import Decimal as _Decimal
+
+        def fake_run(session, base_dir, categorize, reporter, *, decisions, merge_fn):
+            del session, base_dir, categorize, reporter, merge_fn
+            # Mimic a confirmed decision being persisted before the user
+            # rage-quits.
+            txn = SourceTransaction(
+                booking_date=_date(2024, 1, 15),
+                amount=_Decimal("-15.99"),
+                currency="EUR",
+                payee="Netflix",
+                description="Netflix Abo",
+                bank_key="spk",
+            )
+            result = ImportResult(
+                source_txn=txn,
+                action="new",
+                proposal=CategoryProposal(
+                    action="categorize",
+                    postings=(Posting(account="Expenses:Netflix"),),
+                ),
+            )
+            decisions.record(txn, result)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("beancount_importer.cli.run_pipeline", fake_run)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "2024",
+                "--config",
+                str(project_dir / "import_config.toml"),
+            ],
+        )
+        # Exit code 130 = standard SIGINT exit
+        assert result.exit_code == 130, result.output
+        assert "interrupted" in result.output
+        # Decisions JSONL must be empty (or missing) — the in-flight
+        # record was rolled back.
+        decisions_path = project_dir / "decisions.jsonl"
+        if decisions_path.exists():
+            assert decisions_path.read_text().strip() == ""
+
+    def test_interrupt_with_no_in_flight_decisions_still_exits_cleanly(
+        self, project_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Ctrl+C very early (before any decision recorded) — should
+        # still exit 130 with a friendly message, no traceback.
+        def fake_run(session, base_dir, categorize, reporter, *, decisions, merge_fn):
+            del session, base_dir, categorize, reporter, decisions, merge_fn
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("beancount_importer.cli.run_pipeline", fake_run)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "2024",
+                "--config",
+                str(project_dir / "import_config.toml"),
+            ],
+        )
+        assert result.exit_code == 130, result.output
+        assert "interrupted" in result.output
+
+
 class TestRichReporter:
     """Direct unit tests for the per-row reporter behaviour. The
     end-to-end test above asserts the wiring; these isolate the flag.

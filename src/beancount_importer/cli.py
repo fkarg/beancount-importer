@@ -341,14 +341,31 @@ def main(
     # Preview is non-interactive; auto-merge mirrors today's behaviour by
     # passing no `merge_fn`. Real interactive runs get Screen 3 wired up.
     merge_fn = None if preview else make_screen_merge_fn(console)
-    results = run_pipeline(
-        session,
-        base_dir,
-        categorize,
-        reporter,
-        decisions=decisions,
-        merge_fn=merge_fn,
-    )
+    try:
+        results = run_pipeline(
+            session,
+            base_dir,
+            categorize,
+            reporter,
+            decisions=decisions,
+            merge_fn=merge_fn,
+        )
+    except KeyboardInterrupt:
+        # Ctrl+C means "throw out the work I just did". `[q] quit`
+        # stays as the save-and-exit path: the pipeline breaks the run
+        # loop on quit and falls through to persistence. Ctrl+C is the
+        # rage-quit equivalent, so roll back the in-flight decisions
+        # JSONL too — without this the user's interrupted decisions
+        # would replay as confirmed on the next run.
+        removed = decisions.discard_session()
+        if removed:
+            console.print(
+                f"\n[yellow]interrupted — discarded {removed} "
+                f"in-flight decision(s); no files written[/]"
+            )
+        else:
+            console.print("\n[yellow]interrupted — no files written[/]")
+        raise typer.Exit(code=130) from None
 
     skip_persist = dry_run or preview
     _persist_results(results, config, base_dir, dry_run=skip_persist)

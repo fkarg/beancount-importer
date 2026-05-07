@@ -231,3 +231,86 @@ class TestDecisionLogPersistence:
         retrieved = log.lookup(txn)
         assert retrieved is not None
         assert retrieved.target_account == "Expenses:Hashed"
+
+
+class TestDecisionLogDiscardSession:
+    """`discard_session()` rolls back records written under the active
+    session_id while preserving everything else. Used by the CLI's
+    Ctrl+C handler to honour the `[q] saves, Ctrl+C does not` contract.
+    """
+
+    def test_no_op_when_path_is_none(self):
+        log = DecisionLog(None)
+        # Nothing to discard, no error.
+        assert log.discard_session() == 0
+
+    def test_no_op_when_file_missing(self, tmp_path: Path):
+        log = DecisionLog(tmp_path / "d.jsonl")
+        assert log.discard_session() == 0
+
+    def test_removes_only_current_session_records(self, tmp_path: Path):
+        # Two sessions write to the same log; discarding session B
+        # must leave session A's records intact.
+        log_path = tmp_path / "d.jsonl"
+        log_a = DecisionLog(log_path, session_id="aaa")
+        txn_a = make_txn(sepa_reference="REF-A")
+        log_a.record(txn_a, make_result(txn_a))
+
+        log_b = DecisionLog(log_path, session_id="bbb")
+        txn_b = make_txn(sepa_reference="REF-B")
+        log_b.record(txn_b, make_result(txn_b))
+
+        removed = log_b.discard_session()
+        assert removed == 1
+
+        # Reload and verify only A's record survived.
+        fresh = DecisionLog(log_path)
+        assert fresh.lookup(txn_a) is not None
+        assert fresh.lookup(txn_b) is None
+
+    def test_returns_zero_when_session_wrote_nothing(self, tmp_path: Path):
+        log_path = tmp_path / "d.jsonl"
+        log = DecisionLog(log_path, session_id="prior")
+        txn = make_txn(sepa_reference="REF")
+        log.record(txn, make_result(txn))
+
+        # New session, never wrote anything — nothing to discard.
+        empty = DecisionLog(log_path, session_id="new")
+        assert empty.discard_session() == 0
+
+    def test_skips_blank_lines_during_rollback(self, tmp_path: Path):
+        # A blank line in the JSONL (e.g., editor artefact) shouldn't
+        # be re-emitted as a kept line — that'd grow the file every
+        # rollback. Test asserts the blank survives at most via being
+        # naturally absent.
+        log_path = tmp_path / "d.jsonl"
+        log_path.write_text(
+            '{"session": "active", "sig": {"sepa_ref": "X"}, "decision": '
+            '{"action": "categorize", "postings": [{"account": "Expenses:Foo"}]}}\n'
+            '\n'  # blank line
+        )
+        log = DecisionLog(log_path, session_id="active")
+        assert log.discard_session() == 1
+        # Blank line dropped along with the matching record.
+        assert log_path.read_text() == ""
+
+    def test_preserves_corrupt_lines_verbatim(self, tmp_path: Path):
+        # A malformed JSON line shouldn't be lost on rollback (the
+        # user might want to inspect / repair it). Only matched-session
+        # records are stripped; everything else is rewritten as-is.
+        log_path = tmp_path / "d.jsonl"
+        log_path.write_text(
+            '{"session": "active", "sig": {"sepa_ref": "X"}, "decision": '
+            '{"action": "categorize", "postings": [{"account": "Expenses:Foo"}]}}\n'
+            'this-is-not-json\n'
+            '{"session": "older", "sig": {"sepa_ref": "Y"}, "decision": '
+            '{"action": "categorize", "postings": [{"account": "Expenses:Bar"}]}}\n'
+        )
+        log = DecisionLog(log_path, session_id="active")
+        removed = log.discard_session()
+        assert removed == 1
+
+        survivors = log_path.read_text().splitlines()
+        assert "this-is-not-json" in survivors
+        assert any('"session": "older"' in s for s in survivors)
+        assert not any('"session": "active"' in s for s in survivors)

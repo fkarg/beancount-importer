@@ -188,6 +188,49 @@ class DecisionLog:
             fh.flush()
             os.fsync(fh.fileno())
 
+    def discard_session(self) -> int:
+        """Remove every record written under the current session_id.
+
+        Used when the user hits Ctrl+C — they signalled "throw out
+        whatever I just decided", which has to mean both the
+        in-progress ledger writes (already gated by `_persist_results`)
+        AND the per-decision JSONL entries appended in-flight.
+
+        Returns the number of records removed. Pure-IO operation: no
+        in-memory state to update because the process is about to exit
+        anyway, but we still rewrite the file atomically (write to a
+        temp path + replace) so a second Ctrl+C during cleanup can't
+        leave a half-written log.
+        """
+        if self.path is None or not self.path.exists():
+            return 0
+        kept: list[str] = []
+        removed = 0
+        with self.path.open("r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.rstrip("\n")
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    kept.append(line)  # preserve corrupt lines verbatim
+                    continue
+                if entry.get("session") == self.session_id:
+                    removed += 1
+                    continue
+                kept.append(line)
+        if removed == 0:
+            return 0
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for line in kept:
+                fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+        return removed
+
 
 def _new_session_id() -> str:
     """Short random identifier used to group decisions by import session."""
