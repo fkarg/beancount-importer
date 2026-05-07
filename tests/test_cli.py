@@ -94,7 +94,7 @@ class TestImportYearPreview:
         # The aggregate preview reports volumes per bank rather than per-row
         # detail. The CSV has 2 rows in 2024 and 1 in 2023; filtering to 2024
         # should leave exactly 2 transactions accounted for.
-        assert "new=2" in result.output
+        assert "CSV transactions:        2" in result.output
 
     def test_preview_shows_bean_provenance_when_ledger_present(
         self, project_dir: Path
@@ -119,7 +119,7 @@ class TestImportYearPreview:
             ],
         )
         assert result.exit_code == 0, result.output
-        assert "No source provenance:" in result.output
+        assert "No CSV source:" in result.output
         assert "Transactions:" in result.output
 
 

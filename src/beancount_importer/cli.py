@@ -394,7 +394,8 @@ def main(
     if preview:
         bean_stats = compute_bean_provenance_stats(session, base_dir)
         _print_preview_table(results, bean_stats)
-    _print_summary(results, dry_run=skip_persist)
+    else:
+        _print_summary(results, dry_run=skip_persist)
 
 
 # ── Result persistence ────────────────────────────────────────────────────────
@@ -460,6 +461,7 @@ def _persist_tag_updates(
 class _PreviewStats:
     total: int = 0
     matched: int = 0
+    would_skip_rule: int = 0
     update_auto: int = 0
     update_manual: int = 0
     import_auto: int = 0
@@ -479,19 +481,33 @@ class _PreviewStats:
     def import_total(self) -> int:
         return self.import_auto + self.import_manual
 
+    @property
+    def manual_work(self) -> int:
+        return self.update_manual + self.import_manual
+
+    @property
+    def auto_work(self) -> int:
+        return self.update_auto + self.import_auto
+
     def add(self, other: _PreviewStats) -> None:
-        """Sum CSV-side counts only. Bean-side counts are NOT accumulated
-        here: a single ledger transaction touching two bank accounts is
-        loaded once per bank and would be double-counted at year/overall
-        level. The year aggregate (computed in `compute_bean_provenance_stats`
-        keyed by ``("", year)``) is injected at year totals instead.
+        """Sum CSV-side counts only. Bean-side `total_in_bean` /
+        `bean_unmatched` are NOT accumulated here: a single ledger
+        transaction touching two bank accounts is loaded once per bank and
+        would be double-counted at year/overall level. The year aggregate
+        (computed in `compute_bean_provenance_stats` keyed by ``("", year)``)
+        is injected at year totals instead. `bean_expanded` is summed across
+        banks despite a similar caveat — the year-level deduped expanded
+        count isn't available, and matching the reference's behaviour is
+        more useful than dropping the row.
         """
         self.total += other.total
         self.matched += other.matched
+        self.would_skip_rule += other.would_skip_rule
         self.update_auto += other.update_auto
         self.update_manual += other.update_manual
         self.import_auto += other.import_auto
         self.import_manual += other.import_manual
+        self.bean_expanded += other.bean_expanded
 
 
 def _aggregate_preview(
@@ -505,7 +521,10 @@ def _aggregate_preview(
         s = by_bank.setdefault(bank, _PreviewStats())
         s.total += 1
         if r.action == "skip":
-            s.matched += 1
+            if r.skip_reason == "skip_rule":
+                s.would_skip_rule += 1
+            else:
+                s.matched += 1
         elif r.action == "update":
             if not r.proposed_changes:
                 s.matched += 1
@@ -552,7 +571,13 @@ def _print_preview_table(
     def pct(n: int, denom: int) -> str:
         return f"({n / denom * 100:5.1f}%)" if denom else "(  0.0%)"
 
-    def section(label: str, s: _PreviewStats, indent: str = "  ") -> None:
+    def section(
+        label: str,
+        s: _PreviewStats,
+        indent: str = "  ",
+        *,
+        show_rollup: bool = False,
+    ) -> None:
         console.print(f"\n{indent}[bold]{label}[/]")
         denom = s.total
         body = indent + "  "
@@ -562,6 +587,10 @@ def _print_preview_table(
         console.print(
             f"{body}Already matched:      {s.matched:4d}  [dim]{pct(s.matched, denom)}[/]"
         )
+        if s.would_skip_rule:
+            console.print(
+                f"{body}Skip by rule:         {s.would_skip_rule:4d}  [dim]{pct(s.would_skip_rule, denom)}[/]"
+            )
         if s.update_total:
             console.print(
                 f"{body}Would update:         [yellow]{s.update_total:4d}[/]  [yellow]{pct(s.update_total, denom)}[/]"
@@ -597,10 +626,23 @@ def _print_preview_table(
                 console.print(
                     f"{body}Transactions:         {s.total_in_bean:4d}  [dim](100.0%)[/]"
                 )
+            if show_rollup:
+                # Rollups span CSV-side and bean-side work; denom is the
+                # larger of the two so percentages stay <=100% regardless of
+                # which side dominates.
+                rollup_denom = max(s.total, s.total_in_bean)
+                if s.manual_work:
+                    console.print(
+                        f"{body}Manual attention:     [cyan]{s.manual_work:4d}[/]  [cyan]{pct(s.manual_work, rollup_denom)}[/]"
+                    )
+                if s.auto_work:
+                    console.print(
+                        f"{body}Auto (rule):          [green]{s.auto_work:4d}[/]  [green]{pct(s.auto_work, rollup_denom)}[/]"
+                    )
             if s.bean_unmatched:
                 bean_denom = s.total_in_bean
                 console.print(
-                    f"{body}No source provenance: [magenta]{s.bean_unmatched:4d}[/]  [magenta]{pct(s.bean_unmatched, bean_denom)}[/]"
+                    f"{body}No CSV source:        [magenta]{s.bean_unmatched:4d}[/]  [magenta]{pct(s.bean_unmatched, bean_denom)}[/]"
                 )
 
     rule = "  " + "─" * 66
@@ -622,17 +664,14 @@ def _print_preview_table(
         if year_agg is not None:
             year_total.total_in_bean = year_agg.total_in_bean
             year_total.bean_unmatched = year_agg.bean_unmatched
-            # bean_expanded is left at 0: per-bank `bean-query` counts
-            # also double-count cross-bank transactions and we don't
-            # have a deduped year-level count.
-        section(f"{year} TOTAL", year_total, indent="    ")
+        section(f"TOTAL {year}", year_total, indent="    ", show_rollup=True)
         overall.add(year_total)
         overall.total_in_bean += year_total.total_in_bean
         overall.bean_unmatched += year_total.bean_unmatched
 
     if len(by_year) > 1:
         console.print("\n  [bold magenta]── OVERALL ──[/]")
-        section("TOTAL", overall, indent="    ")
+        section("TOTAL", overall, indent="    ", show_rollup=True)
 
     manual = overall.update_manual + overall.import_manual
     auto = overall.update_auto + overall.import_auto
@@ -641,7 +680,6 @@ def _print_preview_table(
         console.print(f"  [cyan]→ {manual} transaction(s) need manual attention[/]")
     if auto:
         console.print(f"  [green]→ {auto} transaction(s) would auto-apply via rules[/]")
-    console.print(rule)
 
 
 def _print_summary(results: list[ImportResult], *, dry_run: bool) -> None:

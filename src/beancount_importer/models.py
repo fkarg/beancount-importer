@@ -111,3 +111,4 @@ class ImportResult(BaseModel):
     is_replay: bool = False
     new_rule: CategorizationRule | None = None
     tag_state_delta: TagStateDelta | None = None
+    skip_reason: Literal["duplicate", "skip_rule"] | None = None

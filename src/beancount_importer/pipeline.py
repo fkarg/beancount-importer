@@ -297,7 +297,9 @@ def _process_transaction(
     # 2. Drop confirmed duplicates entirely.
     if is_duplicate(txn, existing):
         return (
-            ImportResult(source_txn=txn, action="skip", proposal=None),
+            ImportResult(
+                source_txn=txn, action="skip", proposal=None, skip_reason="duplicate"
+            ),
             _advance_tag(working_tag, txn.booking_date),
             working_rules,
         )
@@ -305,7 +307,9 @@ def _process_transaction(
     # 3. Hard suppression — skip_update_patterns drop the proposal entirely.
     if _matches_skip_pattern(config.skip_update_patterns, txn):
         return (
-            ImportResult(source_txn=txn, action="skip", proposal=None),
+            ImportResult(
+                source_txn=txn, action="skip", proposal=None, skip_reason="skip_rule"
+            ),
             _advance_tag(working_tag, txn.booking_date),
             working_rules,
         )
