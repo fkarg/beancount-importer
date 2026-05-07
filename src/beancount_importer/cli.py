@@ -92,9 +92,6 @@ class RichReporter:
             self._last_bank = bank
         del current, total
 
-    def on_warning(self, message: str) -> None:
-        console.print(f"[yellow]warning:[/] {message}")
-
     def on_error(self, message: str) -> None:
         console.print(f"[red]error:[/] {message}")
 

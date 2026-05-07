@@ -314,17 +314,18 @@ class TestBankConfigSourceFilesDefault:
         assert revalidated.source_files == original.source_files
 
     def test_dict_without_output_file_passes_through(self):
-        # If somehow a dict without `output_file` reaches the validator
-        # (constructing it directly via `model_validate` would fail later
-        # at field validation), the `if output is not None` short-circuits
-        # without raising.
+        # If a dict without `output_file` reaches the validator, the
+        # `if output is not None` branch must short-circuit cleanly. The
+        # outer model_validate then surfaces a pydantic ValidationError
+        # for the missing required field — NOT a KeyError leaking out
+        # of `default_source_files`.
+        from pydantic import ValidationError
+
         from beancount_importer.config import BankConfig
 
-        # We invoke `model_validate` and expect the missing-required-field
-        # error from later validation — but the *validator* itself must
-        # not crash on the missing key. If it raised KeyError instead,
-        # pydantic's error message would mention KeyError rather than
-        # the missing-field summary.
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(ValidationError) as excinfo:
             BankConfig.model_validate({"key": "x"})
-        assert "KeyError" not in str(excinfo.value)
+        # Both required fields surface as missing; no KeyError leaks.
+        message = str(excinfo.value)
+        assert "output_file" in message
+        assert "KeyError" not in message

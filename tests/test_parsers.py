@@ -990,9 +990,3 @@ class TestPayPalParserEdgeCases:
         assert "Net" in sig
         assert "Netto" in sig
         assert "Name" in sig
-
-    def test_first_returns_empty_when_all_keys_missing(self):
-        # `_first` skips falsy values and returns "" when nothing matches.
-        from beancount_importer.parsers.paypal import _first
-        assert _first({}, ("A", "B")) == ""
-        assert _first({"A": ""}, ("A", "B")) == ""

@@ -748,16 +748,20 @@ class TestExpandedCounts:
 
 
 class TestPipelineParseError:
-    def test_parse_exception_routed_to_reporter(self, base_dir: Path):
-        """The pipeline must not crash when one of a bank's CSV files is
-        malformed — instead the parse failure is forwarded to
-        `reporter.on_error` so the user sees a single warning line."""
-        # Overwrite the well-formed CSV with one that breaks date parsing.
+    """Malformed bank exports must surface via `reporter.on_error`, not
+    crash the pipeline. We exercise both a capturing reporter (to verify
+    the message reaches the channel) and `NoopReporter` (to guarantee
+    the pipeline never depends on the reporter doing anything)."""
+
+    def _broken_csv(self, base_dir: Path) -> None:
+        # Date column doesn't match `%d.%m.%y` → parser raises ValueError.
         (base_dir / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
             "not-a-date;X;X;-1,00;EUR;\n"
         )
 
+    def test_parse_exception_routed_to_reporter(self, base_dir: Path):
+        self._broken_csv(base_dir)
         captured: list[str] = []
 
         class CapturingReporter:
@@ -765,9 +769,6 @@ class TestPipelineParseError:
                 pass
 
             def on_progress(self, current, total, bank):
-                pass
-
-            def on_warning(self, message):
                 pass
 
             def on_error(self, message):
@@ -778,20 +779,14 @@ class TestPipelineParseError:
         assert results == []  # no rows survived the parse
         assert any("failed to parse" in m for m in captured)
 
-
-# ── NoopReporter: trivial methods are still callable ─────────────────────────
-
-
-class TestNoopReporter:
-    """Direct cover for `NoopReporter.on_warning` / `on_error` — the pipeline
-    happens not to invoke them in the existing tests, so we exercise them
-    explicitly so the no-op behavior is enforced rather than just inferred."""
-
-    def test_on_warning_does_nothing(self):
-        NoopReporter().on_warning("anything")  # no return, no raise
-
-    def test_on_error_does_nothing(self):
-        NoopReporter().on_error("anything")
+    def test_parse_exception_with_noop_reporter_does_not_crash(self, base_dir: Path):
+        # Same broken input, but routed through `NoopReporter` — the
+        # pipeline must complete cleanly (returns empty results) instead
+        # of bubbling the parse exception up to the caller.
+        self._broken_csv(base_dir)
+        session = make_session(base_dir)
+        results = run(session, base_dir, fixed_categorize(), NoopReporter())
+        assert results == []
 
 
 # ── Quit-then-second-bank: outer loop break ─────────────────────────────────

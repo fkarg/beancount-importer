@@ -68,7 +68,6 @@ class Reporter(Protocol):
 
     def on_result(self, result: ImportResult) -> None: ...
     def on_progress(self, current: int, total: int, bank: str) -> None: ...
-    def on_warning(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
 
 
@@ -80,9 +79,6 @@ class NoopReporter:
 
     def on_progress(self, current: int, total: int, bank: str) -> None:
         del current, total, bank
-
-    def on_warning(self, message: str) -> None:
-        del message
 
     def on_error(self, message: str) -> None:
         del message
