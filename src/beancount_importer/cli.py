@@ -29,10 +29,14 @@ from beancount_importer.models import (
 from beancount_importer.pipeline import (
     BeanProvenanceStats,
     CategorizeContext,
+    CategorizeFn,
     compute_bean_provenance_stats,
     run as run_pipeline,
 )
-from beancount_importer.categorizer.host import make_screen_categorizer
+from beancount_importer.categorizer.host import (
+    make_screen_categorizer,
+    make_screen_merge_fn,
+)
 from beancount_importer.replay import DecisionLog
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.storage import load_rules, save_rules
@@ -109,7 +113,7 @@ class RichReporter:
 # ── Interactive categorizer ───────────────────────────────────────────────────
 
 
-def make_preview_categorizer() -> object:
+def make_preview_categorizer() -> CategorizeFn:
     """Non-interactive categorizer used by `--preview`.
 
     Resolution order for the proposal's target account:
@@ -320,12 +324,22 @@ def main(
     )
 
     reporter = RichReporter()
-    categorize = (
+    categorize: CategorizeFn = (
         make_preview_categorizer()
         if preview
         else make_screen_categorizer(console, min_delta=config.matching.min_delta)
     )
-    results = run_pipeline(session, base_dir, categorize, reporter, decisions=decisions)  # type: ignore[arg-type]
+    # Preview is non-interactive; auto-merge mirrors today's behaviour by
+    # passing no `merge_fn`. Real interactive runs get Screen 3 wired up.
+    merge_fn = None if preview else make_screen_merge_fn(console)
+    results = run_pipeline(
+        session,
+        base_dir,
+        categorize,
+        reporter,
+        decisions=decisions,
+        merge_fn=merge_fn,
+    )
 
     skip_persist = dry_run or preview
     _persist_results(results, config, base_dir, dry_run=skip_persist)

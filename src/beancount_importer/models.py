@@ -111,4 +111,14 @@ class ImportResult(BaseModel):
     is_replay: bool = False
     new_rule: CategorizationRule | None = None
     tag_state_delta: TagStateDelta | None = None
-    skip_reason: Literal["duplicate", "skip_rule", "cross_source_match"] | None = None
+    skip_reason: (
+        Literal[
+            "duplicate",
+            "skip_rule",
+            "cross_source_match",
+            "user_kept",      # Screen 3 [k]: existing entry left as-is
+            "user_skipped",   # Screen 3 [s]: row deferred to a later run
+            "user_blocked",   # Screen 3 [b]: future updates from this payee blocked
+        ]
+        | None
+    ) = None

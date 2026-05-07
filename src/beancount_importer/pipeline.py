@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
@@ -79,6 +79,43 @@ class CategorizeContext(BaseModel):
 
 
 CategorizeFn = Callable[[CategorizeContext], CategoryProposal]
+
+
+class MergeContext(BaseModel):
+    """Inputs supplied to a `MergeFn` when an `update` would change fields.
+
+    Fires after `_build_result` decides this txn matches an existing entry
+    AND the resulting `proposed_changes` is non-empty. Lets the host
+    (cli.py) prompt the user via Screen 3 before the splice happens.
+    """
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    txn: SourceTransaction
+    proposal: CategoryProposal
+    matched_entry: LedgerEntry
+    proposed_changes: tuple[ProposedChange, ...]
+    progress: tuple[int, int] = (0, 0)
+    active_tag: ActiveTag | None = None
+
+
+class MergeDecision(BaseModel):
+    """Returned from a `MergeFn`. The pipeline routes on `action`:
+
+    - `update`     → keep the auto-generated update result as-is
+    - `keep`       → silent-match (no splice; replay reproduces silently)
+    - `import_new` → create a fresh entry instead of updating the matched one
+    - `block`      → install a `suppress_updates` rule and skip this row
+    - `skip`       → no-op for this run; row reappears next run
+    - `quit`       → tear down the run
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["update", "keep", "import_new", "block", "skip", "quit"]
+
+
+MergeFn = Callable[[MergeContext], MergeDecision]
 
 
 @runtime_checkable
@@ -228,6 +265,7 @@ def run(
     categorize_fn: CategorizeFn,
     reporter: Reporter,
     decisions: DecisionLog | None = None,
+    merge_fn: MergeFn | None = None,
 ) -> list[ImportResult]:
     """Execute the import pipeline.
 
@@ -295,6 +333,7 @@ def run(
             working_tag=working_tag,
             transforms_hooks=transforms,
             categorize_fn=categorize_fn,
+            merge_fn=merge_fn,
             decisions=decisions,
             auto_threshold=session.options.auto_threshold,
             progress=(progress, total),
@@ -326,6 +365,7 @@ def _process_transaction(
     working_tag: ActiveTag | None,
     transforms_hooks,
     categorize_fn: CategorizeFn,
+    merge_fn: MergeFn | None,
     decisions: DecisionLog,
     auto_threshold: float | None,
     progress: tuple[int, int] = (0, 0),
@@ -463,7 +503,171 @@ def _process_transaction(
         tag_state_delta=tag_delta,
         min_score=config.matching.min_score,
     )
+
+    # 10. Merge prompt — fires only when the auto-decision would change
+    # an existing entry. The host (cli.py) renders Screen 3 and returns
+    # one of six outcomes; the helper rewrites the result accordingly.
+    if (
+        merge_fn is not None
+        and result.action == "update"
+        and result.proposed_changes
+        and result.matched_entry is not None
+        and result.proposal is not None
+    ):
+        merge_decision = merge_fn(
+            MergeContext(
+                txn=txn,
+                proposal=result.proposal,
+                matched_entry=result.matched_entry,
+                proposed_changes=tuple(result.proposed_changes),
+                progress=progress,
+                active_tag=working_tag,
+            )
+        )
+        result, new_rules_list = _apply_merge_decision(
+            result, merge_decision, txn, bank, working_rules
+        )
     return result, next_tag, new_rules_list
+
+
+def _apply_merge_decision(
+    result: ImportResult,
+    decision: MergeDecision,
+    txn: SourceTransaction,
+    bank: BankConfig,
+    working_rules: list[CategorizationRule],
+) -> tuple[ImportResult, list[CategorizationRule]]:
+    """Translate a Screen-3 outcome into a finalised `ImportResult`.
+
+    `working_rules` may grow when the user picks `block` (we install a
+    `suppress_updates` rule so future runs auto-skip). Decisions that
+    don't touch rules return `working_rules` unchanged.
+    """
+    assert result.matched_entry is not None  # gated by the caller
+    assert result.proposal is not None
+    entry = result.matched_entry
+
+    if decision.action == "update":
+        # Default: keep the auto-generated update result as-is.
+        return result, working_rules
+
+    if decision.action == "keep":
+        # Silent match — record a proposal that mirrors the existing
+        # entry so replay reproduces the same empty-diff outcome next
+        # run, without re-prompting.
+        mirror = _proposal_from_entry(entry)
+        kept = result.model_copy(
+            update={
+                "action": "update",
+                "proposed_changes": [],
+                "proposal": mirror,
+                "skip_reason": "user_kept",
+            }
+        )
+        return kept, working_rules
+
+    if decision.action == "skip":
+        return (
+            result.model_copy(
+                update={
+                    "action": "skip",
+                    "matched_entry": None,
+                    "proposed_changes": [],
+                    "proposal": None,
+                    "skip_reason": "user_skipped",
+                }
+            ),
+            working_rules,
+        )
+
+    if decision.action == "quit":
+        return (
+            result.model_copy(
+                update={
+                    "action": "quit",
+                    "matched_entry": None,
+                    "proposed_changes": [],
+                }
+            ),
+            working_rules,
+        )
+
+    if decision.action == "import_new":
+        # Fresh entry instead of touching the matched one. The proposal
+        # already came from the categorizer; we just reformat it as a
+        # new-entry text and clear the matched-entry pointer.
+        new_text = _format_new_entry(bank, txn, result.proposal)
+        return (
+            result.model_copy(
+                update={
+                    "action": "new",
+                    "matched_entry": None,
+                    "proposed_changes": [],
+                    "new_entry_text": new_text,
+                }
+            ),
+            working_rules,
+        )
+
+    # decision.action == "block" — install a skip-update rule for this
+    # payee and skip the current row. Future runs match the rule and
+    # produce a `skip_rule` result without ever reaching Screen 3.
+    block_rule = _block_update_rule(txn, entry)
+    return (
+        result.model_copy(
+            update={
+                "action": "skip",
+                "matched_entry": None,
+                "proposed_changes": [],
+                "proposal": None,
+                "skip_reason": "user_blocked",
+                "new_rule": block_rule,
+            }
+        ),
+        [*working_rules, block_rule] if block_rule else working_rules,
+    )
+
+
+def _proposal_from_entry(entry: LedgerEntry) -> CategoryProposal:
+    """Build a categorize proposal that exactly mirrors `entry`.
+
+    Used for the Screen-3 `keep` branch: a proposal matching the existing
+    entry produces an empty `_diff_changes` and replays as a silent
+    skip on subsequent runs.
+    """
+    return CategoryProposal(
+        action="categorize",
+        postings=(Posting(account=entry.target_account),),
+        payee=entry.payee,
+        narration=entry.narration,
+    )
+
+
+def _block_update_rule(
+    txn: SourceTransaction, entry: LedgerEntry
+) -> CategorizationRule | None:
+    """Synthesize a `suppress_updates=True` rule that matches `txn`.
+
+    Prefers payee-based matching; falls back to description if payee is
+    absent. Returns None when neither field is available — the caller
+    treats this as "block didn't take" and downgrades to a plain skip.
+    """
+    if txn.payee:
+        pattern = _escape_for_regex(txn.payee)
+        return CategorizationRule(
+            target_account=entry.target_account,
+            payee_pattern=pattern,
+            bank_key=txn.bank_key,
+            suppress_updates=True,
+        )
+    if txn.description:
+        return CategorizationRule(
+            target_account=entry.target_account,
+            description_pattern=_escape_for_regex(txn.description),
+            bank_key=txn.bank_key,
+            suppress_updates=True,
+        )
+    return None
 
 
 def _build_result(

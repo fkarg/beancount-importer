@@ -27,6 +27,10 @@ from beancount_importer.categorizer.ambiguous import (
     AmbiguousContext,
     run as run_ambiguous,
 )
+from beancount_importer.categorizer.collision import (
+    CollisionContext,
+    run as run_collision,
+)
 from beancount_importer.categorizer.confirm import (
     ConfirmContext,
     ConfirmDecision,
@@ -39,7 +43,11 @@ from beancount_importer.categorizer.pick import (
 )
 from beancount_importer.matching.account_suggest import rank_accounts
 from beancount_importer.models import CategoryProposal, Posting
-from beancount_importer.pipeline import CategorizeContext
+from beancount_importer.pipeline import (
+    CategorizeContext,
+    MergeContext,
+    MergeDecision,
+)
 
 
 def make_screen_categorizer(
@@ -76,6 +84,53 @@ def make_screen_categorizer(
         return _run_pick_then_confirm(console, ctx)
 
     return _fn
+
+
+def make_screen_merge_fn(
+    console: Console,
+) -> Callable[[MergeContext], MergeDecision]:
+    """Return a `MergeFn` that drives Screen 3 (collision).
+
+    Fires when the pipeline detects an `update` would change at least
+    one field on the matched entry. The screen's six outcomes map 1:1
+    to `MergeDecision.action` values; `_apply_merge_decision` in the
+    pipeline does the result rewrite.
+    """
+
+    def _fn(ctx: MergeContext) -> MergeDecision:
+        coll_ctx = CollisionContext(
+            txn=ctx.txn,
+            existing=ctx.matched_entry,
+            proposed_changes=list(ctx.proposed_changes),
+            proposal=ctx.proposal,
+            progress=ctx.progress,
+            bank_key=ctx.txn.bank_key,
+            year=ctx.txn.booking_date.year,
+            active_tag=ctx.active_tag.tag if ctx.active_tag else None,
+            tag_remaining=_merge_tag_remaining(ctx),
+        )
+        decision = run_collision(console, coll_ctx)
+        # Screen 3 currently exposes update / keep / block / skip / quit.
+        # `import_new` would need a transition back to Screens 1/2 (which
+        # the host can't do from inside a `MergeFn` cleanly without
+        # widening the contract). Reserve the action; defer the wiring.
+        return MergeDecision(action=decision.action)
+
+    return _fn
+
+
+def _merge_tag_remaining(ctx: MergeContext) -> int | None:
+    """Days remaining for a `duration`-mode active tag in a `MergeContext`.
+
+    Mirrors `_tag_remaining` but operates on `MergeContext` (which has
+    its own `active_tag` field). The two contexts intentionally don't
+    share a base class — they describe different pipeline phases.
+    """
+    tag = ctx.active_tag
+    if tag is None or tag.mode != "duration" or tag.until_date is None:
+        return None
+    delta = (tag.until_date - ctx.txn.booking_date).days
+    return max(0, delta)
 
 
 def _is_ambiguous(
