@@ -23,6 +23,10 @@ from collections.abc import Callable
 
 from rich.console import Console
 
+from beancount_importer.categorizer.ambiguous import (
+    AmbiguousContext,
+    run as run_ambiguous,
+)
 from beancount_importer.categorizer.confirm import (
     ConfirmContext,
     ConfirmDecision,
@@ -40,15 +44,26 @@ from beancount_importer.pipeline import CategorizeContext
 
 def make_screen_categorizer(
     console: Console,
+    *,
+    min_delta: float = 0.15,
 ) -> Callable[[CategorizeContext], CategoryProposal]:
-    """Return a `CategorizeFn` that drives Screens 1 and 2.
+    """Return a `CategorizeFn` that drives Screens 1, 2, and 4.
 
-    The closure has no per-session state — every call works from the
-    `CategorizeContext` plus the global `Console`. That keeps the host
-    cheap to construct and trivial to swap for a different impl in tests.
+    `min_delta` is the minimum score gap between the top two candidates
+    that's still considered "decisive" — gaps smaller than this trigger
+    Screen 4 (ambiguous match selection). Default matches
+    `MatchingConfig.min_delta`. The closure has no other per-session
+    state — every call works from the `CategorizeContext` plus the
+    global `Console`.
     """
 
     def _fn(ctx: CategorizeContext) -> CategoryProposal:
+        # Path A0: ambiguous match — multiple candidates within `min_delta`
+        # of each other. A matched rule is authoritative, so it pre-empts
+        # the ambiguity check (the user already declared what to do).
+        if ctx.matched_rule is None and _is_ambiguous(ctx.candidates, min_delta):
+            return _run_ambiguous(console, ctx)
+
         # Path A: a rule matched OR a top candidate exists. Build a
         # provisional proposal from the strongest signal and let the
         # user confirm/edit in Screen 1.
@@ -61,6 +76,63 @@ def make_screen_categorizer(
         return _run_pick_then_confirm(console, ctx)
 
     return _fn
+
+
+def _is_ambiguous(
+    candidates: tuple[tuple, ...],
+    min_delta: float,
+) -> bool:
+    """Two or more candidates with the top scores within `min_delta`.
+
+    Single-candidate hits are unambiguous by definition. Wide gaps
+    (top is decisively better) are also unambiguous — the user gets
+    Screen 1 with the top entry's target reused.
+    """
+    if len(candidates) < 2:
+        return False
+    return (candidates[0][1] - candidates[1][1]) < min_delta
+
+
+# ── Path A0: ambiguous → Screen 4 → Screen 1 / Screen 2 ──────────────────────
+
+
+def _run_ambiguous(
+    console: Console,
+    ctx: CategorizeContext,
+) -> CategoryProposal:
+    """Render Screen 4, then route by the user's decision.
+
+    `pick`        → land on Screen 1 in `top_candidate` mode using the
+                    selected entry's target as the seed proposal
+    `import_new`  → fall through to Screen 2 (no rule, fresh account
+                    pick), then Screen 1 in `fresh_pick` mode
+    `skip` / `quit` → return immediately as a `skip`/`quit` proposal
+    """
+    amb_ctx = AmbiguousContext(
+        txn=ctx.txn,
+        candidates=ctx.candidates,
+        progress=ctx.progress,
+        bank_key=ctx.txn.bank_key,
+        year=ctx.txn.booking_date.year,
+        active_tag=ctx.active_tag.tag if ctx.active_tag else None,
+        tag_remaining=_tag_remaining(ctx),
+    )
+    decision = run_ambiguous(console, amb_ctx)
+    if decision.action == "skip":
+        return CategoryProposal(action="skip")
+    if decision.action == "quit":
+        return CategoryProposal(action="quit")
+    if decision.action == "import_new":
+        return _run_pick_then_confirm(console, ctx)
+    # action == "pick" — Screen 4 guarantees an entry on this branch.
+    assert decision.entry is not None
+    seed = CategoryProposal(
+        action="categorize",
+        postings=(Posting(account=decision.entry.target_account),),
+    )
+    return _run_confirm(
+        console, ctx, seed, kind="top_candidate", matched_entry=decision.entry
+    )
 
 
 # ── Path A: rule / top-candidate → Screen 1 ───────────────────────────────────

@@ -301,6 +301,131 @@ def test_existing_entries_with_blank_accounts_dont_pollute_counts(monkeypatch):
     assert proposal.target_account != ""
 
 
+# ── Path A0: ambiguous → Screen 4 ────────────────────────────────────────────
+
+
+class TestAmbiguous:
+    def _amb_ctx(self) -> CategorizeContext:
+        # Two candidates within the default min_delta=0.15 — clearly
+        # ambiguous. Different target accounts so the picked one is
+        # observable in the resulting proposal.
+        c1 = LedgerEntry(
+            date=date(2024, 3, 1),
+            narration="a",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Food",
+            amount=Decimal("-12.50"),
+            currency="EUR",
+        )
+        c2 = LedgerEntry(
+            date=date(2024, 3, 2),
+            narration="b",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Online",
+            amount=Decimal("-12.50"),
+            currency="EUR",
+        )
+        return _ctx(candidates=((c1, 0.90), (c2, 0.88)))
+
+    def test_enter_picks_top_candidate_on_screen_4(self, monkeypatch):
+        # Screen 4 enter == pick #1; Screen 1 enter confirms.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("", ""))
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(self._amb_ctx())
+        assert proposal.action == "categorize"
+        assert proposal.target_account == "Expenses:Food"
+
+    def test_pick_two_routes_to_second_candidate(self, monkeypatch):
+        # `2` on Screen 4 → Screen 1 confirms with that entry's target.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("2", ""))
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(self._amb_ctx())
+        assert proposal.target_account == "Expenses:Online"
+
+    def test_import_new_falls_through_to_pick_then_confirm(self, monkeypatch):
+        # `i` on Screen 4 → Screen 2 → Screen 1 (fresh_pick).
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("i", "1", "")
+        )
+        ctx = self._amb_ctx()
+        # Existing entries provide the suggestion list for Screen 2.
+        ctx_with_existing = _ctx(
+            candidates=ctx.candidates,
+            existing_entries=(_entry("Expenses:Misc"),),
+        )
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(ctx_with_existing)
+        assert proposal.action == "categorize"
+        assert proposal.target_account == "Expenses:Misc"
+
+    def test_skip_returns_skip_proposal(self, monkeypatch):
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("s"))
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(self._amb_ctx())
+        assert proposal.action == "skip"
+
+    def test_quit_returns_quit_proposal(self, monkeypatch):
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("q"))
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(self._amb_ctx())
+        assert proposal.action == "quit"
+
+    def test_wide_gap_is_not_ambiguous(self, monkeypatch):
+        # 0.90 vs 0.40 → delta 0.50 > min_delta=0.15 → no Screen 4.
+        # Goes straight to Screen 1 (top_candidate); Enter confirms.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
+        c1 = _entry("Expenses:Food")
+        c2 = LedgerEntry(
+            date=date(2024, 3, 2),
+            narration="b",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Other",
+            amount=Decimal("-12.50"),
+            currency="EUR",
+        )
+        console = _console()
+        categorizer = make_screen_categorizer(console)
+        proposal = categorizer(_ctx(candidates=((c1, 0.90), (c2, 0.40))))
+        assert proposal.target_account == "Expenses:Food"
+        # Output should NOT mention multiple-candidate language.
+        out = console.export_text()
+        assert "Multiple ledger entries" not in out
+
+    def test_rule_pre_empts_ambiguity_check(self, monkeypatch):
+        # Even with two near-tied candidates, a matched rule wins —
+        # Screen 4 is skipped, Screen 1 confirms with the rule's target.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
+        rule = CategorizationRule(target_account="Expenses:Rule")
+        ctx = self._amb_ctx()
+        ctx_with_rule = _ctx(
+            matched_rule=rule, candidates=ctx.candidates
+        )
+        console = _console()
+        categorizer = make_screen_categorizer(console)
+        proposal = categorizer(ctx_with_rule)
+        assert proposal.target_account == "Expenses:Rule"
+        assert "Multiple ledger entries" not in console.export_text()
+
+    def test_min_delta_param_lowers_ambiguity_bar(self, monkeypatch):
+        # With min_delta=0.05, the same 0.90/0.88 candidates still trip
+        # the ambiguity check (delta 0.02 < 0.05). Confirms the param
+        # actually flows.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("", ""))
+        console = _console()
+        categorizer = make_screen_categorizer(console, min_delta=0.05)
+        categorizer(self._amb_ctx())
+        assert "Multiple ledger entries" in console.export_text()
+
+    def test_min_delta_zero_disables_screen_4(self, monkeypatch):
+        # `min_delta=0.0` means "only show ambiguous when scores are
+        # exactly equal" — the 0.90/0.88 case slips through to Screen 1.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
+        console = _console()
+        categorizer = make_screen_categorizer(console, min_delta=0.0)
+        categorizer(self._amb_ctx())
+        assert "Multiple ledger entries" not in console.export_text()
+
+
 def test_progress_threaded_to_screens(monkeypatch):
     monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
     rule = CategorizationRule(target_account="Expenses:Food")

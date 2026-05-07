@@ -321,7 +321,9 @@ def main(
 
     reporter = RichReporter()
     categorize = (
-        make_preview_categorizer() if preview else make_screen_categorizer(console)
+        make_preview_categorizer()
+        if preview
+        else make_screen_categorizer(console, min_delta=config.matching.min_delta)
     )
     results = run_pipeline(session, base_dir, categorize, reporter, decisions=decisions)  # type: ignore[arg-type]
 
