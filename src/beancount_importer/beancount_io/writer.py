@@ -3,6 +3,10 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from beancount_importer.models import CategoryProposal, LedgerEntry
 
 
 def append_entry(text: str, target: Path, dry_run: bool = False) -> None:
@@ -55,6 +59,67 @@ def splice_entries(
             f"bean-check failed after splice — rolled back:\n{result.stderr}"
         )
     bak.unlink()
+
+
+def apply_update(
+    entry: LedgerEntry,
+    proposal: CategoryProposal,
+    bank_account: str,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Splice `entry` in place with a transaction reflecting `proposal`.
+
+    `entry.line_start` pins the splice; the end of the transaction is detected
+    by scanning the file for the first blank line (or next top-level directive)
+    after the start. The bank-side leg always carries the original amount; any
+    additional postings come from the proposal. Metadata merges entry-side
+    metadata with proposal metadata (proposal wins) and includes `tag` when set.
+    """
+    payee = proposal.payee or entry.payee
+    narration = proposal.narration or entry.narration
+    postings: list[tuple[str, str | None]] = [
+        (bank_account, f"{entry.amount} {entry.currency}")
+    ]
+    for p in proposal.postings:
+        currency = p.currency or entry.currency
+        amount_str = f"{p.amount} {currency}" if p.amount is not None else None
+        postings.append((p.account, amount_str))
+    metadata = {**entry.metadata, **proposal.metadata}
+    if proposal.tag:
+        metadata["tag"] = proposal.tag
+
+    text = format_transaction(
+        date_str=entry.date.isoformat(),
+        flag=entry.flag,
+        payee=payee,
+        narration=narration,
+        postings=postings,
+        metadata=metadata,
+    )
+    target = Path(entry.file_path)
+    line_end = entry.line_end or _detect_entry_end(target, entry.line_start)
+    splice_entries([(entry.line_start, line_end, text)], target, dry_run=dry_run)
+
+
+def _detect_entry_end(target: Path, line_start: int) -> int:
+    """Find the 1-based last line of the transaction starting at `line_start`.
+
+    Beancount's loader only records the start line. The end is whatever comes
+    before the next blank line or top-level directive — postings and metadata
+    are indented, so we stop at the first un-indented line after the header.
+    """
+    lines = target.read_text(encoding="utf-8").splitlines()
+    end = len(lines)
+    # Header is at index line_start - 1 (1-based → 0-based). Scan from the
+    # next line forward.
+    for i in range(line_start, len(lines)):
+        line = lines[i]
+        if line.strip() == "":
+            return i  # blank line is at 1-based (i+1); last entry line is at i
+        if not line[:1].isspace():
+            return i  # next un-indented line begins a new directive
+    return end
 
 
 def format_transaction(

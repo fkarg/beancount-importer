@@ -21,7 +21,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from beancount_importer.beancount_io.writer import append_entry
+from beancount_importer.beancount_io.writer import append_entry, apply_update
 from beancount_importer.config import Config
 from beancount_importer.models import (
     CategoryProposal,
@@ -409,18 +409,31 @@ def _persist_results(
     *,
     dry_run: bool,
 ) -> None:
-    """Append each new entry to its bank's output file, routed by booking year."""
+    """Persist each result to disk: append "new" entries, splice "update" entries.
+
+    Entries route by the source transaction's booking year. Skipped/quit
+    actions are no-ops. Updates without proposed_changes are silent — the
+    matched entry is already correct, no rewrite needed.
+    """
     for r in results:
-        if r.action != "new" or not r.new_entry_text:
-            continue
         try:
             bank_cfg = config.bank(r.source_txn.bank_key)
         except KeyError:
             continue
-        out_path = _resolve(
-            base_dir, bank_cfg.output_file, r.source_txn.booking_date.year
-        )
-        append_entry(r.new_entry_text, out_path, dry_run=dry_run)
+        if r.action == "new" and r.new_entry_text:
+            out_path = _resolve(
+                base_dir, bank_cfg.output_file, r.source_txn.booking_date.year
+            )
+            append_entry(r.new_entry_text, out_path, dry_run=dry_run)
+        elif (
+            r.action == "update"
+            and r.matched_entry is not None
+            and r.proposal is not None
+            and r.proposed_changes
+        ):
+            apply_update(
+                r.matched_entry, r.proposal, bank_cfg.account, dry_run=dry_run
+            )
 
 
 def _persist_new_rules(
