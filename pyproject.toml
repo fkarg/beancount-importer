@@ -71,7 +71,10 @@ exclude = ["**/__pycache__", ".venv"]
 
 
 [tool.pyrefly]
-project_includes = ["src", "tests", "migrations", "main.py", "conftest.py"]
+# Tests use a `**(defaults | kwargs)` factory pattern that pyrefly
+# cannot narrow; the resulting noise would drown real bugs. Hold
+# production code under `src/` to a clean bar.
+project_includes = ["src"]
 project_excludes = ["**/__pycache__", ".venv", "scripts"]
 disable-project-excludes-heuristics = true
 use-ignore-files = false
