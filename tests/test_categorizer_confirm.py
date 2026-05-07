@@ -327,6 +327,59 @@ class TestRun:
         assert decision.action == "skip"
         assert decision.proposal is None
 
+    def test_r_toggles_save_as_rule_and_persists_through_enter(self, monkeypatch):
+        # `[r]` flips `save_as_rule` and re-renders; subsequent Enter
+        # carries the flag through so the pipeline can derive a rule.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", ""))
+        decision = run(_console(), _ctx())
+        assert decision.action == "confirm"
+        assert decision.proposal is not None
+        assert decision.proposal.save_as_rule is True
+
+    def test_r_pressed_twice_returns_to_off(self, monkeypatch):
+        # Toggle on, toggle off, then confirm — proposal carries default
+        # `save_as_rule=False`. Verifies it really is a toggle.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("r", "r", "")
+        )
+        decision = run(_console(), _ctx())
+        assert decision.action == "confirm"
+        assert decision.proposal is not None
+        assert decision.proposal.save_as_rule is False
+
+    def test_save_as_rule_indicator_renders_when_toggled(self, monkeypatch):
+        # When the proposal is rendered with `save_as_rule=True`, the
+        # "Will write" block shows the indicator + which field seeds
+        # the pattern. User sees what they're committing to.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", ""))
+        console = _console()
+        run(console, _ctx())
+        out = console.export_text()
+        assert "save as rule:" in out
+        # Default fixture txn has a payee so the rule pattern seeds on it.
+        assert "on payee:" in out
+
+    def test_save_as_rule_falls_back_to_description_when_no_payee(
+        self, monkeypatch
+    ):
+        # No payee → indicator says "on description: …" so the user
+        # sees the rule will be brittler than the payee-seeded path.
+        from beancount_importer.models import SourceTransaction
+
+        no_payee_txn = SourceTransaction(
+            booking_date=date(2024, 3, 5),
+            amount=Decimal("-12.50"),
+            currency="EUR",
+            payee="",
+            description="WIRE: ACME",
+            bank_key="spk",
+        )
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", ""))
+        console = _console()
+        run(console, _ctx(txn=no_payee_txn))
+        out = console.export_text()
+        assert "on description:" in out
+
     def test_c_returns_change_account_with_current_proposal(self, monkeypatch):
         # `[c]` is a transition action — Screen 1 hands back the in-flight
         # proposal so the host can preserve narration/payee edits across

@@ -168,17 +168,34 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
     console.print(f"    category:     {target}")
     if p.tag:
         console.print(f"    tag:          [magenta]#{p.tag}[/]")
+    if p.save_as_rule:
+        # Show *which* field would seed the synthesized rule's pattern,
+        # so the user knows what they're locking in. Mirrors the
+        # heuristic in `pipeline._derive_rule` (payee wins, description
+        # falls back).
+        rule_field = "payee" if ctx.txn.payee else "description"
+        rule_value = ctx.txn.payee or ctx.txn.description or ""
+        console.print(
+            f"    save as rule: [green]✓[/] "
+            f"[dim](on {rule_field}: {rule_value!r})[/]"
+        )
     console.print()
 
 
 def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
     """Hotkey row.
 
-    `[c]` (change account) lands here once Screen 2 wiring exists in
-    the host. `[r]` (rule editor) and `[u]` (fix matched rule) come
-    online as their target screens land.
+    `[r]` toggles "save this proposal as a rule" — the pipeline derives
+    a `CategorizationRule` from the txn's payee/description and stages
+    it for persistence on confirm. `[u]` (fix matched rule) is still
+    deferred.
     """
     is_debit = ctx.txn.amount < 0
+    rule_label = (
+        f"{hotkey('r')} [green]✓[/] save as rule"
+        if ctx.proposal.save_as_rule
+        else f"{hotkey('r')} save as rule"
+    )
     console.print(
         f"  {hotkey('enter')} confirm  "
         f"{hotkey('n')} narration  "
@@ -189,8 +206,9 @@ def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
     # in any of the three plugin modes, so the menu would only mislead.
     mode_part = f"  {hotkey('m')} amortize" if is_debit else ""
     console.print(
-        f"  {hotkey('t')} tag menu{mode_part}  "
-        f"{hotkey('s')} skip       "
+        f"  {rule_label}  "
+        f"{hotkey('t')} tag menu{mode_part}  "
+        f"{hotkey('s')} skip  "
         f"{hotkey('q')} quit"
     )
 
@@ -198,8 +216,8 @@ def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 
-_HOTKEYS_DEBIT: tuple[str, ...] = ("", "n", "p", "c", "t", "m", "s", "q")
-_HOTKEYS_CREDIT: tuple[str, ...] = ("", "n", "p", "c", "t", "s", "q")
+_HOTKEYS_DEBIT: tuple[str, ...] = ("", "n", "p", "c", "r", "t", "m", "s", "q")
+_HOTKEYS_CREDIT: tuple[str, ...] = ("", "n", "p", "c", "r", "t", "s", "q")
 
 
 def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
@@ -225,6 +243,13 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             # Hand control to the host — it owns Screen 2 plumbing
             # (suggestions, all_accounts) which Screen 1 doesn't.
             return ConfirmDecision(action="change_account", proposal=proposal)
+        if key == "r":
+            # Toggle save_as_rule and re-render so the user can see
+            # the indicator change before they commit.
+            proposal = proposal.model_copy(
+                update={"save_as_rule": not proposal.save_as_rule}
+            )
+            continue
         # Edit/menu hotkeys: mutate `proposal` and loop. `Prompt.ask`'s
         # `choices` list keeps `key` inside this set — no fallthrough.
         if key == "n":
