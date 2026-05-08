@@ -186,6 +186,64 @@ class TestRender:
         assert 'payee:        "Starbucks"' in out
         assert "category:     ↓ Expenses:Food" in out
 
+    def test_will_write_highlights_changed_fields_against_matched_entry(self):
+        # When the proposal differs from the matched entry, each
+        # changed field gets a `(was: "...")` annotation so the user
+        # sees exactly what the rule (or top-candidate reuse) is
+        # changing. Unchanged fields don't show the annotation.
+        from beancount_importer.models import LedgerEntry
+
+        existing = LedgerEntry(
+            date=date(2024, 3, 4),
+            narration="Coffee",  # matches proposal narration → no diff
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Drinks",  # differs → flagged
+            amount=Decimal("-12.50"),
+            currency="EUR",
+            payee="Old Bucks",  # differs → flagged
+        )
+        con = _console()
+        render(con, _ctx(matched_entry=existing))
+        out = con.export_text()
+        # Changed fields show `(was: ...)` callouts. Account fields
+        # render with their glyph; text fields are quoted.
+        assert '(was: "Old Bucks")' in out
+        assert "(was: ↓ Expenses:Drinks)" in out
+        # Unchanged narration shows no annotation — line is dimmed.
+        narr_lines = [
+            line for line in out.splitlines() if "narration:" in line
+        ]
+        assert len(narr_lines) == 1
+        assert "(was:" not in narr_lines[0]
+
+    def test_will_write_no_annotation_when_no_matched_entry(self):
+        # Fresh-import path (no candidate to diff against) — the block
+        # renders plain values without `(was:)` callouts on any field.
+        con = _console()
+        render(con, _ctx(matched_entry=None))
+        out = con.export_text()
+        assert "(was:" not in out
+
+    def test_will_write_marks_field_as_new_when_old_was_empty(self):
+        # Existing entry has no payee; the proposal fills one in. The
+        # diff line shows `(new)` rather than `(was: "")` because there
+        # was nothing there before.
+        from beancount_importer.models import LedgerEntry
+
+        existing = LedgerEntry(
+            date=date(2024, 3, 4),
+            narration="Coffee",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Food",
+            amount=Decimal("-12.50"),
+            currency="EUR",
+            payee="",  # empty → proposal fills it
+        )
+        con = _console()
+        render(con, _ctx(matched_entry=existing))
+        out = con.export_text()
+        assert "(new)" in out
+
     def test_tag_line_only_when_proposal_has_tag(self):
         con1 = _console()
         render(

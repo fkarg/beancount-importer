@@ -78,16 +78,19 @@ def make_screen_categorizer(
         # user confirm/edit in Screen 1.
         if ctx.matched_rule is not None or ctx.candidates:
             proposal, kind, matched_entry = _initial_proposal(ctx)
-            # Silent-match short-circuit: if the proposal we'd present
-            # produces zero diff against the top candidate, there's
-            # nothing for the user to decide. Returning the proposal
-            # straight through lets the pipeline classify it as
-            # `update` with empty `proposed_changes`, which the ticker
-            # renders as "already matched". Without this, fuzzy-matching
-            # the same row twice (e.g. dedup misses because narration
-            # was edited) would re-prompt on every run.
-            if matched_entry is not None and not _diff_changes(
-                matched_entry, proposal, ctx.matched_rule
+            # Silent-match short-circuit: when there's an existing
+            # entry that the pipeline will diff this proposal against,
+            # and the diff is empty, there's nothing for the user to
+            # decide. The pipeline diffs against the top scorer
+            # candidate regardless of how the proposal was built (rule
+            # vs. top_candidate provenance), so we use the same target
+            # here. `matched_entry` is set on `top_candidate`; for
+            # `auto_matched` we fall back to `ctx.candidates[0][0]`.
+            diff_target = matched_entry or (
+                ctx.candidates[0][0] if ctx.candidates else None
+            )
+            if diff_target is not None and not _diff_changes(
+                diff_target, proposal, ctx.matched_rule
             ):
                 return proposal
             return _run_confirm(console, ctx, proposal, kind, matched_entry)
@@ -217,6 +220,12 @@ def _initial_proposal(
     """
     if ctx.matched_rule is not None:
         rule = ctx.matched_rule
+        # When a rule fires AND the matcher found an existing entry,
+        # pass the entry through so Screen 1 can highlight which
+        # fields the rule actually changes. The kind stays
+        # `auto_matched` (the rule is the user-facing provenance);
+        # the entry is only used by the diff-aware "Will write" block.
+        candidate = ctx.candidates[0][0] if ctx.candidates else None
         return (
             CategoryProposal(
                 action="categorize",
@@ -227,7 +236,7 @@ def _initial_proposal(
                 rule_used=rule,
             ),
             "auto_matched",
-            None,
+            candidate,
         )
     # ctx.candidates is non-empty (Path A's other branch).
     top_entry, _score = ctx.candidates[0]

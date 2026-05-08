@@ -158,14 +158,41 @@ def _render_raw_block(console: Console, ctx: ConfirmContext) -> None:
 
 
 def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
+    """Render the "Will write" block with per-field diff highlighting.
+
+    When `ctx.matched_entry` is set (rule fired against an existing
+    entry, or a top-candidate match), the rendering diffs each field
+    against the entry: unchanged fields are dim, changed fields are
+    yellow with `(was: "old")`. Fresh imports (no matched_entry) show
+    every field plain — the whole row IS new.
+    """
     p = ctx.proposal
+    entry = ctx.matched_entry
     payee_out = p.payee or ctx.txn.payee or ""
     narr_out = p.narration or ctx.txn.description or ""
-    target = styled_account(p.target_account) if p.target_account else "?"
+
     console.print("  Will write:")
-    console.print(f'    narration:    "{narr_out}"')
-    console.print(f'    payee:        "{payee_out}"')
-    console.print(f"    category:     {target}")
+    _render_will_write_field(
+        console, "narration:", f'"{narr_out}"',
+        new_value=narr_out,
+        old_value=entry.narration if entry else None,
+    )
+    _render_will_write_field(
+        console, "payee:", f'"{payee_out}"',
+        new_value=payee_out,
+        old_value=entry.payee if entry else None,
+    )
+    target_str = styled_account(p.target_account) if p.target_account else "?"
+    old_target = entry.target_account if entry else None
+    old_target_styled = (
+        styled_account(old_target) if old_target else None
+    )
+    _render_will_write_field(
+        console, "category:", target_str,
+        new_value=p.target_account or "",
+        old_value=old_target,
+        old_rendered=old_target_styled,
+    )
     if p.tag:
         console.print(f"    tag:          [magenta]#{p.tag}[/]")
     if p.save_as_rule:
@@ -180,6 +207,40 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
             f"[dim](on {rule_field}: {rule_value!r})[/]"
         )
     console.print()
+
+
+def _render_will_write_field(
+    console: Console,
+    label: str,
+    rendered: str,
+    *,
+    new_value: str,
+    old_value: str | None,
+    old_rendered: str | None = None,
+) -> None:
+    """One line of the "Will write" block, with diff styling.
+
+    `old_value=None` means "no comparison entry" → render plain
+    (a fresh import). Equal values render dim ("nothing to do here").
+    A real change renders yellow with the old text appended dim.
+
+    `old_rendered` is the display form of `old_value` for the suffix.
+    Defaults to the quoted text form (right for narration/payee);
+    callers wanting glyph-styled accounts pass a pre-styled string.
+    """
+    label_padded = f"{label:<14}"
+    if old_value is None:
+        console.print(f"    {label_padded}{rendered}")
+        return
+    if new_value == (old_value or ""):
+        console.print(f"    [dim]{label_padded}{rendered}[/]")
+        return
+    if old_value:
+        old_display = old_rendered if old_rendered else f'"{old_value}"'
+        suffix = f" [dim](was:[/] {old_display}[dim])[/]"
+    else:
+        suffix = " [dim](new)[/]"
+    console.print(f"    {label_padded}[yellow]{rendered}[/]{suffix}")
 
 
 def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:

@@ -155,6 +155,19 @@ class TestDecisionLogRecord:
         log.record(txn, make_result(txn))
         assert log.lookup(txn) is not None
 
+    def test_skips_silent_match_update(self, tmp_path: Path):
+        # `update` action with no proposed_changes is a silent "already
+        # matched" — the host's silent-skip fast-path produced it
+        # automatically, the user didn't decide anything. Recording it
+        # would clutter decisions.jsonl with "decisions I didn't make".
+        log = DecisionLog(tmp_path / "decisions.jsonl")
+        txn = make_txn(sepa_reference="X")
+        result = make_result(txn, action="update")
+        # `make_result` doesn't set proposed_changes, so it's [].
+        assert result.proposed_changes == []
+        log.record(txn, result)
+        assert log.lookup(txn) is None
+
     def test_independent_of_bean_check(self, tmp_path: Path):
         """Once flushed, decisions persist even if a later write/check
         fails. The CLI flushes BEFORE writing .bean files exactly so

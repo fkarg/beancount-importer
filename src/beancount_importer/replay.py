@@ -166,6 +166,10 @@ class DecisionLog:
         - skip/quit actions
         - rule-driven decisions where the user didn't ask to save as a rule
           (the rule itself is the persistent record; replaying would shadow it)
+        - silent-match updates (`update` action with no proposed_changes):
+          the host's silent-skip fast-path catches these at runtime, so
+          there's nothing the user actually decided — recording would
+          clutter the log with "decisions I didn't make".
 
         The in-memory `_index` is updated immediately so subsequent
         `lookup()` calls within the same run see the new decision (e.g.
@@ -178,6 +182,8 @@ class DecisionLog:
         if result.is_replay or result.action in ("skip", "quit"):
             return
         if result.rule_matched is not None and result.new_rule is None:
+            return
+        if result.action == "update" and not result.proposed_changes:
             return
 
         sig = make_decision_signature(txn)
