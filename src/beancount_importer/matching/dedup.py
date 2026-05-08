@@ -50,8 +50,24 @@ def is_duplicate(txn: SourceTransaction, existing: list[LedgerEntry]) -> bool:
     Callers must have already filtered `existing` to the same-bank
     bucket; the hashes deliberately omit account/bank fields.
     """
+    return find_duplicate(txn, existing) is not None
+
+
+def find_duplicate(
+    txn: SourceTransaction, existing: list[LedgerEntry]
+) -> LedgerEntry | None:
+    """Return the first entry whose key matches `txn`, or None.
+
+    Used by the pipeline to "claim" the matched entry — without it,
+    two identical CSV rows would both dedup-skip pointing at the
+    *same* entry, leaving its sibling looking like a CSV-orphan in
+    the preview report.
+    """
     key = dedup_key(txn)
-    return any(_entry_key(entry) == key for entry in existing)
+    for entry in existing:
+        if _entry_key(entry) == key:
+            return entry
+    return None
 
 
 def _entry_key(entry: LedgerEntry) -> str:

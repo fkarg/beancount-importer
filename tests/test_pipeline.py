@@ -271,6 +271,55 @@ class TestPipelineActiveTag:
 # ── Replay ───────────────────────────────────────────────────────────────────
 
 
+class TestEntryClaiming:
+    """Two identical CSV rows + two identical bean entries: each row
+    should pair with a distinct entry instead of both pointing at the
+    same one. Otherwise the second entry shows up as a CSV-orphan in
+    the bean-side provenance report.
+    """
+
+    def test_two_identical_csv_rows_pair_with_distinct_entries(
+        self, tmp_path: Path
+    ):
+        # CSV: two identical rows on the same date.
+        (tmp_path / "SPK_jan.csv").write_text(textwrap.dedent("""\
+            Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz
+            08.01.24;DISCOSTADL;Bar tab;-16,00;EUR;
+            08.01.24;DISCOSTADL;Bar tab;-16,00;EUR;
+        """))
+        # Bean: two identical existing entries that should pair 1:1.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-08 * "DISCOSTADL" "Bar tab"
+              Assets:B:SPK  -16.00 EUR
+              Expenses:Drinks  16.00 EUR
+
+            2024-01-08 * "DISCOSTADL" "Bar tab"
+              Assets:B:SPK  -16.00 EUR
+              Expenses:Drinks  16.00 EUR
+        """))
+        session = make_session(tmp_path)
+        results = run(
+            session,
+            tmp_path,
+            fixed_categorize("Expenses:Drinks"),
+            NoopReporter(),
+        )
+        assert len(results) == 2
+        # Both rows resolve to a matched entry (either silent dedup or
+        # silent-update); critically, they point at *different* entries.
+        matched_lines = [
+            (r.matched_entry.file_path, r.matched_entry.line_start)
+            for r in results
+            if r.matched_entry is not None
+        ]
+        assert len(matched_lines) == 2
+        assert len(set(matched_lines)) == 2, (
+            "expected the two CSV rows to claim distinct bean entries, "
+            f"got: {matched_lines}"
+        )
+
+
 class TestPipelineReplay:
     def test_replay_short_circuits_categorize(self, base_dir: Path):
         # Pre-seed the decision log with a choice for the first txn.

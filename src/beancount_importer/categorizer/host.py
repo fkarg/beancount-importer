@@ -67,32 +67,39 @@ def make_screen_categorizer(
     """
 
     def _fn(ctx: CategorizeContext) -> CategoryProposal:
-        # Path A0: ambiguous match — multiple candidates within `min_delta`
-        # of each other. A matched rule is authoritative, so it pre-empts
-        # the ambiguity check (the user already declared what to do).
-        if ctx.matched_rule is None and _is_ambiguous(ctx.candidates, min_delta):
-            return _run_ambiguous(console, ctx)
-
-        # Path A: a rule matched OR a top candidate exists. Build a
-        # provisional proposal from the strongest signal and let the
-        # user confirm/edit in Screen 1.
+        # Path A: a rule matched OR a top candidate exists. Build the
+        # provisional proposal first; the diff against the candidate
+        # set decides whether the user gets involved.
         if ctx.matched_rule is not None or ctx.candidates:
             proposal, kind, matched_entry = _initial_proposal(ctx)
-            # Silent-match short-circuit: when there's an existing
-            # entry that the pipeline will diff this proposal against,
-            # and the diff is empty, there's nothing for the user to
-            # decide. The pipeline diffs against the top scorer
-            # candidate regardless of how the proposal was built (rule
-            # vs. top_candidate provenance), so we use the same target
-            # here. `matched_entry` is set on `top_candidate`; for
-            # `auto_matched` we fall back to `ctx.candidates[0][0]`.
-            diff_target = matched_entry or (
-                ctx.candidates[0][0] if ctx.candidates else None
+            ambiguous = (
+                ctx.matched_rule is None
+                and _is_ambiguous(ctx.candidates, min_delta)
             )
-            if diff_target is not None and not _diff_changes(
-                diff_target, proposal, ctx.matched_rule
+            # Silent-match check runs BEFORE the ambiguity check.
+            # When the candidates are ambiguous AND every one of them
+            # produces a zero diff against this proposal (e.g. two
+            # identical bean entries on the same date), there's no
+            # real choice — picking either is a no-op. Otherwise we
+            # only need to check the diff target (top candidate / the
+            # rule-side matched entry).
+            diff_targets = (
+                _ambiguous_set(ctx.candidates, min_delta)
+                if ambiguous
+                else _single_diff_target(matched_entry, ctx.candidates)
+            )
+            if diff_targets and all(
+                not _diff_changes(e, proposal, ctx.matched_rule)
+                for e in diff_targets
             ):
                 return proposal
+
+            # Real ambiguity: at least one ambiguous candidate would
+            # actually produce a write. The user picks which existing
+            # entry this CSV row is supposed to pair with.
+            if ambiguous:
+                return _run_ambiguous(console, ctx)
+
             return _run_confirm(console, ctx, proposal, kind, matched_entry)
 
         # Path B: nothing to suggest. Screen 2 picks an account, then
@@ -100,6 +107,39 @@ def make_screen_categorizer(
         return _run_pick_then_confirm(console, ctx)
 
     return _fn
+
+
+def _ambiguous_set(
+    candidates: tuple[tuple, ...],
+    min_delta: float,
+) -> list:
+    """All candidates within `min_delta` of the top score.
+
+    The "ambiguous" set the user would see on Screen 4 — by checking
+    each one's diff against the proposal, we can prove silent-skip
+    is safe even when the scorer can't decide between them.
+    """
+    if not candidates:
+        return []
+    top_score = candidates[0][1]
+    return [
+        entry for (entry, score) in candidates
+        if (top_score - score) < min_delta
+    ]
+
+
+def _single_diff_target(matched_entry, candidates: tuple[tuple, ...]) -> list:
+    """The single entry the pipeline will diff this proposal against.
+
+    `matched_entry` is set on the `top_candidate` provenance; for
+    `auto_matched` we fall back to the top scorer candidate (the
+    pipeline's _process_transaction does the same fallback).
+    """
+    if matched_entry is not None:
+        return [matched_entry]
+    if candidates:
+        return [candidates[0][0]]
+    return []
 
 
 def make_screen_merge_fn(

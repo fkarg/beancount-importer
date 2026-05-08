@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict
 from beancount_importer.beancount_io.reader import read_ledger_multi
 from beancount_importer.beancount_io.writer import format_transaction
 from beancount_importer.config import BankConfig
-from beancount_importer.matching.dedup import is_duplicate
+from beancount_importer.matching.dedup import find_duplicate
 from beancount_importer.matching.registry import (
     MatcherHook,
     MatchOutcome,
@@ -396,11 +396,21 @@ def _process_transaction(
         )
         return result, _advance_tag(working_tag, txn.booking_date), working_rules
 
-    # 2. Drop confirmed duplicates entirely.
-    if is_duplicate(txn, existing):
+    # 2. Drop confirmed duplicates entirely. Claim the matched entry
+    # (remove it from the bucket the caller passed in) so a second
+    # identical CSV row doesn't re-claim the same entry — without
+    # this, two identical CSVs would both point at entry A and leave
+    # entry B looking like a CSV-orphan in the preview report.
+    duplicate = find_duplicate(txn, existing)
+    if duplicate is not None:
+        existing.remove(duplicate)
         return (
             ImportResult(
-                source_txn=txn, action="skip", proposal=None, skip_reason="duplicate"
+                source_txn=txn,
+                action="skip",
+                proposal=None,
+                skip_reason="duplicate",
+                matched_entry=duplicate,
             ),
             _advance_tag(working_tag, txn.booking_date),
             working_rules,
@@ -731,6 +741,14 @@ def _build_result(
     new_entry_text = ""
     if best is not None:
         proposed_changes = _diff_changes(best, proposal, matched_rule)
+        # Claim the matched entry from the bucket the caller passed in,
+        # so a subsequent identical CSV row pairs with a different
+        # entry. Without this the multi-match case (two identical CSVs
+        # + two identical bean entries) would both attribute to the
+        # same entry, leaving its sibling orphan in the bean-side
+        # provenance count. `best` is guaranteed to be in `existing`
+        # because `find_candidates` selects from it.
+        existing.remove(best)
     else:
         new_entry_text = _format_new_entry(bank, txn, proposal)
 
