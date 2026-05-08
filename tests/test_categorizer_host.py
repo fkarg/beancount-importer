@@ -276,6 +276,52 @@ class TestChangeAccount:
         )
         assert proposal.action == "quit"
 
+    def test_silent_match_when_top_candidate_diff_is_empty(self, monkeypatch):
+        # The top candidate's target matches the seed proposal exactly,
+        # and the proposal carries no payee/narration override — so the
+        # diff is empty. Screen 1 must not fire; the pipeline should
+        # classify this as a silent "already matched" row. Real-world
+        # case: dedup missed (e.g. narration was hand-edited) but the
+        # scorer correctly identified the row.
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError(
+                "Prompt.ask must NOT be called for silent-match rows"
+            )
+
+        monkeypatch.setattr("rich.prompt.Prompt.ask", fail_if_called)
+        existing = (_entry("Expenses:Food"),)
+        # No rule, but the candidate above min_score with matching target.
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(_ctx(candidates=((existing[0], 0.95),)))
+        # Returned proposal carries the candidate's target; pipeline will
+        # diff it against the same entry and produce empty changes.
+        assert proposal.action == "categorize"
+        assert proposal.target_account == "Expenses:Food"
+
+    def test_screen_1_still_fires_when_diff_is_non_empty(self, monkeypatch):
+        # If the seed proposal would actually change something on the
+        # existing entry (e.g. rule overrides the payee), Screen 1 must
+        # still fire so the user can confirm the change.
+        from beancount_importer.rules.models import CategorizationRule
+
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
+        rule = CategorizationRule(
+            payee_pattern="Starbucks",
+            target_account="Expenses:Coffee",
+            override_payee="Starbucks Italia",
+        )
+        # Existing entry has a different payee + different target —
+        # rule override creates a real diff.
+        existing = (_entry("Expenses:Food"),)
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(
+            _ctx(matched_rule=rule, existing_entries=existing,
+                 candidates=((existing[0], 0.95),))
+        )
+        assert proposal.action == "categorize"
+        # Rule's target won; user pressed Enter on Screen 1.
+        assert proposal.target_account == "Expenses:Coffee"
+
     def test_c_then_l_opens_full_column_grid(self, monkeypatch):
         # End-to-end: [c] on Screen 1, [l] on Screen 2 → column grid,
         # numeric pick, then [enter] confirm. Verifies the column grid

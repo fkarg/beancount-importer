@@ -47,6 +47,7 @@ from beancount_importer.pipeline import (
     CategorizeContext,
     MergeContext,
     MergeDecision,
+    _diff_changes,
 )
 
 
@@ -77,6 +78,18 @@ def make_screen_categorizer(
         # user confirm/edit in Screen 1.
         if ctx.matched_rule is not None or ctx.candidates:
             proposal, kind, matched_entry = _initial_proposal(ctx)
+            # Silent-match short-circuit: if the proposal we'd present
+            # produces zero diff against the top candidate, there's
+            # nothing for the user to decide. Returning the proposal
+            # straight through lets the pipeline classify it as
+            # `update` with empty `proposed_changes`, which the ticker
+            # renders as "already matched". Without this, fuzzy-matching
+            # the same row twice (e.g. dedup misses because narration
+            # was edited) would re-prompt on every run.
+            if matched_entry is not None and not _diff_changes(
+                matched_entry, proposal, ctx.matched_rule
+            ):
+                return proposal
             return _run_confirm(console, ctx, proposal, kind, matched_entry)
 
         # Path B: nothing to suggest. Screen 2 picks an account, then
