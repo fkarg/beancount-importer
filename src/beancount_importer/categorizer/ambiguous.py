@@ -126,16 +126,29 @@ def render(console: Console, ctx: AmbiguousContext) -> None:
 
 
 def _render_candidates(console: Console, ctx: AmbiguousContext) -> None:
-    """Render the candidate list with score bars + per-entry summary."""
+    """Render the candidate list with score bars + per-entry summary.
+
+    Each line shows: source_account → target_account so the user can
+    distinguish entries that look identical otherwise (e.g. an
+    internal transfer recorded twice — once on each leg's bank). The
+    score bars suggest a ranking, but identical-looking entries with
+    different source accounts are usually two real bookings, not a
+    "right one and wrong one".
+    """
     visible = ctx.candidates[:_MAX_CANDIDATES]
     for i, (entry, score) in enumerate(visible, start=1):
         descr = entry.payee or entry.narration or ""
         target = styled_account(entry.target_account) if entry.target_account else "?"
+        source = (
+            styled_account(entry.source_account)
+            if entry.source_account
+            else "?"
+        )
         console.print(
             f"    {hotkey(str(i))}  [cyan]{_bars(score)}[/]  "
             f"{entry.date.isoformat()}  "
             f'"[dim]{descr}[/]"  '
-            f"{target}  {entry.amount}"
+            f"{source} → {target}  {entry.amount}"
         )
     console.print()
 

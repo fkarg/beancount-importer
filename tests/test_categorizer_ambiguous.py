@@ -139,6 +139,19 @@ class TestRender:
         # Glyph + class on each candidate's target.
         assert "↓ Expenses:Online" in con.export_text()
 
+    def test_candidate_shows_source_account(self):
+        # Source → target makes identical-looking candidates
+        # distinguishable. Real-world case: a transfer recorded twice
+        # in two banks' ledgers, same date/payee/narration/amount,
+        # different source accounts.
+        con = _console()
+        render(con, _ctx())
+        out = con.export_text()
+        # The default fixture's entry has source_account "Assets:B:PayPal".
+        assert "◆ Assets:B:PayPal" in out
+        # Arrow between source and target.
+        assert "→" in out
+
     def test_candidate_with_blank_target_shows_question_mark(self):
         bare = (_entry(date(2024, 3, 12), "x"), 1.0)
         # `model_copy` to clear the target without going through the

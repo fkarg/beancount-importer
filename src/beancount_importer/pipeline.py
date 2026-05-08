@@ -998,6 +998,15 @@ def compute_bean_provenance_stats(
     tx_root = (base_dir / config.transactions_dir).resolve()
     expanded = _expanded_counts(config, base_dir, banks, year_filter)
 
+    # When the user passes `--bank`, `banks` is already filtered to the
+    # one they asked about. Bean-side stats must follow suit — otherwise
+    # the preview ends up with an extra "N26" / "TR" section the user
+    # explicitly opted out of, plus a phantom file-bucketed copy of the
+    # target bank shadowing its real section. The cleanest signal is
+    # "did the user narrow the bank set?", which is "did `_select_banks`
+    # drop any?".
+    bank_scope_active = len(banks) < len(config.banks)
+
     # Per-section, per-year buckets dedupe by (file_path, line_start) so a
     # single transaction with multiple in-scope postings (e.g. a TR rebalance
     # touching two sub-accounts) counts once. The same key underpins the
@@ -1011,6 +1020,10 @@ def compute_bean_provenance_stats(
             continue
         if entry.source_account in bank_accounts:
             section = entry.source_account
+        elif bank_scope_active:
+            # Out-of-scope entries are dropped entirely under `--bank`;
+            # the user asked for one bank, the report should match.
+            continue
         else:
             section = str(Path(entry.file_path).resolve().relative_to(tx_root))
         line_key = (entry.file_path, entry.line_start)

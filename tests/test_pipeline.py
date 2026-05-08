@@ -723,6 +723,55 @@ class TestBeanProvenanceStats:
         # One transaction in TR.bean, even though two postings match the prefix.
         assert stats[("TR.bean", 2024)].total_in_bean == 1
 
+    def test_bank_filter_drops_out_of_scope_sections(self, tmp_path: Path):
+        # `--bank spk` must scope bean-side stats too: file-bucketed
+        # sections for non-SPK ledgers (e.g. N26.bean, TR.bean) and
+        # the file-shadow section for SPK.bean entries with non-SPK
+        # source accounts should not appear at all under that filter.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        (tmp_path / "transactions" / "N26.bean").write_text(textwrap.dedent("""\
+            2024-02-01 * "Spotify" "Abo"
+              Assets:B:N26  -9.99 EUR
+              Expenses:Streaming  9.99 EUR
+        """))
+        # Configure both banks but filter to spk via ImportOptions.
+        n26 = BankConfig(
+            key="n26",
+            display_name="N26",
+            account="Assets:B:N26",
+            file_glob="N26_*.csv",
+            output_file="transactions/N26.bean",
+            csv=CsvConfig(
+                delimiter=",", date_format=["%Y-%m-%d"], amount_locale="en",
+                field_date="date", field_amount="amount",
+                field_currency="currency", field_payee="payee",
+                field_description="description",
+            ),
+        )
+        cfg = Config(
+            banks=[self._bank(), n26],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(
+            config=cfg,
+            options=ImportOptions(bank_filter="spk"),
+        )
+        stats = compute_bean_provenance_stats(session, tmp_path)
+        # SPK section present (the user asked for spk).
+        assert ("Assets:B:SPK", 2024) in stats
+        # N26 entries dropped — neither as configured-bank section nor
+        # as a file-bucketed shadow.
+        assert ("Assets:B:N26", 2024) not in stats
+        assert ("N26.bean", 2024) not in stats
+        # Year-aggregate counts only the in-scope bank's entries.
+        assert stats[("", 2024)].total_in_bean == 1
+
     def test_counts_total_bean_entries_per_year(self, tmp_path: Path):
         # Two SPK ledger entries in 2024, one in 2023.
         (tmp_path / "transactions").mkdir()
