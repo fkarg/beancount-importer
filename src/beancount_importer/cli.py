@@ -341,33 +341,43 @@ def main(
     # Preview is non-interactive; auto-merge mirrors today's behaviour by
     # passing no `merge_fn`. Real interactive runs get Screen 3 wired up.
     merge_fn = None if preview else make_screen_merge_fn(console)
+    # Accumulator the pipeline appends to mid-run. On Ctrl+C the pipeline
+    # raises out, but we keep this list so we can still persist the rules
+    # the user created before bailing.
+    results: list[ImportResult] = []
+    skip_persist = dry_run or preview
     try:
-        results = run_pipeline(
+        run_pipeline(
             session,
             base_dir,
             categorize,
             reporter,
             decisions=decisions,
             merge_fn=merge_fn,
+            results_accumulator=results,
         )
     except KeyboardInterrupt:
-        # Ctrl+C means "throw out the work I just did". `[q] quit`
-        # stays as the save-and-exit path: the pipeline breaks the run
-        # loop on quit and falls through to persistence. Ctrl+C is the
-        # rage-quit equivalent, so roll back the in-flight decisions
-        # JSONL too — without this the user's interrupted decisions
-        # would replay as confirmed on the next run.
-        removed = decisions.discard_session()
-        if removed:
-            console.print(
-                f"\n[yellow]interrupted — discarded {removed} "
-                f"in-flight decision(s); no files written[/]"
-            )
-        else:
-            console.print("\n[yellow]interrupted — no files written[/]")
+        # Ctrl+C: drop the buffered decisions and any pending .bean
+        # writes (results were never persisted). Rules are different —
+        # the user pressing [r] is durable intent that should outlive
+        # a rage-quit, so we still persist whatever rules accumulated.
+        if not skip_persist:
+            _persist_new_rules(results, list(rules), rules_path, dry_run=False)
+        new_rule_count = sum(1 for r in results if r.new_rule is not None)
+        suffix = (
+            f" (kept {new_rule_count} new rule{'s' if new_rule_count != 1 else ''})"
+            if new_rule_count and not skip_persist
+            else ""
+        )
+        console.print(f"\n[yellow]interrupted — no decisions saved{suffix}[/]")
         raise typer.Exit(code=130) from None
 
-    skip_persist = dry_run or preview
+    # Natural completion (or `[q] quit` mid-run, which breaks the loop
+    # cleanly inside `run_pipeline`). Flush decisions FIRST so the
+    # user's manual choices survive any subsequent file-write failure
+    # — the original "decisions are durable before .bean" contract.
+    if not skip_persist:
+        decisions.flush()
     _persist_results(results, config, base_dir, dry_run=skip_persist)
     _persist_new_rules(results, list(rules), rules_path, dry_run=skip_persist)
     _persist_tag_updates(results, tag_state, tags_path, dry_run=skip_persist)

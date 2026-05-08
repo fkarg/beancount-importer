@@ -5,11 +5,16 @@ are intrinsically one-off — "this specific transaction is a gift, just this on
 Without persistence, re-importing a year later forces the user to re-decide every
 such case. The decision log captures them so subsequent runs replay automatically.
 
-Write ordering: decisions are appended to the JSONL **immediately when made**,
-not after `bean-check` succeeds. Balance-assertion failures are routine (e.g.
-cash account needs a balance update somewhere else); gating the log on bean-check
-would erase the user's manual history every time. The intent survives even if
-the ledger write rolls back — re-running picks up the same decisions via replay.
+Write ordering: decisions are **buffered in memory** during the run and flushed
+to JSONL only when the user accepts them (a successful natural completion or
+`[q] quit`). Ctrl+C simply doesn't flush — the partial work disappears.
+This honours the `[q] saves, Ctrl+C does not` contract end-to-end.
+
+Earlier versions wrote per-decision in-flight to survive crashes, but the
+trade-off backfired: any interrupted run silently persisted half the
+session as confirmed, contradicting the user's "abandon" intent. A crash
+mid-run now loses the session's decisions; that's the price for honest
+Ctrl+C semantics.
 """
 
 from __future__ import annotations
@@ -120,6 +125,9 @@ class DecisionLog:
         self.path = path
         self.session_id = session_id or _new_session_id()
         self._index: dict[str, CategoryProposal] = {}
+        # Records accumulated during the run. `flush()` writes them; Ctrl+C
+        # just drops the buffer.
+        self._pending: list[dict[str, Any]] = []
         if path is not None and path.exists():
             self._load()
 
@@ -150,7 +158,7 @@ class DecisionLog:
         return self._index.get(sig.as_key())
 
     def record(self, txn: SourceTransaction, result: ImportResult) -> None:
-        """Append the result's decision to the log if it represents user intent.
+        """Buffer the result's decision in memory for later `flush()`.
 
         Skips:
         - results without a proposal (e.g. dedup-skipped, transfer-linked)
@@ -158,6 +166,12 @@ class DecisionLog:
         - skip/quit actions
         - rule-driven decisions where the user didn't ask to save as a rule
           (the rule itself is the persistent record; replaying would shadow it)
+
+        The in-memory `_index` is updated immediately so subsequent
+        `lookup()` calls within the same run see the new decision (e.g.
+        a duplicate row processed later in the same session replays
+        cleanly rather than re-prompting). Only the disk write is
+        deferred until `flush()`.
         """
         if self.path is None or result.proposal is None:
             return
@@ -175,61 +189,31 @@ class DecisionLog:
             "decision": _serialize_proposal(result.proposal),
         }
 
-        self._append_atomic(record)
+        self._pending.append(record)
         self._index[sig.as_key()] = result.proposal
 
-    def _append_atomic(self, record: dict[str, Any]) -> None:
-        """Append + fsync. Single line per record keeps the write atomic on POSIX."""
-        assert self.path is not None
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False) + "\n"
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+    def flush(self) -> int:
+        """Persist all pending records to the JSONL. Returns the count.
 
-    def discard_session(self) -> int:
-        """Remove every record written under the current session_id.
+        Called by the CLI when the user signals the session was a
+        success (natural completion or `[q] quit`). On Ctrl+C, the
+        caller skips this — `_pending` falls away with the process,
+        so no rollback step is needed.
 
-        Used when the user hits Ctrl+C — they signalled "throw out
-        whatever I just decided", which has to mean both the
-        in-progress ledger writes (already gated by `_persist_results`)
-        AND the per-decision JSONL entries appended in-flight.
-
-        Returns the number of records removed. Pure-IO operation: no
-        in-memory state to update because the process is about to exit
-        anyway, but we still rewrite the file atomically (write to a
-        temp path + replace) so a second Ctrl+C during cleanup can't
-        leave a half-written log.
+        Append-only with fsync per batch. A single fsync amortises
+        the durability cost across the whole session.
         """
-        if self.path is None or not self.path.exists():
+        if self.path is None or not self._pending:
             return 0
-        kept: list[str] = []
-        removed = 0
-        with self.path.open("r", encoding="utf-8") as fh:
-            for raw_line in fh:
-                line = raw_line.rstrip("\n")
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    kept.append(line)  # preserve corrupt lines verbatim
-                    continue
-                if entry.get("session") == self.session_id:
-                    removed += 1
-                    continue
-                kept.append(line)
-        if removed == 0:
-            return 0
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            for line in kept:
-                fh.write(line + "\n")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        count = len(self._pending)
+        with self.path.open("a", encoding="utf-8") as fh:
+            for record in self._pending:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, self.path)
-        return removed
+        self._pending.clear()
+        return count
 
 
 def _new_session_id() -> str:

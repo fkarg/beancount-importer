@@ -96,6 +96,7 @@ class TestDecisionLogLookup:
         txn = make_txn(sepa_reference="NETFLIX-001")
         proposal = make_proposal(account="Expenses:Streaming", payee="Netflix")
         log.record(txn, make_result(txn, proposal=proposal))
+        log.flush()  # CLI does this on natural completion / [q]
 
         # Reopen to verify persistence
         reloaded = DecisionLog(log_path)
@@ -155,14 +156,17 @@ class TestDecisionLogRecord:
         assert log.lookup(txn) is not None
 
     def test_independent_of_bean_check(self, tmp_path: Path):
-        """Decisions persist even if a later write/check fails — the log
-        must capture intent regardless of ledger-write success."""
+        """Once flushed, decisions persist even if a later write/check
+        fails. The CLI flushes BEFORE writing .bean files exactly so
+        manual choices survive any subsequent bean-check failure.
+        """
         log_path = tmp_path / "decisions.jsonl"
         log = DecisionLog(log_path)
         txn = make_txn(sepa_reference="A")
         log.record(txn, make_result(txn))
-        # Simulate a downstream bean-check failure: nothing in record() depends
-        # on it, so the entry remains queryable on reopening.
+        log.flush()  # the CLI's "preserve manual work" point
+        # Simulate a downstream bean-check failure: nothing past the
+        # flush call mutates the log, so the entry remains queryable.
         reloaded = DecisionLog(log_path)
         assert reloaded.lookup(txn) is not None
 
@@ -175,6 +179,7 @@ class TestDecisionLogPersistence:
         log = DecisionLog(log_path)
         log.record(make_txn(sepa_reference="A"), make_result(make_txn(sepa_reference="A")))
         log.record(make_txn(sepa_reference="B"), make_result(make_txn(sepa_reference="B")))
+        log.flush()
         lines = log_path.read_text().strip().splitlines()
         assert len(lines) == 2
 
@@ -190,6 +195,7 @@ class TestDecisionLogPersistence:
         log = DecisionLog(log_path)
         txn = make_txn(sepa_reference="X")
         log.record(txn, make_result(txn))
+        log.flush()
         assert log_path.exists()
 
     def test_blank_lines_skipped_on_load(self, tmp_path: Path):
@@ -233,84 +239,70 @@ class TestDecisionLogPersistence:
         assert retrieved.target_account == "Expenses:Hashed"
 
 
-class TestDecisionLogDiscardSession:
-    """`discard_session()` rolls back records written under the active
-    session_id while preserving everything else. Used by the CLI's
-    Ctrl+C handler to honour the `[q] saves, Ctrl+C does not` contract.
+class TestDecisionLogFlush:
+    """`flush()` is now the only path that writes JSONL. `record()`
+    just buffers in memory; the CLI calls `flush()` on natural
+    completion or `[q] quit`. Ctrl+C drops the buffer with the process.
     """
 
-    def test_no_op_when_path_is_none(self):
-        log = DecisionLog(None)
-        # Nothing to discard, no error.
-        assert log.discard_session() == 0
-
-    def test_no_op_when_file_missing(self, tmp_path: Path):
-        log = DecisionLog(tmp_path / "d.jsonl")
-        assert log.discard_session() == 0
-
-    def test_removes_only_current_session_records(self, tmp_path: Path):
-        # Two sessions write to the same log; discarding session B
-        # must leave session A's records intact.
+    def test_record_does_not_write_to_disk(self, tmp_path: Path):
         log_path = tmp_path / "d.jsonl"
-        log_a = DecisionLog(log_path, session_id="aaa")
-        txn_a = make_txn(sepa_reference="REF-A")
-        log_a.record(txn_a, make_result(txn_a))
-
-        log_b = DecisionLog(log_path, session_id="bbb")
-        txn_b = make_txn(sepa_reference="REF-B")
-        log_b.record(txn_b, make_result(txn_b))
-
-        removed = log_b.discard_session()
-        assert removed == 1
-
-        # Reload and verify only A's record survived.
-        fresh = DecisionLog(log_path)
-        assert fresh.lookup(txn_a) is not None
-        assert fresh.lookup(txn_b) is None
-
-    def test_returns_zero_when_session_wrote_nothing(self, tmp_path: Path):
-        log_path = tmp_path / "d.jsonl"
-        log = DecisionLog(log_path, session_id="prior")
+        log = DecisionLog(log_path)
         txn = make_txn(sepa_reference="REF")
         log.record(txn, make_result(txn))
+        # File must not exist yet — flush is what creates it.
+        assert not log_path.exists()
 
-        # New session, never wrote anything — nothing to discard.
-        empty = DecisionLog(log_path, session_id="new")
-        assert empty.discard_session() == 0
-
-    def test_skips_blank_lines_during_rollback(self, tmp_path: Path):
-        # A blank line in the JSONL (e.g., editor artefact) shouldn't
-        # be re-emitted as a kept line — that'd grow the file every
-        # rollback. Test asserts the blank survives at most via being
-        # naturally absent.
+    def test_flush_writes_buffered_records(self, tmp_path: Path):
         log_path = tmp_path / "d.jsonl"
-        log_path.write_text(
-            '{"session": "active", "sig": {"sepa_ref": "X"}, "decision": '
-            '{"action": "categorize", "postings": [{"account": "Expenses:Foo"}]}}\n'
-            '\n'  # blank line
-        )
-        log = DecisionLog(log_path, session_id="active")
-        assert log.discard_session() == 1
-        # Blank line dropped along with the matching record.
-        assert log_path.read_text() == ""
+        log = DecisionLog(log_path)
+        txn1 = make_txn(sepa_reference="REF-1")
+        txn2 = make_txn(sepa_reference="REF-2")
+        log.record(txn1, make_result(txn1))
+        log.record(txn2, make_result(txn2))
+        assert log.flush() == 2
+        assert log_path.exists()
+        lines = log_path.read_text().splitlines()
+        assert len(lines) == 2
 
-    def test_preserves_corrupt_lines_verbatim(self, tmp_path: Path):
-        # A malformed JSON line shouldn't be lost on rollback (the
-        # user might want to inspect / repair it). Only matched-session
-        # records are stripped; everything else is rewritten as-is.
+    def test_flush_returns_zero_when_nothing_buffered(self, tmp_path: Path):
+        log = DecisionLog(tmp_path / "d.jsonl")
+        assert log.flush() == 0
+
+    def test_flush_no_op_with_path_none(self):
+        log = DecisionLog(None)
+        txn = make_txn(sepa_reference="REF")
+        log.record(txn, make_result(txn))
+        assert log.flush() == 0
+
+    def test_flush_clears_buffer(self, tmp_path: Path):
+        # A second flush after a successful one writes nothing extra;
+        # the buffer is consumed exactly once.
         log_path = tmp_path / "d.jsonl"
-        log_path.write_text(
-            '{"session": "active", "sig": {"sepa_ref": "X"}, "decision": '
-            '{"action": "categorize", "postings": [{"account": "Expenses:Foo"}]}}\n'
-            'this-is-not-json\n'
-            '{"session": "older", "sig": {"sepa_ref": "Y"}, "decision": '
-            '{"action": "categorize", "postings": [{"account": "Expenses:Bar"}]}}\n'
-        )
-        log = DecisionLog(log_path, session_id="active")
-        removed = log.discard_session()
-        assert removed == 1
+        log = DecisionLog(log_path)
+        txn = make_txn(sepa_reference="REF")
+        log.record(txn, make_result(txn))
+        assert log.flush() == 1
+        assert log.flush() == 0
+        assert len(log_path.read_text().splitlines()) == 1
 
-        survivors = log_path.read_text().splitlines()
-        assert "this-is-not-json" in survivors
-        assert any('"session": "older"' in s for s in survivors)
-        assert not any('"session": "active"' in s for s in survivors)
+    def test_lookup_works_before_flush(self, tmp_path: Path):
+        # The in-memory index is updated on `record()` (not gated on
+        # flush) so a duplicate row processed later in the same run
+        # still replays cleanly.
+        log = DecisionLog(tmp_path / "d.jsonl")
+        txn = make_txn(sepa_reference="REF")
+        log.record(txn, make_result(txn))
+        assert log.lookup(txn) is not None
+
+    def test_dropped_buffer_means_nothing_persisted(self, tmp_path: Path):
+        # Simulate Ctrl+C: record but never flush. Reloading from disk
+        # sees zero records.
+        log_path = tmp_path / "d.jsonl"
+        log = DecisionLog(log_path)
+        txn = make_txn(sepa_reference="REF")
+        log.record(txn, make_result(txn))
+        # Drop the in-process state by constructing a fresh log.
+        del log
+        fresh = DecisionLog(log_path)
+        assert fresh.lookup(txn) is None

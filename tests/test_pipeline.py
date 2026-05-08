@@ -279,6 +279,9 @@ class TestPipelineReplay:
         # Drive the pipeline once with a deterministic categorizer to seed.
         session = make_session(base_dir)
         run(session, base_dir, fixed_categorize("Expenses:From-Replay"), NoopReporter(), decisions=log)
+        # The pipeline buffers decisions; the CLI's success path flushes
+        # them. Mimic that here so the next run sees them on disk.
+        log.flush()
         # Now reopen log and run again with a categorizer that would error if called.
         log2 = DecisionLog(log_path)
         called = []

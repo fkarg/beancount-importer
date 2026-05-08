@@ -266,6 +266,7 @@ def run(
     reporter: Reporter,
     decisions: DecisionLog | None = None,
     merge_fn: MergeFn | None = None,
+    results_accumulator: list[ImportResult] | None = None,
 ) -> list[ImportResult]:
     """Execute the import pipeline.
 
@@ -274,6 +275,11 @@ def run(
     `options.year_filter` (if any) scopes which transactions are processed;
     output paths are resolved against each transaction's own booking year by
     the CLI after the pipeline returns.
+
+    `results_accumulator`, if provided, is the same list returned on
+    success — it lets the caller observe the partial state on
+    `KeyboardInterrupt` (which the pipeline doesn't catch). The CLI uses
+    this to persist rules created mid-run even when the user rage-quits.
     """
     decisions = decisions if decisions is not None else DecisionLog(None)
     config = session.config
@@ -314,7 +320,9 @@ def run(
         csv_by_bank.setdefault(t.bank_key, []).append(t)
 
     total = len(inputs)
-    results: list[ImportResult] = []
+    results: list[ImportResult] = (
+        results_accumulator if results_accumulator is not None else []
+    )
 
     for progress, txn in enumerate(inputs, start=1):
         reporter.on_progress(progress, total, txn.bank_key)

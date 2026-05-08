@@ -146,18 +146,19 @@ class TestImportYearPreview:
         assert "Transactions:" in result.output
 
 
-class TestKeyboardInterruptRollback:
-    """Ctrl+C must skip ledger writes (already true) AND roll back the
-    decisions JSONL appended in-flight. Without the rollback, the
-    user's interrupted choices would replay as confirmed next run —
-    contradicting the `[q] saves, Ctrl+C does not` contract.
+class TestKeyboardInterruptSemantics:
+    """Ctrl+C contract: drop the buffered decision log, drop in-flight
+    .bean writes, but persist any rules the user toggled `save_as_rule`
+    on before bailing — rules express durable intent that should
+    outlive a rage-quit.
     """
 
-    def test_interrupt_during_pipeline_rolls_back_decisions(
+    def test_interrupt_does_not_persist_buffered_decisions(
         self, project_dir: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        # Simulate Ctrl+C by patching the pipeline runner to write a
-        # decision via the passed-in DecisionLog and then raise.
+        # The pipeline buffers decisions in DecisionLog._pending and
+        # only `flush()` writes them. On Ctrl+C the CLI doesn't flush,
+        # so the JSONL stays empty.
         from beancount_importer.models import (
             CategoryProposal,
             ImportResult,
@@ -167,10 +168,11 @@ class TestKeyboardInterruptRollback:
         from datetime import date as _date
         from decimal import Decimal as _Decimal
 
-        def fake_run(session, base_dir, categorize, reporter, *, decisions, merge_fn):
+        def fake_run(
+            session, base_dir, categorize, reporter,
+            *, decisions, merge_fn, results_accumulator,
+        ):
             del session, base_dir, categorize, reporter, merge_fn
-            # Mimic a confirmed decision being persisted before the user
-            # rage-quits.
             txn = SourceTransaction(
                 booking_date=_date(2024, 1, 15),
                 amount=_Decimal("-15.99"),
@@ -188,6 +190,8 @@ class TestKeyboardInterruptRollback:
                 ),
             )
             decisions.record(txn, result)
+            if results_accumulator is not None:
+                results_accumulator.append(result)
             raise KeyboardInterrupt
 
         monkeypatch.setattr("beancount_importer.cli.run_pipeline", fake_run)
@@ -200,22 +204,87 @@ class TestKeyboardInterruptRollback:
                 str(project_dir / "import_config.toml"),
             ],
         )
-        # Exit code 130 = standard SIGINT exit
         assert result.exit_code == 130, result.output
         assert "interrupted" in result.output
-        # Decisions JSONL must be empty (or missing) — the in-flight
-        # record was rolled back.
+        # Decisions JSONL stays empty.
         decisions_path = project_dir / "decisions.jsonl"
         if decisions_path.exists():
             assert decisions_path.read_text().strip() == ""
 
-    def test_interrupt_with_no_in_flight_decisions_still_exits_cleanly(
+    def test_interrupt_persists_rules_created_before_rage_quit(
         self, project_dir: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        # Ctrl+C very early (before any decision recorded) — should
-        # still exit 130 with a friendly message, no traceback.
-        def fake_run(session, base_dir, categorize, reporter, *, decisions, merge_fn):
+        # If the user pressed [r] (save_as_rule) on a few rows then
+        # hit Ctrl+C, those rules must survive — they're durable
+        # intent independent of decisions/.bean writes.
+        from beancount_importer.models import (
+            CategoryProposal,
+            ImportResult,
+            Posting,
+            SourceTransaction,
+        )
+        from beancount_importer.rules.models import CategorizationRule
+        from datetime import date as _date
+        from decimal import Decimal as _Decimal
+
+        def fake_run(
+            session, base_dir, categorize, reporter,
+            *, decisions, merge_fn, results_accumulator,
+        ):
             del session, base_dir, categorize, reporter, decisions, merge_fn
+            txn = SourceTransaction(
+                booking_date=_date(2024, 1, 15),
+                amount=_Decimal("-15.99"),
+                currency="EUR",
+                payee="Netflix",
+                description="Netflix Abo",
+                bank_key="spk",
+            )
+            new_rule = CategorizationRule(
+                payee_pattern="Netflix",
+                target_account="Expenses:Streaming",
+            )
+            result = ImportResult(
+                source_txn=txn,
+                action="new",
+                proposal=CategoryProposal(
+                    action="categorize",
+                    postings=(Posting(account="Expenses:Streaming"),),
+                    save_as_rule=True,
+                ),
+                new_rule=new_rule,
+            )
+            assert results_accumulator is not None
+            results_accumulator.append(result)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("beancount_importer.cli.run_pipeline", fake_run)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "2024",
+                "--config",
+                str(project_dir / "import_config.toml"),
+            ],
+        )
+        assert result.exit_code == 130, result.output
+        assert "kept 1 new rule" in result.output
+        rules_text = (project_dir / "rules.json").read_text()
+        assert "Netflix" in rules_text
+        assert "Expenses:Streaming" in rules_text
+
+    def test_interrupt_with_no_pending_state_exits_cleanly(
+        self, project_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Ctrl+C very early (before any decision recorded) — exits 130
+        # with the friendly message, no traceback, no "kept N rules".
+        def fake_run(
+            session, base_dir, categorize, reporter,
+            *, decisions, merge_fn, results_accumulator,
+        ):
+            del session, base_dir, categorize, reporter, decisions
+            del merge_fn, results_accumulator
             raise KeyboardInterrupt
 
         monkeypatch.setattr("beancount_importer.cli.run_pipeline", fake_run)
@@ -230,6 +299,7 @@ class TestKeyboardInterruptRollback:
         )
         assert result.exit_code == 130, result.output
         assert "interrupted" in result.output
+        assert "kept" not in result.output
 
 
 class TestRichReporter:
