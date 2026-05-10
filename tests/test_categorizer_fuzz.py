@@ -12,6 +12,14 @@ for free-text prompts). For each seed, we run the screen and assert it
 terminates with a typed decision. The seed sweep is wide enough that any
 unhandled key or pathological loop surfaces as either a crash or an
 infinite-call timeout (capped via the responder's call counter).
+
+We use `pytest.mark.parametrize` rather than `hypothesis` here: the
+input space is one opaque integer fed to `random.Random`, which
+hypothesis can neither constrain nor shrink — so we'd pay its setup
+cost without getting any of its benefits. A fixed seed list keeps runs
+reproducible across machines and produces the same coverage in a
+fraction of the wall time. Hypothesis is still used in `test_parsers.py`
+where it actually explores structured inputs.
 """
 
 from __future__ import annotations
@@ -22,8 +30,7 @@ from decimal import Decimal
 from io import StringIO
 from typing import Any
 
-from hypothesis import given, settings
-from hypothesis import strategies as st
+import pytest
 from rich.console import Console
 
 from beancount_importer.categorizer.ambiguous import (
@@ -64,7 +71,10 @@ from beancount_importer.rules.models import CategorizationRule
 
 
 def _console() -> Console:
-    return Console(file=StringIO(), record=True, width=120, emoji=False)
+    # `record=False`: the fuzz tests don't introspect rendered output —
+    # only assert on the final decision shape — so the recorded-output
+    # buffer would just be paid-for-and-thrown-away work per render.
+    return Console(file=StringIO(), record=False, width=120, emoji=False)
 
 
 # Ceiling on Prompt.ask invocations per run. If any screen's run loop
@@ -228,47 +238,45 @@ def _ambiguous_ctx() -> AmbiguousContext:
 # ── The fuzz tests ────────────────────────────────────────────────────────────
 
 
-_FAST = settings(max_examples=40, deadline=2000)
+# Fixed seed grid. 40 picks is enough to surface any unhandled-key or
+# pathological-loop bug — same budget the previous `max_examples=40`
+# used. Kept as `range(40)` rather than a hand-curated list so the
+# coverage scales transparently if the fuzz space ever grows.
+_SEEDS = list(range(40))
 
 
-@_FAST
-@given(seed=st.integers(min_value=0, max_value=2**31 - 1))
-def test_confirm_run_always_terminates_with_typed_decision(seed: int):
-    import pytest
-
-    with pytest.MonkeyPatch.context() as mp:
-        responder = _patched_prompt(mp, seed)
-        decision = run_confirm(_console(), _confirm_ctx())
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_confirm_run_always_terminates_with_typed_decision(
+    seed: int, monkeypatch
+):
+    responder = _patched_prompt(monkeypatch, seed)
+    decision = run_confirm(_console(), _confirm_ctx())
     assert isinstance(decision, ConfirmDecision)
     assert decision.action in {"confirm", "skip", "quit", "change_account"}
     assert responder.calls <= _MAX_PROMPTS
 
 
-@_FAST
-@given(
-    seed=st.integers(min_value=0, max_value=2**31 - 1),
-    debit=st.booleans(),
-)
-def test_confirm_run_handles_both_debit_and_credit(seed: int, debit: bool):
+# 20 seeds × 2 polarities = 40 cases — same total fuzz budget as the
+# other tests, with both debit and credit guaranteed to be exercised.
+@pytest.mark.parametrize("debit", [True, False])
+@pytest.mark.parametrize("seed", _SEEDS[:20])
+def test_confirm_run_handles_both_debit_and_credit(
+    seed: int, debit: bool, monkeypatch
+):
     """The `[m]` hotkey is debit-only — fuzz both polarities to make
     sure the credit path doesn't accept a non-listed key.
     """
-    import pytest
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patched_prompt(mp, seed)
-        decision = run_confirm(_console(), _confirm_ctx(debit=debit))
+    _patched_prompt(monkeypatch, seed)
+    decision = run_confirm(_console(), _confirm_ctx(debit=debit))
     assert isinstance(decision, ConfirmDecision)
 
 
-@_FAST
-@given(seed=st.integers(min_value=0, max_value=2**31 - 1))
-def test_pick_run_always_terminates_with_typed_decision(seed: int):
-    import pytest
-
-    with pytest.MonkeyPatch.context() as mp:
-        responder = _patched_prompt(mp, seed)
-        decision = run_pick(_console(), _pick_ctx())
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_pick_run_always_terminates_with_typed_decision(
+    seed: int, monkeypatch
+):
+    responder = _patched_prompt(monkeypatch, seed)
+    decision = run_pick(_console(), _pick_ctx())
     assert isinstance(decision, PickDecision)
     assert decision.action in {"pick", "skip", "quit"}
     assert responder.calls <= _MAX_PROMPTS
@@ -277,50 +285,38 @@ def test_pick_run_always_terminates_with_typed_decision(seed: int):
         assert decision.account is not None
 
 
-@_FAST
-@given(seed=st.integers(min_value=0, max_value=2**31 - 1))
-def test_collision_run_always_terminates_with_typed_decision(seed: int):
-    import pytest
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patched_prompt(mp, seed)
-        decision = run_collision(_console(), _collision_ctx())
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_collision_run_always_terminates_with_typed_decision(
+    seed: int, monkeypatch
+):
+    _patched_prompt(monkeypatch, seed)
+    decision = run_collision(_console(), _collision_ctx())
     assert isinstance(decision, CollisionDecision)
     assert decision.action in {"update", "keep", "import_new", "block", "skip", "quit"}
 
 
-@_FAST
-@given(seed=st.integers(min_value=0, max_value=2**31 - 1))
-def test_ambiguous_run_always_terminates_with_typed_decision(seed: int):
-    import pytest
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patched_prompt(mp, seed)
-        decision = run_ambiguous(_console(), _ambiguous_ctx())
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_ambiguous_run_always_terminates_with_typed_decision(
+    seed: int, monkeypatch
+):
+    _patched_prompt(monkeypatch, seed)
+    decision = run_ambiguous(_console(), _ambiguous_ctx())
     assert isinstance(decision, AmbiguousDecision)
     assert decision.action in {"pick", "import_new", "skip", "quit"}
 
 
-@_FAST
-@given(seed=st.integers(min_value=0, max_value=2**31 - 1))
-def test_tag_menu_run_always_terminates(seed: int):
-    import pytest
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patched_prompt(mp, seed)
-        result = run_tag_menu(_console(), None)
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_tag_menu_run_always_terminates(seed: int, monkeypatch):
+    _patched_prompt(monkeypatch, seed)
+    result = run_tag_menu(_console(), None)
     # Either a TagStateDelta or None — both are documented returns.
     assert result is None or hasattr(result, "op")
 
 
-@_FAST
-@given(seed=st.integers(min_value=0, max_value=2**31 - 1))
-def test_amortize_run_always_returns_proposal(seed: int):
-    import pytest
-
-    with pytest.MonkeyPatch.context() as mp:
-        _patched_prompt(mp, seed)
-        result = run_amortize(_console(), _proposal())
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_amortize_run_always_returns_proposal(seed: int, monkeypatch):
+    _patched_prompt(monkeypatch, seed)
+    result = run_amortize(_console(), _proposal())
     assert isinstance(result, CategoryProposal)
 
 
