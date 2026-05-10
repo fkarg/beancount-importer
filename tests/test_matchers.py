@@ -15,6 +15,7 @@ from beancount_importer.matching.registry import (
     first_outcome,
     load_matchers,
 )
+from beancount_importer.matching.settled import hook as settled_hook
 from beancount_importer.matching.transfers import hook as transfers_hook
 from beancount_importer.models import LedgerEntry, SourceTransaction
 
@@ -212,3 +213,133 @@ class TestTransferMatcher:
     def test_does_not_skip_when_no_counterparty_exists(self):
         outcome = transfers_hook.match(_n26_transfer(), {}, [])
         assert outcome is None
+
+
+# ── Intermediary-settlement matcher ───────────────────────────────────────────
+
+
+def _settled_entry(
+    *,
+    entry_date: date = date(2024, 4, 29),
+    metadata_dates: tuple[date, ...] = (date(2024, 5, 3),),
+    amount: Decimal = Decimal("-29.06"),
+    currency: str = "EUR",
+) -> LedgerEntry:
+    """An entry that the user booked with `paypal:` (or similar) metadata.
+
+    `entry_date` is the merchant/actual date; `metadata_dates` carries the
+    settle/intermediary dates extracted from the entry's posting metadata.
+    """
+    return LedgerEntry(
+        date=entry_date,
+        narration="Uber",
+        source_account="Assets:B:SPK",
+        target_account="Expenses:Food:Outside",
+        amount=amount,
+        currency=currency,
+        metadata_dates=metadata_dates,
+    )
+
+
+class TestIntermediarySettlementMatcher:
+    def test_skips_when_csv_row_matches_settle_date(self):
+        # PayPal CSV row dated at the settle (intermediary) date — entry's
+        # `paypal: 2024-05-03` metadata says we already booked this.
+        txn = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            payee="Uber",
+            description="Uber",
+            bank_key="paypal",
+        )
+        outcome = settled_hook.match(txn, {}, [_settled_entry()])
+        assert outcome is not None
+        assert outcome.kind == "skip"
+        assert outcome.reason == "settled_via_intermediary"
+        assert outcome.matched_entry is not None
+
+    def test_skips_when_csv_row_matches_actual_date(self):
+        # CSV row dated at the entry's own (actual) date — also a duplicate.
+        txn = SourceTransaction(
+            booking_date=date(2024, 4, 29),
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            payee="Uber",
+            description="Uber",
+            bank_key="paypal",
+        )
+        outcome = settled_hook.match(txn, {}, [_settled_entry()])
+        assert outcome is not None
+        assert outcome.kind == "skip"
+
+    def test_skips_when_sign_flips_across_banks(self):
+        # SPK records the outflow (-29.06); PayPal "Bank Deposit" inflow
+        # (+29.06) on the same date — same logical movement, opposite sign.
+        txn = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("29.06"),
+            currency="EUR",
+            payee="PayPal Bank Deposit",
+            description="Bank Deposit",
+            bank_key="paypal",
+        )
+        outcome = settled_hook.match(txn, {}, [_settled_entry()])
+        assert outcome is not None
+        assert outcome.kind == "skip"
+
+    def test_does_not_skip_entry_without_metadata_dates(self):
+        # A regular merchant entry (no paypal:/settle:) is NOT settlement
+        # evidence; the matcher must pass so dedup/scoring can run normally.
+        plain = LedgerEntry(
+            date=date(2024, 4, 29),
+            narration="Uber",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Food:Outside",
+            amount=Decimal("-29.06"),
+            currency="EUR",
+        )
+        txn = SourceTransaction(
+            booking_date=date(2024, 4, 29),
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            payee="Uber",
+            description="Uber",
+            bank_key="paypal",
+        )
+        assert settled_hook.match(txn, {}, [plain]) is None
+
+    def test_does_not_skip_on_amount_mismatch(self):
+        txn = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("-30.00"),
+            currency="EUR",
+            payee="Uber",
+            description="Uber",
+            bank_key="paypal",
+        )
+        assert settled_hook.match(txn, {}, [_settled_entry()]) is None
+
+    def test_does_not_skip_on_currency_mismatch(self):
+        txn = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("-29.06"),
+            currency="USD",
+            payee="Uber",
+            description="Uber",
+            bank_key="paypal",
+        )
+        assert settled_hook.match(txn, {}, [_settled_entry()]) is None
+
+    def test_does_not_skip_when_dates_disagree(self):
+        # Same amount, but neither the entry's date nor its metadata_dates
+        # match — the row is a separate transaction.
+        txn = SourceTransaction(
+            booking_date=date(2024, 6, 15),
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            payee="Uber",
+            description="Uber",
+            bank_key="paypal",
+        )
+        assert settled_hook.match(txn, {}, [_settled_entry()]) is None

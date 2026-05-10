@@ -130,6 +130,7 @@ class MatchingConfig(BaseModel):
     # PayPal-funded SPK debit → transfer to `Assets:B:PayPal`). Order matters;
     # the first matcher to fire wins. See `matching/registry.py`.
     enabled_matchers: list[str] = [
+        "beancount_importer.matching.settled",
         "beancount_importer.matching.transfers",
         "beancount_importer.matching.paypal",
     ]

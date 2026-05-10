@@ -473,10 +473,16 @@ class TestPipelineCrossBank:
         assert results[0].matched_entry is not None
         assert results[0].matched_entry.amount_inferred is True
 
-    def test_paypal_metadata_synthesizes_match(self, tmp_path: Path):
-        # SPK entry with `paypal: <date>` metadata — plugin would split this
-        # into a separate PayPal transaction at load time. Without the
-        # plugin, the importer reconstructs the virtual entry from config.
+    def test_paypal_metadata_settled_matcher_skips(self, tmp_path: Path):
+        # SPK entry with `paypal: <date>` metadata — a plugin (`settle_inv`)
+        # would split this into a separate PayPal transaction at load time.
+        # On import, the `settled` matcher recognises the metadata as
+        # settlement evidence and silent-skips the corresponding PayPal
+        # CSV row before the scorer runs. The reader-level
+        # `synthesize_from_metadata` path that fed virtual entries into
+        # the scorer is now redundant for the skip case but remains
+        # available for scoring against entries that *don't* carry a
+        # metadata-date key (covered by `test_beancount_io.py`).
         (tmp_path / "transactions").mkdir()
         (tmp_path / "transactions" / "SPK.bean").write_text(
             '2024-04-13 * "Google Payment" ""\n'
@@ -484,7 +490,6 @@ class TestPipelineCrossBank:
             '    paypal: 2024-04-11\n'
             '  Expenses:Apps  3.39 EUR\n'
         )
-        # PayPal CSV records the actual purchase date.
         self._write_paypal_csv(
             tmp_path / "PayPal_2024.csv",
             "2024-04-11,Google Payment,EUR,-3.39",
@@ -492,16 +497,14 @@ class TestPipelineCrossBank:
         cfg = Config(
             banks=[self._make_paypal_bank()],
             transactions_dir="transactions",
-            matching=MatchingConfig(
-                min_score=0.35,
-                synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
-            ),
+            matching=MatchingConfig(min_score=0.35),
         )
         session = ImportSession(config=cfg, options=ImportOptions())
         results = run(session, tmp_path, fixed_categorize(), NoopReporter())
         assert len(results) == 1
-        assert results[0].action == "update"
-        assert results[0].proposed_changes == []
+        assert results[0].action == "skip"
+        assert results[0].skip_reason == "cross_source_match"
+        assert results[0].matched_entry is not None
 
     def test_funding_bank_can_be_n26(self, tmp_path: Path):
         # Same shape as above but the transit leg lives on N26 instead of
@@ -1620,3 +1623,4 @@ class TestHasCsvMatch:
         session = ImportSession(config=cfg, options=ImportOptions())
         stats = compute_bean_provenance_stats(session, tmp_path)
         assert stats[("Assets:B:SPK", 2024)].bean_unmatched == 1
+
