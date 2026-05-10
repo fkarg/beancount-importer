@@ -224,15 +224,22 @@ def _settled_entry(
     metadata_dates: tuple[date, ...] = (date(2024, 5, 3),),
     amount: Decimal = Decimal("-29.06"),
     currency: str = "EUR",
+    payee: str = "PayPal",
+    narration: str = "Uber",
 ) -> LedgerEntry:
     """An entry that the user booked with `paypal:` (or similar) metadata.
 
     `entry_date` is the merchant/actual date; `metadata_dates` carries the
     settle/intermediary dates extracted from the entry's posting metadata.
+    The default `payee="PayPal"` matches realistic bookings — the bank-side
+    entry typically tags both the intermediary and the merchant so the
+    matcher's text floor lines up with PayPal-CSV rows on either the
+    merchant ("Uber") or sign-flipped funding ("PayPal Bank Deposit") side.
     """
     return LedgerEntry(
         date=entry_date,
-        narration="Uber",
+        payee=payee,
+        narration=narration,
         source_account="Assets:B:SPK",
         target_account="Expenses:Food:Outside",
         amount=amount,
@@ -343,3 +350,125 @@ class TestIntermediarySettlementMatcher:
             bank_key="paypal",
         )
         assert settled_hook.match(txn, {}, [_settled_entry()]) is None
+
+    def test_does_not_skip_unrelated_payee_with_matching_amount_and_date(self):
+        # Recurring fixed-amount risk: an unrelated 29.06 EUR row landing
+        # on the same date as some other entry's `paypal:` metadata. The
+        # text floor must reject — silent-skipping a real transaction is
+        # how rows disappear without warning.
+        unrelated = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            payee="Spotify",
+            description="Premium Family",
+            bank_key="paypal",
+        )
+        assert settled_hook.match(unrelated, {}, [_settled_entry()]) is None
+
+    def test_does_not_skip_when_csv_row_has_no_text(self):
+        # Without identifying text on the CSV side the matcher can't tell
+        # a real settlement from an amount/date coincidence — fall through
+        # to dedup/scoring instead of silent-skipping.
+        textless = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            bank_key="paypal",
+        )
+        assert settled_hook.match(textless, {}, [_settled_entry()]) is None
+
+    def test_does_not_skip_when_entry_has_no_text(self):
+        # Mirror image: a nameless ledger entry isn't strong enough
+        # evidence to silent-skip a CSV row even if amount + date align.
+        textless_entry = LedgerEntry(
+            date=date(2024, 4, 29),
+            narration="",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Food:Outside",
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            metadata_dates=(date(2024, 5, 3),),
+        )
+        txn = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            payee="Uber",
+            description="Uber",
+            bank_key="paypal",
+        )
+        assert settled_hook.match(txn, {}, [textless_entry]) is None
+
+    def test_picks_first_text_matching_entry_when_amount_collides(self):
+        # Two settlement-bearing entries with the same |amount| + date.
+        # The matcher must prefer the one whose text actually overlaps
+        # with the CSV row, not the first iterated.
+        wrong = _settled_entry(payee="PayPal", narration="Spotify")
+        right = _settled_entry(payee="PayPal", narration="Uber")
+        txn = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            payee="Uber",
+            description="Uber Trip",
+            bank_key="paypal",
+        )
+        # Iterate `wrong` first — text floor rejects it; matcher then
+        # falls through to `right`.
+        outcome = settled_hook.match(txn, {}, [wrong, right])
+        assert outcome is not None
+        assert outcome.matched_entry is right
+
+
+# ── Default registration order ────────────────────────────────────────────────
+
+
+class TestDefaultMatcherOrder:
+    """The shipped `enabled_matchers` order is load-bearing: each later
+    matcher assumes the earlier ones have already filtered. Specifically,
+    `intermediary_settlement` must run before `paypal` — otherwise a
+    row that *should* silent-skip would instead get rewritten to the
+    PayPal account and re-booked.
+    """
+
+    def test_settled_runs_before_paypal_in_default_config(self):
+        from beancount_importer.config import MatchingConfig
+
+        cfg = MatchingConfig()
+        order = cfg.enabled_matchers
+        assert "beancount_importer.matching.settled" in order
+        assert "beancount_importer.matching.paypal" in order
+        assert order.index(
+            "beancount_importer.matching.settled"
+        ) < order.index("beancount_importer.matching.paypal")
+
+    def test_settled_pre_empts_paypal_when_both_would_match(self):
+        # SPK funding row with a settled-on-PayPal counterpart entry AND
+        # a PayPal-CSV row: paypal_hook would emit `rewrite_target`,
+        # settled_hook would emit `skip`. The default load order must
+        # produce `skip`, otherwise an already-booked row gets re-imported.
+        spk = _spk_funding(Decimal("-3.39"))
+        paypal_csv_row = _paypal_csv(Decimal("-3.39"))
+        already_booked = LedgerEntry(
+            date=date(2024, 4, 13),
+            payee="PayPal",
+            narration="Google",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Subscriptions",
+            amount=Decimal("-3.39"),
+            currency="EUR",
+            metadata_dates=(date(2024, 4, 13),),
+        )
+        hooks = load_matchers(
+            [
+                "beancount_importer.matching.settled",
+                "beancount_importer.matching.paypal",
+            ]
+        )
+        outcome = first_outcome(
+            hooks, spk, {"paypal": [paypal_csv_row]}, [already_booked]
+        )
+        assert outcome is not None
+        assert outcome.kind == "skip"
+        assert outcome.reason == "settled_via_intermediary"

@@ -473,13 +473,34 @@ def _process_transaction(
     matcher_proposal: CategoryProposal | None = None
     if matcher_outcome is not None:
         if matcher_outcome.kind == "skip":
+            # Claim the matched entry across the views the rest of the run
+            # consults: `existing_all` so the next matcher pass doesn't
+            # re-match the same entry, and the bank-scoped bucket if the
+            # entry happens to live there too. Without this, two CSV rows
+            # with the same |amount| + date pointing at two distinct
+            # settlement-bearing entries would both attribute to whichever
+            # entry the matcher iteration hit first.
+            # Shipped matchers always set `matched_entry` on a skip outcome
+            # and always pull it from `existing_all`; the protocol allows
+            # None for forward-compat with heuristic matchers that skip
+            # without naming an entry, but in practice we can take the
+            # claim path unconditionally. The bank-scoped bucket may or
+            # may not contain it (cross-source matchers usually return
+            # an entry on a different bank).
+            matched = matcher_outcome.matched_entry
+            if matched is None:  # pragma: no cover - defensive
+                pass
+            else:
+                existing_all.remove(matched)
+                if matched in existing:
+                    existing.remove(matched)
             return (
                 ImportResult(
                     source_txn=txn,
                     action="skip",
                     proposal=None,
                     skip_reason="cross_source_match",
-                    matched_entry=matcher_outcome.matched_entry,
+                    matched_entry=matched,
                 ),
                 _advance_tag(working_tag, txn.booking_date),
                 working_rules,

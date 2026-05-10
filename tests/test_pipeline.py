@@ -604,6 +604,106 @@ class TestPipelineMatchers:
         assert spk.proposal.metadata.get("paypal") == "2024-04-13"
         assert "Assets:B:PayPal" in spk.new_entry_text
 
+    def test_settled_matcher_claims_same_bank_entry_from_bucket(
+        self, tmp_path: Path
+    ):
+        """Edge case: the matcher fires against an entry on the *same*
+        bank as the CSV row (e.g. SPK CSV row matches an SPK entry that
+        carries `paypal:` metadata for an unrelated reason). The claim
+        must remove from the bank-scoped bucket too, otherwise the
+        bucket retains a phantom matched entry that downstream
+        scoring/dedup would re-consider for sibling rows.
+        """
+        self._spk_csv(
+            tmp_path / "SPK_2024.csv",
+            "03.05.24;Uber;Uber Trip;-29,06;EUR;",
+        )
+        bean_dir = tmp_path / "transactions"
+        bean_dir.mkdir()
+        # Same-bank entry: source on SPK with paypal: metadata. CSV
+        # description differs from narration so plain dedup misses; the
+        # settled matcher catches it via amount + metadata-date + text
+        # overlap on "Uber".
+        (bean_dir / "SPK.bean").write_text(
+            '2024-04-29 * "PayPal" "Uber"\n'
+            "  Assets:B:SPK   -29.06 EUR\n"
+            "    paypal: 2024-05-03\n"
+            "  Expenses:Food:Outside  29.06 EUR\n"
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+
+        assert len(results) == 1
+        r = results[0]
+        assert r.action == "skip"
+        assert r.skip_reason == "cross_source_match"
+        assert r.matched_entry is not None
+        # The matched entry's source_account is the SAME as the CSV row's
+        # bank → it lives in the bank-scoped bucket too. The claim
+        # behavior is observable via the second-row regression below.
+        assert r.matched_entry.source_account == "Assets:B:SPK"
+
+    def test_settled_matcher_pairs_two_csv_rows_with_distinct_entries(
+        self, tmp_path: Path
+    ):
+        """N PayPal CSV rows with the same |amount|+date as N distinct
+        bank-side entries (each with `paypal:` metadata) must each pair
+        with a *different* entry. Pre-fix the matcher iterated stop-at-
+        first, so both rows attributed to whichever entry the loop hit
+        first — leaving the sibling looking like a bean-orphan in the
+        provenance preview.
+        """
+        # Two PayPal CSV rows for the same merchant, same amount, same date
+        # — two distinct movements (think: two Uber rides on the same day).
+        self._paypal_csv(
+            tmp_path / "PayPal_2024.csv",
+            "2024-05-03,Uber,EUR,-29.06\n2024-05-03,Uber,EUR,-29.06",
+        )
+        # Two SPK-side entries that the user already booked, each with
+        # a `paypal:` date pointing at 2024-05-03.
+        bean_dir = tmp_path / "transactions"
+        bean_dir.mkdir()
+        (bean_dir / "SPK.bean").write_text(
+            '2024-04-29 * "PayPal" "Uber"\n'
+            "  Assets:B:SPK   -29.06 EUR\n"
+            "    paypal: 2024-05-03\n"
+            "  Expenses:Food:Outside  29.06 EUR\n\n"
+            '2024-04-29 * "PayPal" "Uber"\n'
+            "  Assets:B:SPK   -29.06 EUR\n"
+            "    paypal: 2024-05-03\n"
+            "  Expenses:Food:Outside  29.06 EUR\n"
+        )
+        cfg = Config(
+            banks=[
+                make_spk_bank(year_template_output=False),
+                self._make_paypal_bank(),
+            ],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+
+        paypal_results = [r for r in results if r.source_txn.bank_key == "paypal"]
+        assert len(paypal_results) == 2
+        assert all(r.action == "skip" for r in paypal_results)
+        assert all(r.skip_reason == "cross_source_match" for r in paypal_results)
+        # The critical assertion: distinct entries claimed, not both
+        # attributing to the same one.
+        keys = [
+            (r.matched_entry.file_path, r.matched_entry.line_start)
+            for r in paypal_results
+            if r.matched_entry is not None
+        ]
+        assert len(keys) == 2 and len(set(keys)) == 2, (
+            f"expected two distinct settlement-bearing entries claimed, got: {keys}"
+        )
+
     def test_internal_transfer_matcher_skips_already_booked_leg(
         self, tmp_path: Path
     ):
