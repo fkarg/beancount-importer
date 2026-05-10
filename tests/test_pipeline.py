@@ -1990,3 +1990,265 @@ class TestPipelineNearMissesPlumbing:
         netflix = next(c for c in captured if c.txn.payee == "Netflix")
         assert netflix.candidates  # scorer found the entry
         assert netflix.near_misses == ()
+
+
+# ── Pipeline contract: determinism / isolation / multi-row pairing ───────────
+
+
+class TestPipelineDeterminism:
+    """`pipeline.run()` is deterministic given the same inputs.
+
+    CLAUDE.md elevates this to an architectural invariant. The cheapest
+    enforcement: run the pipeline twice on a fixed setup and compare the
+    `ImportResult` lists.
+    """
+
+    def test_two_runs_produce_equal_results(self, base_dir: Path):
+        session = make_session(base_dir)
+        first = run(session, base_dir, fixed_categorize(), NoopReporter())
+        # Use a fresh session — `ImportSession` is frozen, but the
+        # `working_rules` / `working_tag` machinery lives inside `run()`,
+        # so a second call against the same files must reproduce.
+        session2 = make_session(base_dir)
+        second = run(session2, base_dir, fixed_categorize(), NoopReporter())
+        # Comparing the full result list catches regressions in iteration
+        # order, claim ordering, near-miss generation, etc.
+        assert [r.model_dump() for r in first] == [r.model_dump() for r in second]
+
+
+class TestPipelineBucketIsolation:
+    """Bank-scoped dedup/scoring buckets keep cross-bank lookalikes apart.
+
+    Two entries with identical (date, |amount|, currency) on different
+    banks must not interfere — an SPK CSV row pairs with the SPK entry,
+    not the N26 entry. The cross-source matchers see both via
+    `existing_all`, but the dedup/scoring path is bank-scoped through
+    `existing_by_account`.
+    """
+
+    def _n26_bank(self) -> BankConfig:
+        return BankConfig(
+            key="n26",
+            display_name="N26",
+            account="Assets:B:N26",
+            file_glob="N26_*.csv",
+            output_file="n26.bean",
+            csv=CsvConfig(
+                delimiter=";",
+                date_format=["%d.%m.%y"],
+                amount_locale="de",
+                field_date="Buchungstag",
+                field_amount="Betrag",
+                field_currency="Waehrung",
+                field_payee="Beguenstigter",
+                field_description="Verwendungszweck",
+            ),
+        )
+
+    def test_spk_csv_row_pairs_with_spk_entry_not_n26_lookalike(
+        self, tmp_path: Path
+    ):
+        # CSVs: one SPK row only.
+        (tmp_path / "SPK_2024.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;Netflix;Netflix Abo;-15,99;EUR;\n"
+        )
+        # Bean: two entries on different banks with identical date/amount.
+        # The SPK one is the only legitimate match.
+        bean_dir = tmp_path / "transactions"
+        bean_dir.mkdir()
+        (bean_dir / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Netflix Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        (bean_dir / "N26.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Netflix Abo"
+              Assets:B:N26  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        cfg = Config(
+            banks=[
+                make_spk_bank(year_template_output=False),
+                self._n26_bank(),
+            ],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Streaming"), NoopReporter()
+        )
+        # One CSV row → one result. It must have matched the SPK-side
+        # entry, not the N26 lookalike.
+        assert len(results) == 1
+        assert results[0].action == "skip"
+        assert results[0].skip_reason == "duplicate"
+        assert results[0].matched_entry is not None
+        assert results[0].matched_entry.source_account == "Assets:B:SPK"
+
+
+class TestPipelineRuleRewriteOverrideNarration:
+    """Counterpart to TestPipelineRuleRewriteForDedup, but for the
+    `override_narration` field — only `override_payee` had end-to-end
+    coverage previously.
+    """
+
+    def test_dedup_catches_narration_cleaned_entry(self, tmp_path: Path):
+        # Bean entry was previously written with rule.override_narration
+        # applied: payee carried through raw, narration cleaned.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-04-02 * "Frankfurter Turn-u.Sport- Gemeinschaft 1847 j.P." "Monthly dues"
+              Assets:B:SPK  -49.50 EUR
+              Expenses:Fitness:Gym  49.50 EUR
+        """))
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "02.04.24;Frankfurter Turn-u.Sport- Gemeinschaft 1847 j.P.;"
+            "0614870/Vereinsbeitrag FTG Frankfurt FOLGELASTSCHRIFT;-49,50;EUR;\n"
+        )
+        rule = CategorizationRule(
+            target_account="Expenses:Fitness:Gym",
+            payee_pattern="FTG|Frankfurter Turn",
+            override_narration="Monthly dues",
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(
+            config=cfg, rules=(rule,), options=ImportOptions()
+        )
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 1
+        assert results[0].action == "skip"
+        assert results[0].skip_reason == "duplicate"
+
+    def test_changed_override_re_prompts_previously_imported_row(
+        self, tmp_path: Path
+    ):
+        # Documents the trade-off: editing a rule's override_payee between
+        # runs makes the previously-imported entry's content hash diverge
+        # from the freshly-rewritten txn, so the row re-prompts. Without
+        # this guarantee in tests, a future "fix" could silently skip
+        # legitimate re-prompts.
+        # First run with the OLD rule writes an entry tagged "Old Name".
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-04-02 * "Old Name" "0614870/Vereinsbeitrag FTG Frankfurt FOLGELASTSCHRIFT"
+              Assets:B:SPK  -49.50 EUR
+              Expenses:Fitness:Gym  49.50 EUR
+        """))
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "02.04.24;Frankfurter Turn-u.Sport- Gemeinschaft 1847 j.P.;"
+            "0614870/Vereinsbeitrag FTG Frankfurt FOLGELASTSCHRIFT;-49,50;EUR;\n"
+        )
+        # Second run with a NEW override_payee — content hash now uses
+        # "FTG Frankfurt", which doesn't match "Old Name" on disk.
+        new_rule = CategorizationRule(
+            target_account="Expenses:Fitness:Gym",
+            payee_pattern="FTG|Frankfurter Turn",
+            override_payee="FTG Frankfurt",
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(
+            config=cfg, rules=(new_rule,), options=ImportOptions()
+        )
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        # The row didn't dedup — it found a candidate and produced an
+        # update with non-empty diff.
+        assert len(results) == 1
+        r = results[0]
+        assert r.action == "update"
+        assert r.matched_entry is not None
+        assert r.proposed_changes  # diff non-empty: payee change visible
+
+
+class TestNNPairingViaCandidates:
+    """49eb37a's existing test covers the dedup path. This adds the
+    categorize+candidates path — N CSVs whose narrations differ enough
+    to *miss* dedup but score above threshold against N distinct entries
+    must each pair with a different entry, not all attribute to entry #1.
+    """
+
+    def test_two_csv_rows_pair_with_distinct_entries_via_scorer(
+        self, tmp_path: Path
+    ):
+        # CSV: two near-identical rows, slightly different narrations so
+        # content-hash dedup misses them.
+        (tmp_path / "SPK_jan.csv").write_text(textwrap.dedent("""\
+            Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz
+            08.01.24;DISCOSTADL;Bar tab variant A;-16,00;EUR;
+            08.01.24;DISCOSTADL;Bar tab variant B;-16,00;EUR;
+        """))
+        # Bean: two existing entries with neutral narration. Each scores
+        # well above min_score against either CSV row — text differs but
+        # date+amount+payee carry the signal.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-08 * "DISCOSTADL" "Bar tab"
+              Assets:B:SPK  -16.00 EUR
+              Expenses:Drinks  16.00 EUR
+
+            2024-01-08 * "DISCOSTADL" "Bar tab"
+              Assets:B:SPK  -16.00 EUR
+              Expenses:Drinks  16.00 EUR
+        """))
+        session = make_session(tmp_path)
+        results = run(
+            session,
+            tmp_path,
+            fixed_categorize("Expenses:Drinks"),
+            NoopReporter(),
+        )
+        assert len(results) == 2
+        # Both rows take the categorize+candidates path (proposal is
+        # `update` because best != None). Each must claim a distinct
+        # entry — not both attribute to whichever was iterated first.
+        keys = [
+            (r.matched_entry.file_path, r.matched_entry.line_start)
+            for r in results
+            if r.matched_entry is not None
+        ]
+        assert len(keys) == 2 and len(set(keys)) == 2
+
+    def test_more_csv_rows_than_entries_creates_new_for_remainder(
+        self, tmp_path: Path
+    ):
+        # 3 CSVs ↔ 1 bean entry: first row pairs (skip via dedup), the
+        # remaining two find no candidates (the single entry has been
+        # claimed) and get categorized as new.
+        (tmp_path / "SPK_jan.csv").write_text(textwrap.dedent("""\
+            Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz
+            08.01.24;DISCOSTADL;Bar tab;-16,00;EUR;
+            08.01.24;DISCOSTADL;Bar tab;-16,00;EUR;
+            08.01.24;DISCOSTADL;Bar tab;-16,00;EUR;
+        """))
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-08 * "DISCOSTADL" "Bar tab"
+              Assets:B:SPK  -16.00 EUR
+              Expenses:Drinks  16.00 EUR
+        """))
+        session = make_session(tmp_path)
+        results = run(
+            session,
+            tmp_path,
+            fixed_categorize("Expenses:Drinks"),
+            NoopReporter(),
+        )
+        assert len(results) == 3
+        # Exactly one row dedups (claims the single entry); the other
+        # two should be `update`-with-empty-diff (silent match against
+        # the same entry? no — the entry was claimed) → `new`.
+        actions = [r.action for r in results]
+        # One skip (dedup), two new — order depends on iteration but
+        # the multiset is fixed.
+        assert sorted(actions) == ["new", "new", "skip"]
