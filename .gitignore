@@ -218,4 +218,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 # pure planning / wip artifacts
-docs/superpowers
+docs/
