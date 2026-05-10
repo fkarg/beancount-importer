@@ -19,6 +19,7 @@ uv run bean-import --help                        # CLI entry point
 ## Architecture
 
 The codebase is a modular beancount v3 CSV importer. The key architectural principle is a **pure pipeline**: `pipeline.run()` never writes files, never touches stdin/stdout, and is deterministic given its inputs. All I/O and interaction is delegated to `cli.py`.
+Keep the architecture as simple and straightforward as possible. Someone else should be able to quickly reason locally without looking at related files.
 
 ### Layer map
 
@@ -67,8 +68,12 @@ Banks with `[banks.csv]` in config → `GenericCsvParser` (no Python needed). Ba
 
 - **Unit tests** (`test_parsers.py`, `test_rules.py`, `test_matching.py`): pure functions, no filesystem
 - **Integration tests** (`test_beancount_io.py`, `test_pipeline.py`, `test_replay.py`): use `tmp_path`; no network; no interactive prompts
-- `tests/conftest.py` provides `sample_config`, `sample_bean`, and `deterministic_categorize` (a test double for `CategorizeFn` that always returns `Expenses:Unknown`)
+- `tests/conftest.py` provides `deterministic_categorize` — a `CategorizeFn` test double that always returns `Expenses:Unknown` with the txn's own payee/description carried through. Reach for a custom stub only when a test specifically needs to assert on the context.
 - Property-based tests via `hypothesis` in `test_parsers.py` for locale parsing functions
+
+## Pre-commit hook
+
+`.pre-commit-config.yaml` runs ruff, pyrefly (src only), and the full pytest suite (with a 100% coverage gate) on every commit. The hook blocks red commits — there is no "commit failing tests now, fix later" workflow. Land tests and the corresponding production change in the same commit. Activate per clone with `uv run pre-commit install`.
 
 ## Commits
 
