@@ -12,6 +12,7 @@ one `run()` call. The session itself is frozen.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
@@ -273,6 +274,41 @@ def run(
 # ── Per-transaction processing ────────────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class _TxnState:
+    """Per-transaction state threaded through the processing phases.
+
+    Inputs (`txn`, `bank`, `progress`) and the carried-forward session
+    state (`working_rules`, `working_tag`) flow in via the constructor.
+    Each phase that produces a value (`rule`, `proposal`, …) returns an
+    `evolve`d copy with the new field populated. Phases never mutate.
+
+    Buckets (`existing`, `existing_all`) and other cross-cutting params
+    stay as explicit function arguments rather than fields here — they
+    live across many transactions and threading lists through frozen
+    state would just be ceremony.
+    """
+
+    txn: SourceTransaction
+    bank: BankConfig
+    progress: tuple[int, int]
+    working_rules: tuple[CategorizationRule, ...]
+    working_tag: ActiveTag | None
+
+    rule: CategorizationRule | None = None
+    match_txn: SourceTransaction | None = None
+    candidates: tuple[tuple[LedgerEntry, float], ...] = ()
+    matcher_proposal: CategoryProposal | None = None
+    proposal: CategoryProposal | None = None
+    new_rule: CategorizationRule | None = None
+    user_tag_delta: TagStateDelta | None = None
+    tag_delta: TagStateDelta | None = None
+    next_tag: ActiveTag | None = None
+
+    def evolve(self, **changes) -> _TxnState:
+        return replace(self, **changes)
+
+
 def _process_transaction(
     *,
     txn: SourceTransaction,
@@ -291,233 +327,82 @@ def _process_transaction(
     auto_threshold: float | None,
     progress: tuple[int, int] = (0, 0),
 ) -> tuple[ImportResult, ActiveTag | None, list[CategorizationRule]]:
-    """Process one txn, returning the result + updated tag + updated rules list."""
+    """Process one txn, returning the result + updated tag + updated rules list.
 
-    # 0. Look the rule up first. The result is used to *rewrite* the txn
-    # for matching: dedup and the scorer compare against existing entries
-    # that were written with rule overrides applied, so the txn side has
-    # to apply the same overrides for the texts to line up. Without this,
-    # the second import of any rule-affected row content-hash-mismatches
-    # its own previously-written entry and gets re-prompted. Replay still
-    # short-circuits ahead of rules — it's a stronger signal.
-    rule = find_matching_rule(txn, working_rules)
-    match_txn = _apply_rule_overrides(txn, rule)
+    Composed from named phase helpers operating on a frozen `_TxnState`. The
+    short-circuit phase tries replay → dedup → skip-pattern → matcher in
+    order; any hit emits a terminal result. The proposal phase scores
+    candidates and selects between matcher rewrite, auto-threshold rule,
+    silent-skip seed, or `categorize_fn`. The post-process phase folds in
+    transforms, tag state, and the save-as-rule synthesis. The finalise
+    phase builds the result, runs the merge prompt, and claims the matched
+    entry.
+    """
+    state = _TxnState(
+        txn=txn,
+        bank=bank,
+        progress=progress,
+        working_rules=tuple(working_rules),
+        working_tag=working_tag,
+    )
+    state = _resolve_rule(state)
+    advanced_tag = _advance_tag(state.working_tag, txn.booking_date)
 
-    # 1. Replay log takes precedence over everything else.
-    replayed = decisions.lookup(txn)
-    if replayed is not None:
-        result = _build_result(
-            txn=txn,
-            bank=bank,
-            proposal=replayed,
-            existing=existing,
-            matched_rule=None,
-            is_replay=True,
-            new_rule=None,
-            tag_state_delta=None,
-            min_score=config.matching.min_score,
-            match_txn=match_txn,
-        )
-        _claim_matched_entry(result, existing)
-        return result, _advance_tag(working_tag, txn.booking_date), working_rules
+    # Short-circuit phase: each helper returns an `ImportResult` for its
+    # own outcome, or `None` to fall through. Helpers that consume an
+    # entry mutate `existing` / `existing_all` in place — pragmatic given
+    # the buckets are shared across the whole run.
+    short_circuit = _short_circuit(
+        state,
+        decisions=decisions,
+        existing=existing,
+        existing_all=existing_all,
+        csv_by_bank=csv_by_bank,
+        matchers=matchers,
+        config=config,
+    )
+    if isinstance(short_circuit, ImportResult):
+        return short_circuit, advanced_tag, list(state.working_rules)
+    state = short_circuit  # may carry a matcher_proposal forward
 
-    # 2. Drop confirmed duplicates entirely. Claim the matched entry
-    # (remove it from the bucket the caller passed in) so a second
-    # identical CSV row doesn't re-claim the same entry — without
-    # this, two identical CSVs would both point at entry A and leave
-    # entry B looking like a CSV-orphan in the preview report.
-    duplicate = find_duplicate(match_txn, existing)
-    if duplicate is not None:
-        existing.remove(duplicate)
-        return (
-            ImportResult(
-                source_txn=txn,
-                action="skip",
-                proposal=None,
-                skip_reason="duplicate",
-                matched_entry=duplicate,
-            ),
-            _advance_tag(working_tag, txn.booking_date),
-            working_rules,
-        )
-
-    # 3. Hard suppression — skip_update_patterns drop the proposal entirely.
-    if _matches_skip_pattern(config.skip_update_patterns, txn):
-        return (
-            ImportResult(
-                source_txn=txn, action="skip", proposal=None, skip_reason="skip_rule"
-            ),
-            _advance_tag(working_tag, txn.booking_date),
-            working_rules,
-        )
-
-    # 4. Cross-source matchers: detect rows already booked elsewhere (skip)
-    # or rows that should book to a non-default account (rewrite_target). The
-    # matcher uses the full CSV+ledger universe, not just the current bank's
-    # bucket. Recorded as a proposal so replay reproduces the outcome without
-    # re-running matchers.
-    matcher_outcome = first_outcome(matchers, txn, csv_by_bank, existing_all)
-    matcher_proposal: CategoryProposal | None = None
-    if matcher_outcome is not None:
-        if matcher_outcome.kind == "skip":
-            # Claim the matched entry across the views the rest of the run
-            # consults: `existing_all` so the next matcher pass doesn't
-            # re-match the same entry, and the bank-scoped bucket if the
-            # entry happens to live there too. Without this, two CSV rows
-            # with the same |amount| + date pointing at two distinct
-            # settlement-bearing entries would both attribute to whichever
-            # entry the matcher iteration hit first.
-            # Shipped matchers always set `matched_entry` on a skip outcome
-            # and always pull it from `existing_all`; the protocol allows
-            # None for forward-compat with heuristic matchers that skip
-            # without naming an entry, but in practice we can take the
-            # claim path unconditionally. The bank-scoped bucket may or
-            # may not contain it (cross-source matchers usually return
-            # an entry on a different bank).
-            matched = matcher_outcome.matched_entry
-            if matched is None:  # pragma: no cover - defensive
-                pass
-            else:
-                existing_all.remove(matched)
-                if matched in existing:
-                    existing.remove(matched)
-            return (
-                ImportResult(
-                    source_txn=txn,
-                    action="skip",
-                    proposal=None,
-                    skip_reason="cross_source_match",
-                    matched_entry=matched,
-                ),
-                _advance_tag(working_tag, txn.booking_date),
-                working_rules,
-            )
-        # rewrite_target: synthesize a proposal that bypasses the categorizer.
-        matcher_proposal = _proposal_from_outcome(matcher_outcome, txn)
-
-    # 5. Score candidates (using the rule-rewritten txn so cleaned narration
-    # / payee on the entry side compares against equivalently cleaned text).
-    candidates = find_candidates(
-        match_txn, existing, min_score=config.matching.min_score
+    # Proposal phase.
+    state = _score_candidates(state, existing=existing, min_score=config.matching.min_score)
+    state = _resolve_proposal(
+        state,
+        config=config,
+        existing=existing,
+        existing_all=existing_all,
+        bank=bank,
+        auto_threshold=auto_threshold,
+        categorize_fn=categorize_fn,
     )
 
-    # 6. Choose the proposal source. Matcher rewrites are authoritative — they
-    # represent ground truth from cross-source data and pre-empt both the
-    # auto-threshold path and the user prompt.
-    proposal: CategoryProposal
-    if matcher_proposal is not None:
-        proposal = matcher_proposal
-    elif (
-        auto_threshold is not None
-        and candidates
-        and candidates[0][1] >= auto_threshold
-        and rule is not None
-    ):
-        proposal = _proposal_from_rule(rule)
-    else:
-        # Pipeline-side silent-skip: if the auto-built seed proposal would
-        # produce no field changes against the matched entry (or every
-        # ambiguous candidate), skip categorize_fn entirely. The user has
-        # nothing to consent to — `_build_result` will emit an `update`
-        # action with empty `proposed_changes` and `merge_fn` is gated on
-        # non-empty changes, so no UI fires anywhere.
-        silent = _silent_skip_proposal(rule, tuple(candidates), config.matching.min_delta)
-        if silent is not None:
-            proposal = silent
-        else:
-            from beancount_importer.matching.account_suggest import rank_accounts
+    # Post-process the proposal: transforms, user tag delta, active tag
+    # auto-stamp, save-as-rule, tag delta for persistence.
+    state = _apply_transforms(state, transforms_hooks)
+    state = _apply_user_tag_delta(state)
+    state = _stamp_active_tag(state)
+    state = _maybe_save_as_rule(state)
+    state = _compute_tag_delta(state)
 
-            suggested = rule.target_account if rule is not None else None
-            hints, _ = rank_accounts(
-                txn, candidates, existing_all, suggested_target=suggested
-            )
-            # Diagnostic near-misses: only computed when nothing crossed the
-            # threshold, so the screens can render an explanatory line above
-            # the hotkeys instead of leaving the user guessing why dedup
-            # didn't silent-skip the row.
-            near_misses = (
-                _compute_near_misses(
-                    match_txn,
-                    in_bucket=existing,
-                    cross_bucket=existing_all,
-                    bank_account=bank.account,
-                    min_score=config.matching.min_score,
-                )
-                if not candidates
-                else ()
-            )
-            context = CategorizeContext(
-                txn=txn,
-                rules=tuple(working_rules),
-                candidates=tuple(candidates),
-                matched_rule=rule,
-                account_hints=tuple(hints),
-                active_tag=working_tag,
-                existing_entries=tuple(existing_all),
-                source_account=bank.account,
-                progress=progress,
-                near_misses=near_misses,
-                seed_proposal=_seed_proposal(rule, tuple(candidates)),
-                is_ambiguous=(
-                    rule is None
-                    and _is_ambiguous_match(tuple(candidates), config.matching.min_delta)
-                ),
-            )
-            proposal = categorize_fn(context)
-
-    # 6. Apply transforms only when there's a rule to drive them.
-    if rule is not None:
-        proposal = apply_transforms(transforms_hooks, proposal, txn, rule)
-
-    # 6b. Apply a user-driven tag-state delta (Screen 1's `[t]` hotkey).
-    # The proposal arrives with `tag_state_delta` set; we mutate working_tag
-    # before the auto-stamp step so this txn picks up the new tag. The
-    # delta also surfaces on the result (step 9) for persistence.
-    user_tag_delta = proposal.tag_state_delta
-    if user_tag_delta is not None:
-        if user_tag_delta.op == "set":
-            working_tag = user_tag_delta.new_state
-        elif user_tag_delta.op == "clear":
-            working_tag = None
-
-    # 7. Apply active tag (if any and applicable) when proposal didn't set one.
-    if working_tag is not None and proposal.tag is None and working_tag.applies_to(txn.booking_date):
-        proposal = proposal.model_copy(update={"tag": working_tag.tag})
-
-    # 8. Synthesize a rule from the proposal if the user asked to save it.
-    new_rule: CategorizationRule | None = None
-    new_rules_list = working_rules
-    if proposal.save_as_rule and proposal.action == "categorize":
-        new_rule = _derive_rule(txn, proposal)
-        if new_rule is not None:
-            new_rules_list = [*working_rules, new_rule]
-
-    # 9. Compute tag-state delta. User intent dominates: a user `set`/`clear`
-    # is recorded verbatim. Otherwise we fall back to the auto-clear that
-    # fires when `once` mode expires or `duration` runs past `until_date`.
-    next_tag = _advance_tag(working_tag, txn.booking_date)
-    tag_delta: TagStateDelta | None = None
-    if user_tag_delta is not None:
-        tag_delta = user_tag_delta
-    elif next_tag != working_tag and working_tag is not None:
-        tag_delta = TagStateDelta(op="clear")
-
+    # Finalise: build result, optional merge prompt, claim entry.
+    # `_resolve_proposal` always sets `state.proposal` on this path —
+    # the assert is a contract pin for type-checkers.
+    assert state.proposal is not None
     result = _build_result(
         txn=txn,
         bank=bank,
-        proposal=proposal,
+        proposal=state.proposal,
         existing=existing,
-        matched_rule=rule,
+        matched_rule=state.rule,
         is_replay=False,
-        new_rule=new_rule,
-        tag_state_delta=tag_delta,
+        new_rule=state.new_rule,
+        tag_state_delta=state.tag_delta,
         min_score=config.matching.min_score,
-        match_txn=match_txn,
+        match_txn=state.match_txn,
     )
 
-    # 10. Merge prompt — fires only when the auto-decision would change
-    # an existing entry. The host (cli.py) renders Screen 3 and returns
-    # one of six outcomes; the helper rewrites the result accordingly.
+    new_rules_list = list(state.working_rules)
     if (
         merge_fn is not None
         and result.action == "update"
@@ -532,22 +417,337 @@ def _process_transaction(
                 matched_entry=result.matched_entry,
                 proposed_changes=tuple(result.proposed_changes),
                 progress=progress,
-                active_tag=working_tag,
+                active_tag=state.working_tag,
             )
         )
         result, new_rules_list = _apply_merge_decision(
-            result, merge_decision, txn, bank, working_rules
+            result, merge_decision, txn, bank, list(state.working_rules)
         )
 
-    # 11. Claim the matched entry from the bucket only on outcomes that
-    # actually consume it. `update` (auto-merge or user-confirmed) and
-    # silent `keep` both land here with `action == "update"` and a set
-    # `matched_entry`; the user-driven `skip`/`block`/`import_new`/`quit`
-    # outcomes have already cleared `matched_entry` in `_apply_merge_decision`
-    # and must NOT remove the entry from the bucket — a subsequent
-    # identical CSV row needs to still see it.
+    # Claim the matched entry only on outcomes that actually consume it
+    # (see `_claim_matched_entry`).
     _claim_matched_entry(result, existing)
-    return result, next_tag, new_rules_list
+    return result, state.next_tag, new_rules_list
+
+
+# ── Phase helpers (state in, state or terminal out) ──────────────────────────
+
+
+def _resolve_rule(state: _TxnState) -> _TxnState:
+    """Look up the matching rule and pre-rewrite the txn for matching.
+
+    Dedup and the scorer compare against existing entries that were
+    written with rule overrides applied, so the txn side has to mirror
+    those overrides for the texts to line up. Without this pre-rewrite,
+    the second import of a rule-affected row content-hash-mismatches its
+    own previously-written entry and gets re-prompted. Replay still wins
+    over rules — it's a stronger signal — but it short-circuits before
+    we get here.
+    """
+    rule = find_matching_rule(state.txn, list(state.working_rules))
+    return state.evolve(rule=rule, match_txn=_apply_rule_overrides(state.txn, rule))
+
+
+def _short_circuit(
+    state: _TxnState,
+    *,
+    decisions: DecisionLog,
+    existing: list[LedgerEntry],
+    existing_all: list[LedgerEntry],
+    csv_by_bank: dict[str, list[SourceTransaction]],
+    matchers: list[MatcherHook],
+    config,
+) -> ImportResult | _TxnState:
+    """Try the four short-circuit paths in order, returning the first hit.
+
+    Returns an `ImportResult` if a path fires (the caller emits it as the
+    txn's terminal outcome), or the (possibly evolved) state if every
+    path falls through. The matcher path may evolve state with a
+    `matcher_proposal` even when it doesn't short-circuit.
+    """
+    replay = _try_replay(state, decisions=decisions, existing=existing, config=config)
+    if replay is not None:
+        return replay
+
+    dedup = _try_dedup(state, existing=existing)
+    if dedup is not None:
+        return dedup
+
+    skip = _try_skip_pattern(state, config=config)
+    if skip is not None:
+        return skip
+
+    return _try_matcher(
+        state,
+        matchers=matchers,
+        csv_by_bank=csv_by_bank,
+        existing=existing,
+        existing_all=existing_all,
+    )
+
+
+def _try_replay(
+    state: _TxnState,
+    *,
+    decisions: DecisionLog,
+    existing: list[LedgerEntry],
+    config,
+) -> ImportResult | None:
+    """If a past decision matches this txn, reproduce its result."""
+    replayed = decisions.lookup(state.txn)
+    if replayed is None:
+        return None
+    result = _build_result(
+        txn=state.txn,
+        bank=state.bank,
+        proposal=replayed,
+        existing=existing,
+        matched_rule=None,
+        is_replay=True,
+        new_rule=None,
+        tag_state_delta=None,
+        min_score=config.matching.min_score,
+        match_txn=state.match_txn,
+    )
+    _claim_matched_entry(result, existing)
+    return result
+
+
+def _try_dedup(
+    state: _TxnState,
+    *,
+    existing: list[LedgerEntry],
+) -> ImportResult | None:
+    """Drop confirmed duplicates and claim the matched entry.
+
+    Without claiming, two identical CSVs would both point at entry A
+    and leave entry B looking like a CSV-orphan in the preview report.
+    """
+    assert state.match_txn is not None  # set by _resolve_rule
+    duplicate = find_duplicate(state.match_txn, existing)
+    if duplicate is None:
+        return None
+    existing.remove(duplicate)
+    return ImportResult(
+        source_txn=state.txn,
+        action="skip",
+        proposal=None,
+        skip_reason="duplicate",
+        matched_entry=duplicate,
+    )
+
+
+def _try_skip_pattern(state: _TxnState, *, config) -> ImportResult | None:
+    """Hard suppression — `skip_update_patterns` drops the proposal entirely."""
+    if not _matches_skip_pattern(config.skip_update_patterns, state.txn):
+        return None
+    return ImportResult(
+        source_txn=state.txn,
+        action="skip",
+        proposal=None,
+        skip_reason="skip_rule",
+    )
+
+
+def _try_matcher(
+    state: _TxnState,
+    *,
+    matchers: list[MatcherHook],
+    csv_by_bank: dict[str, list[SourceTransaction]],
+    existing: list[LedgerEntry],
+    existing_all: list[LedgerEntry],
+) -> ImportResult | _TxnState:
+    """Cross-source matchers: skip-when-already-booked or rewrite_target.
+
+    On `skip` outcomes, claim the matched entry across both bucket views
+    so a parallel CSV row doesn't re-attribute to it. On `rewrite_target`,
+    stash the synthesized proposal on state and let the proposal phase
+    pick it up; the categorizer is bypassed for this txn.
+    """
+    outcome = first_outcome(matchers, state.txn, csv_by_bank, existing_all)
+    if outcome is None:
+        return state
+    if outcome.kind == "skip":
+        # Shipped matchers always set `matched_entry` on a skip outcome
+        # and pull it from `existing_all`; the protocol allows None for
+        # forward-compat with heuristic matchers that skip without
+        # naming an entry. The bank-scoped bucket may or may not contain
+        # it (cross-source matchers usually return an entry on a
+        # different bank).
+        matched = outcome.matched_entry
+        if matched is None:  # pragma: no cover - defensive
+            pass
+        else:
+            existing_all.remove(matched)
+            if matched in existing:
+                existing.remove(matched)
+        return ImportResult(
+            source_txn=state.txn,
+            action="skip",
+            proposal=None,
+            skip_reason="cross_source_match",
+            matched_entry=matched,
+        )
+    return state.evolve(matcher_proposal=_proposal_from_outcome(outcome, state.txn))
+
+
+def _score_candidates(
+    state: _TxnState,
+    *,
+    existing: list[LedgerEntry],
+    min_score: float,
+) -> _TxnState:
+    """Score the rule-rewritten txn against `existing` and stash candidates."""
+    assert state.match_txn is not None
+    candidates = find_candidates(state.match_txn, existing, min_score=min_score)
+    return state.evolve(candidates=tuple(candidates))
+
+
+def _resolve_proposal(
+    state: _TxnState,
+    *,
+    config,
+    existing: list[LedgerEntry],
+    existing_all: list[LedgerEntry],
+    bank: BankConfig,
+    auto_threshold: float | None,
+    categorize_fn: CategorizeFn,
+) -> _TxnState:
+    """Choose the proposal source.
+
+    Order of precedence (each falls through if it doesn't apply):
+    1. Matcher rewrite (`rewrite_target` outcome) — ground truth from
+       cross-source data, preempts both auto-threshold and the prompt.
+    2. Auto-threshold + rule — high-confidence candidate match with a
+       rule attached, applied without a prompt.
+    3. Pipeline silent-skip — seed proposal would produce no diff
+       against the matched entry; the user has nothing to consent to.
+    4. `categorize_fn` — the user (or a stub) chooses.
+    """
+    if state.matcher_proposal is not None:
+        return state.evolve(proposal=state.matcher_proposal)
+
+    if (
+        auto_threshold is not None
+        and state.candidates
+        and state.candidates[0][1] >= auto_threshold
+        and state.rule is not None
+    ):
+        return state.evolve(proposal=_proposal_from_rule(state.rule))
+
+    silent = _silent_skip_proposal(
+        state.rule, state.candidates, config.matching.min_delta
+    )
+    if silent is not None:
+        return state.evolve(proposal=silent)
+
+    from beancount_importer.matching.account_suggest import rank_accounts
+
+    suggested = state.rule.target_account if state.rule is not None else None
+    hints, _ = rank_accounts(
+        state.txn, list(state.candidates), existing_all, suggested_target=suggested
+    )
+    # Diagnostic near-misses: only computed when nothing crossed the
+    # threshold, so the screens can render an explanatory line above the
+    # hotkeys instead of leaving the user guessing why dedup didn't
+    # silent-skip the row.
+    assert state.match_txn is not None
+    near_misses = (
+        _compute_near_misses(
+            state.match_txn,
+            in_bucket=existing,
+            cross_bucket=existing_all,
+            bank_account=bank.account,
+            min_score=config.matching.min_score,
+        )
+        if not state.candidates
+        else ()
+    )
+    context = CategorizeContext(
+        txn=state.txn,
+        rules=state.working_rules,
+        candidates=state.candidates,
+        matched_rule=state.rule,
+        account_hints=tuple(hints),
+        active_tag=state.working_tag,
+        existing_entries=tuple(existing_all),
+        source_account=bank.account,
+        progress=state.progress,
+        near_misses=near_misses,
+        seed_proposal=_seed_proposal(state.rule, state.candidates),
+        is_ambiguous=(
+            state.rule is None
+            and _is_ambiguous_match(state.candidates, config.matching.min_delta)
+        ),
+    )
+    return state.evolve(proposal=categorize_fn(context))
+
+
+def _apply_transforms(state: _TxnState, transforms_hooks) -> _TxnState:
+    """Run rule-driven transform hooks against the proposal."""
+    if state.rule is None or state.proposal is None:
+        return state
+    return state.evolve(
+        proposal=apply_transforms(transforms_hooks, state.proposal, state.txn, state.rule)
+    )
+
+
+def _apply_user_tag_delta(state: _TxnState) -> _TxnState:
+    """Fold a Screen-1 `[t]` outcome into the working tag.
+
+    The proposal arrives with `tag_state_delta` set; we stash the delta
+    and update `working_tag` BEFORE the auto-stamp step so this txn
+    picks up the new tag. The delta also surfaces on the result later
+    (via `_compute_tag_delta`) for persistence.
+    """
+    assert state.proposal is not None
+    delta = state.proposal.tag_state_delta
+    if delta is None:
+        return state.evolve(user_tag_delta=None)
+    if delta.op == "set":
+        return state.evolve(user_tag_delta=delta, working_tag=delta.new_state)
+    # delta.op == "clear"
+    return state.evolve(user_tag_delta=delta, working_tag=None)
+
+
+def _stamp_active_tag(state: _TxnState) -> _TxnState:
+    """Stamp the active tag onto the proposal if applicable."""
+    assert state.proposal is not None
+    tag = state.working_tag
+    if tag is None or state.proposal.tag is not None:
+        return state
+    if not tag.applies_to(state.txn.booking_date):
+        return state
+    return state.evolve(proposal=state.proposal.model_copy(update={"tag": tag.tag}))
+
+
+def _maybe_save_as_rule(state: _TxnState) -> _TxnState:
+    """Synthesize a rule from the proposal if the user asked to save it."""
+    assert state.proposal is not None
+    if not (state.proposal.save_as_rule and state.proposal.action == "categorize"):
+        return state
+    new_rule = _derive_rule(state.txn, state.proposal)
+    if new_rule is None:
+        return state
+    return state.evolve(
+        new_rule=new_rule,
+        working_rules=(*state.working_rules, new_rule),
+    )
+
+
+def _compute_tag_delta(state: _TxnState) -> _TxnState:
+    """Compute the persisted tag-state delta + the next-txn working tag.
+
+    User intent dominates: a user `set` / `clear` is recorded verbatim.
+    Otherwise we fall back to the auto-clear that fires when `once`
+    mode expires or `duration` runs past `until_date`.
+    """
+    next_tag = _advance_tag(state.working_tag, state.txn.booking_date)
+    if state.user_tag_delta is not None:
+        return state.evolve(next_tag=next_tag, tag_delta=state.user_tag_delta)
+    if next_tag != state.working_tag and state.working_tag is not None:
+        return state.evolve(next_tag=next_tag, tag_delta=TagStateDelta(op="clear"))
+    return state.evolve(next_tag=next_tag, tag_delta=None)
 
 
 def _apply_merge_decision(
