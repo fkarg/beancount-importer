@@ -1152,14 +1152,14 @@ class TestExpandedCounts:
                 stderr = ""
             return R()
 
-        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
-        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
+        monkeypatch.setattr("beancount_importer.pipeline.preview.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.preview.subprocess.run", fake_run)
         stats = compute_bean_provenance_stats(session, base)
         assert stats[("Assets:B:SPK", 2024)].bean_expanded == 42
 
     def test_returns_zero_when_bean_query_missing(self, tmp_path: Path, monkeypatch):
         session, base = self._setup(tmp_path)
-        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: None)
+        monkeypatch.setattr("beancount_importer.pipeline.preview.shutil.which", lambda _: None)
         stats = compute_bean_provenance_stats(session, base)
         assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
@@ -1169,11 +1169,11 @@ class TestExpandedCounts:
         # Remove year filter
         cfg = session.config
         session_no_year = ImportSession(config=cfg, options=ImportOptions())
-        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.preview.shutil.which", lambda _: "/usr/bin/bean-query")
         # Subprocess.run MUST NOT be called.
         called = []
         monkeypatch.setattr(
-            "beancount_importer.pipeline.subprocess.run",
+            "beancount_importer.pipeline.preview.subprocess.run",
             lambda *a, **kw: called.append(a) or (_ for _ in ()).throw(AssertionError("should not run")),
         )
         stats = compute_bean_provenance_stats(session_no_year, base)
@@ -1186,10 +1186,10 @@ class TestExpandedCounts:
         session, base = self._setup(tmp_path)
         # Delete the placeholder main bean
         (base / "main.2024.bean").unlink()
-        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.preview.shutil.which", lambda _: "/usr/bin/bean-query")
         called = []
         monkeypatch.setattr(
-            "beancount_importer.pipeline.subprocess.run",
+            "beancount_importer.pipeline.preview.subprocess.run",
             lambda *a, **kw: called.append(a),
         )
         stats = compute_bean_provenance_stats(session, base)
@@ -1206,8 +1206,8 @@ class TestExpandedCounts:
                 stderr = "boom"
             return R()
 
-        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
-        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
+        monkeypatch.setattr("beancount_importer.pipeline.preview.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.preview.subprocess.run", fake_run)
         stats = compute_bean_provenance_stats(session, base)
         assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
@@ -1218,8 +1218,8 @@ class TestExpandedCounts:
         def raising(*args, **kwargs):
             raise sp.TimeoutExpired(cmd="bean-query", timeout=30)
 
-        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
-        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", raising)
+        monkeypatch.setattr("beancount_importer.pipeline.preview.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.preview.subprocess.run", raising)
         # Must not propagate the TimeoutExpired.
         stats = compute_bean_provenance_stats(session, base)
         assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
@@ -1232,8 +1232,8 @@ class TestExpandedCounts:
         def raising(*args, **kwargs):
             raise FileNotFoundError("bean-query")
 
-        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
-        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", raising)
+        monkeypatch.setattr("beancount_importer.pipeline.preview.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.preview.subprocess.run", raising)
         stats = compute_bean_provenance_stats(session, base)
         assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
@@ -1249,8 +1249,8 @@ class TestExpandedCounts:
                 stderr = ""
             return R()
 
-        monkeypatch.setattr("beancount_importer.pipeline.shutil.which", lambda _: "/usr/bin/bean-query")
-        monkeypatch.setattr("beancount_importer.pipeline.subprocess.run", fake_run)
+        monkeypatch.setattr("beancount_importer.pipeline.preview.shutil.which", lambda _: "/usr/bin/bean-query")
+        monkeypatch.setattr("beancount_importer.pipeline.preview.subprocess.run", fake_run)
         stats = compute_bean_provenance_stats(session, base)
         assert stats[("Assets:B:SPK", 2024)].bean_expanded == 0
 
