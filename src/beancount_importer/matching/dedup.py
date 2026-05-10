@@ -8,14 +8,22 @@ intentionally don't appear in the hash so the two sides are
 comparable. The pipeline's per-bank bucketing in
 `_process_transaction`'s caller is what enforces the bank match.
 
-Description-vs-narration: we hash on raw description on the txn side
-and narration on the entry side. They line up *iff* the user hasn't
-edited the bean file's narration after the first import. Edits break
-dedup — that's a real risk for users who clean up their ledgers, but
-the cure (storing the original raw description as metadata on every
-entry) costs more than it pays. Cash withdrawals and other
-SEPA-less rows fall back to this hash; everything with a SEPA ref
-sails through the fast path.
+Two-key match: each side produces a SET of candidate keys (always a
+content hash, plus a `sepa:<ref>` key when one is available), and a
+duplicate is declared when the sets intersect. This handles the
+common case where the CSV row carries a SEPA reference but the
+existing bean entry — written by an importer that doesn't emit
+`sepa_ref` metadata — only has the content-hash key. Without the
+fallback, every SEPA-bearing row whose existing entry lacks the
+metadata gets re-prompted on every import.
+
+Description-vs-narration: the content hash uses raw description on the
+txn side and narration on the entry side. They line up *iff* the user
+hasn't edited the bean file's narration after the first import. Edits
+break the content-hash path — that's a real risk for users who clean
+up their ledgers, but the cure (storing the original raw description
+on every entry) costs more than it pays. The SEPA path survives
+narration edits as long as `sepa_ref` is present somewhere.
 """
 
 from __future__ import annotations
@@ -26,7 +34,13 @@ from beancount_importer.models import SourceTransaction, LedgerEntry
 
 
 def dedup_key(txn: SourceTransaction) -> str:
-    """Primary dedup key: SEPA reference if present, else content hash."""
+    """Primary dedup key: SEPA reference if present, else content hash.
+
+    Kept for callers that want a single canonical key (e.g. logging or
+    tests). Dedup itself uses `_txn_keys` / `_entry_keys`, which
+    return *all* candidate keys so a SEPA-bearing txn still matches
+    an entry that only carries the content-hash key.
+    """
     if txn.sepa_reference:
         return f"sepa:{txn.sepa_reference}"
     return _content_hash(txn)
@@ -44,6 +58,29 @@ def _content_hash(txn: SourceTransaction) -> str:
     return f"hash:{digest}"
 
 
+def _txn_keys(txn: SourceTransaction) -> set[str]:
+    keys = {_content_hash(txn)}
+    if txn.sepa_reference:
+        keys.add(f"sepa:{txn.sepa_reference}")
+    return keys
+
+
+def _entry_keys(entry: LedgerEntry) -> set[str]:
+    parts = "|".join([
+        str(entry.date),
+        str(entry.amount),
+        entry.currency,
+        entry.payee or "",
+        entry.narration,
+    ])
+    digest = hashlib.sha256(parts.encode()).hexdigest()[:16]
+    keys = {f"hash:{digest}"}
+    sepa = entry.metadata.get("sepa_ref") or entry.metadata.get("sepa_reference", "")
+    if sepa:
+        keys.add(f"sepa:{sepa}")
+    return keys
+
+
 def is_duplicate(txn: SourceTransaction, existing: list[LedgerEntry]) -> bool:
     """Return True if any existing entry has the same dedup key.
 
@@ -56,30 +93,15 @@ def is_duplicate(txn: SourceTransaction, existing: list[LedgerEntry]) -> bool:
 def find_duplicate(
     txn: SourceTransaction, existing: list[LedgerEntry]
 ) -> LedgerEntry | None:
-    """Return the first entry whose key matches `txn`, or None.
+    """Return the first entry whose keys overlap `txn`'s, or None.
 
     Used by the pipeline to "claim" the matched entry — without it,
     two identical CSV rows would both dedup-skip pointing at the
     *same* entry, leaving its sibling looking like a CSV-orphan in
     the preview report.
     """
-    key = dedup_key(txn)
+    keys = _txn_keys(txn)
     for entry in existing:
-        if _entry_key(entry) == key:
+        if keys & _entry_keys(entry):
             return entry
     return None
-
-
-def _entry_key(entry: LedgerEntry) -> str:
-    sepa = entry.metadata.get("sepa_ref") or entry.metadata.get("sepa_reference", "")
-    if sepa:
-        return f"sepa:{sepa}"
-    parts = "|".join([
-        str(entry.date),
-        str(entry.amount),
-        entry.currency,
-        entry.payee or "",
-        entry.narration,
-    ])
-    digest = hashlib.sha256(parts.encode()).hexdigest()[:16]
-    return f"hash:{digest}"

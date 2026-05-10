@@ -204,6 +204,25 @@ class TestIsDuplicate:
         )
         assert is_duplicate(txn, [entry])
 
+    def test_detects_match_when_txn_has_sepa_but_entry_lacks_metadata(self):
+        # Real-world regression: the writer doesn't emit `sepa_ref`
+        # metadata, so a re-import of a SEPA-bearing CSV row used to
+        # silently miss its own previously-imported entry — the txn
+        # side keyed `sepa:X` while the entry side fell through to
+        # the content hash. Dedup now compares key *sets*, so the
+        # shared content hash catches this case.
+        txn = make_txn(
+            sepa_reference="1034114065753",
+            payee="PayPal Europe S.a.r.l. et Cie S.C.A",
+            description="1034114065753/. Uber, Ihr Einkauf bei Uber FOLGELASTSCHRIFT",
+        )
+        entry = make_entry(
+            payee="PayPal Europe S.a.r.l. et Cie S.C.A",
+            narration="1034114065753/. Uber, Ihr Einkauf bei Uber FOLGELASTSCHRIFT",
+            metadata={},
+        )
+        assert is_duplicate(txn, [entry])
+
     def test_detects_content_match_when_payee_only_differs_in_capitalisation(self):
         # Sanity: hashes are case-sensitive (we don't normalise here —
         # that's the scorer's job). If a user lowercased the payee in
