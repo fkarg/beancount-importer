@@ -32,7 +32,7 @@ from beancount_importer.matching.registry import (
     first_outcome,
     load_matchers,
 )
-from beancount_importer.matching.scorer import find_candidates
+from beancount_importer.matching.scorer import DEFAULT_MAX_DATE_DAYS, find_candidates
 from beancount_importer.models import (
     CategoryProposal,
     ImportResult,
@@ -52,6 +52,29 @@ from beancount_importer.transforms import apply_transforms, load_transforms
 
 
 # ── Public types ──────────────────────────────────────────────────────────────
+
+
+class NearMiss(BaseModel):
+    """A close-but-not-quite match surfaced for diagnostic display.
+
+    Computed by the pipeline only when no real candidates land — exists
+    purely to give the user a readable answer to "why is this row being
+    prompted instead of dedup-skipped?".
+
+    Two reasons:
+    - `below_threshold`: same source-account bucket, scored under `min_score`.
+      Usually means rule-cleaned narration drifted under the cutoff.
+    - `different_bucket`: same currency + |amount| within date tolerance, but
+      the entry's `source_account` doesn't match the txn's bank. Catches the
+      sub-account case (entry on `Assets:B:SPK:Checking` while txn buckets
+      to `Assets:B:SPK`) and other misfiled placements.
+    """
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    entry: LedgerEntry
+    score: float
+    reason: Literal["below_threshold", "different_bucket"]
 
 
 class CategorizeContext(BaseModel):
@@ -76,6 +99,9 @@ class CategorizeContext(BaseModel):
     # the screen-driven categorizer to render the headline + state header.
     source_account: str = ""
     progress: tuple[int, int] = (0, 0)
+    # Diagnostic-only: populated only when `candidates` is empty, surfaces
+    # why the user is being prompted instead of seeing a silent skip.
+    near_misses: tuple[NearMiss, ...] = ()
 
 
 CategorizeFn = Callable[[CategorizeContext], CategoryProposal]
@@ -380,6 +406,16 @@ def _process_transaction(
 ) -> tuple[ImportResult, ActiveTag | None, list[CategorizationRule]]:
     """Process one txn, returning the result + updated tag + updated rules list."""
 
+    # 0. Look the rule up first. The result is used to *rewrite* the txn
+    # for matching: dedup and the scorer compare against existing entries
+    # that were written with rule overrides applied, so the txn side has
+    # to apply the same overrides for the texts to line up. Without this,
+    # the second import of any rule-affected row content-hash-mismatches
+    # its own previously-written entry and gets re-prompted. Replay still
+    # short-circuits ahead of rules — it's a stronger signal.
+    rule = find_matching_rule(txn, working_rules)
+    match_txn = _apply_rule_overrides(txn, rule)
+
     # 1. Replay log takes precedence over everything else.
     replayed = decisions.lookup(txn)
     if replayed is not None:
@@ -393,6 +429,7 @@ def _process_transaction(
             new_rule=None,
             tag_state_delta=None,
             min_score=config.matching.min_score,
+            match_txn=match_txn,
         )
         return result, _advance_tag(working_tag, txn.booking_date), working_rules
 
@@ -401,7 +438,7 @@ def _process_transaction(
     # identical CSV row doesn't re-claim the same entry — without
     # this, two identical CSVs would both point at entry A and leave
     # entry B looking like a CSV-orphan in the preview report.
-    duplicate = find_duplicate(txn, existing)
+    duplicate = find_duplicate(match_txn, existing)
     if duplicate is not None:
         existing.remove(duplicate)
         return (
@@ -449,10 +486,10 @@ def _process_transaction(
         # rewrite_target: synthesize a proposal that bypasses the categorizer.
         matcher_proposal = _proposal_from_outcome(matcher_outcome, txn)
 
-    # 5. Find rule + ranked candidates.
-    rule = find_matching_rule(txn, working_rules)
+    # 5. Score candidates (using the rule-rewritten txn so cleaned narration
+    # / payee on the entry side compares against equivalently cleaned text).
     candidates = find_candidates(
-        txn, existing, min_score=config.matching.min_score
+        match_txn, existing, min_score=config.matching.min_score
     )
 
     # 6. Choose the proposal source. Matcher rewrites are authoritative — they
@@ -475,6 +512,21 @@ def _process_transaction(
         hints, _ = rank_accounts(
             txn, candidates, existing_all, suggested_target=suggested
         )
+        # Diagnostic near-misses: only computed when nothing crossed the
+        # threshold, so the screens can render an explanatory line above
+        # the hotkeys instead of leaving the user guessing why dedup didn't
+        # silent-skip the row.
+        near_misses = (
+            _compute_near_misses(
+                match_txn,
+                in_bucket=existing,
+                cross_bucket=existing_all,
+                bank_account=bank.account,
+                min_score=config.matching.min_score,
+            )
+            if not candidates
+            else ()
+        )
         context = CategorizeContext(
             txn=txn,
             rules=tuple(working_rules),
@@ -485,6 +537,7 @@ def _process_transaction(
             existing_entries=tuple(existing_all),
             source_account=bank.account,
             progress=progress,
+            near_misses=near_misses,
         )
         proposal = categorize_fn(context)
 
@@ -535,6 +588,7 @@ def _process_transaction(
         new_rule=new_rule,
         tag_state_delta=tag_delta,
         min_score=config.matching.min_score,
+        match_txn=match_txn,
     )
 
     # 10. Merge prompt — fires only when the auto-decision would change
@@ -714,7 +768,15 @@ def _build_result(
     new_rule: CategorizationRule | None,
     tag_state_delta: TagStateDelta | None,
     min_score: float,
+    match_txn: SourceTransaction | None = None,
 ) -> ImportResult:
+    """Assemble the per-row result.
+
+    `match_txn` carries any rule-driven payee/narration overrides used during
+    candidate scoring; if omitted (e.g. on the replay path that doesn't
+    pre-rewrite), we fall back to the raw `txn`. The split lets the call site
+    own the rule semantics without duplicating overrides logic here.
+    """
     if proposal.action == "skip":
         return ImportResult(
             source_txn=txn,
@@ -733,7 +795,8 @@ def _build_result(
         )
 
     # categorize action: decide new vs. update by inspecting top candidate.
-    candidates = find_candidates(txn, existing, min_score=min_score)
+    score_txn = match_txn if match_txn is not None else txn
+    candidates = find_candidates(score_txn, existing, min_score=min_score)
     best: LedgerEntry | None = candidates[0][0] if candidates else None
     action = "update" if best is not None else "new"
 
@@ -767,6 +830,88 @@ def _build_result(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _apply_rule_overrides(
+    txn: SourceTransaction, rule: CategorizationRule | None
+) -> SourceTransaction:
+    """Return a copy of `txn` with rule-driven payee/narration overrides folded in.
+
+    Rules can set `override_payee` / `override_narration`; when they do, the
+    importer writes those values into the ledger entry it creates. Dedup and
+    candidate scoring need to compare like-with-like, so the txn's matching
+    fields are pre-substituted to mirror what would land on disk. When the
+    rule sets neither override (or no rule fires), the original txn is
+    returned unchanged. Identity-preserving so caller code can compare via
+    `is` for a quick "did anything change?" check.
+    """
+    if rule is None:
+        return txn
+    overrides: dict[str, str] = {}
+    if rule.override_payee:
+        overrides["payee"] = rule.override_payee
+    if rule.override_narration:
+        overrides["description"] = rule.override_narration
+    return txn.model_copy(update=overrides) if overrides else txn
+
+
+def _compute_near_misses(
+    txn: SourceTransaction,
+    *,
+    in_bucket: list[LedgerEntry],
+    cross_bucket: list[LedgerEntry],
+    bank_account: str,
+    min_score: float,
+) -> tuple[NearMiss, ...]:
+    """Surface the closest "almost-a-match" entry for diagnostic display.
+
+    Two passes, each contributing at most one entry so the screens render a
+    single explanatory line. The order — in-bucket first — reflects the more
+    common cause of unexpected re-prompting (text drifted under `min_score`)
+    and yields a more actionable hint than the cross-bucket case.
+
+    The cross-bucket pass deliberately skips entries with `amount_inferred`
+    (cross-bank transit legs handled by the scorer's reversed-sign path) so
+    the diagnostic doesn't double up on a relationship the scorer already
+    surfaces via candidates.
+    """
+    misses: list[NearMiss] = []
+
+    # In-bucket: same source_account, scorer ran but everything fell below
+    # min_score. Re-score with no floor and pick the best below the cutoff.
+    below = find_candidates(txn, in_bucket, min_score=0.0)
+    for entry, score in below:
+        if score < min_score:
+            misses.append(NearMiss(entry=entry, score=score, reason="below_threshold"))
+            break
+
+    # Cross-bucket: an entry with the same currency + |amount| within date
+    # tolerance lives on a *different* source_account. Catches sub-account
+    # placements (`Assets:B:SPK:Checking` when the txn buckets to
+    # `Assets:B:SPK`) without claiming or otherwise touching the entry.
+    target_amount = abs(txn.amount)
+    closest: tuple[int, LedgerEntry] | None = None
+    for entry in cross_bucket:
+        if entry.source_account == bank_account:
+            continue
+        if entry.amount_inferred:
+            continue
+        if entry.currency != txn.currency:
+            continue
+        if abs(entry.amount) != target_amount:
+            continue
+        days = abs((entry.date - txn.booking_date).days)
+        if days > DEFAULT_MAX_DATE_DAYS:
+            continue
+        if closest is None or days < closest[0]:
+            closest = (days, entry)
+    if closest is not None:
+        # Synthesize a confidence figure analogous to the scorer's date
+        # proximity term so the screen can render a single comparable score.
+        score = 1.0 - (closest[0] / DEFAULT_MAX_DATE_DAYS)
+        misses.append(NearMiss(entry=closest[1], score=score, reason="different_bucket"))
+
+    return tuple(misses)
 
 
 def _advance_tag(tag: ActiveTag | None, booking_date) -> ActiveTag | None:

@@ -451,3 +451,75 @@ class TestRun:
         assert decision.proposal is not None
         # Edit-before-[c] preserved.
         assert decision.proposal.narration == "Coffee Roma"
+
+
+# ── Near-miss diagnostic rendering ───────────────────────────────────────────
+
+
+from beancount_importer.categorizer.confirm import render_near_misses
+from beancount_importer.pipeline import NearMiss
+
+
+def _miss_below() -> NearMiss:
+    return NearMiss(
+        entry=LedgerEntry(
+            date=date(2024, 4, 2),
+            narration="dim narration",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Fitness:Gym",
+            amount=Decimal("-49.50"),
+            currency="EUR",
+        ),
+        score=0.31,
+        reason="below_threshold",
+    )
+
+
+def _miss_elsewhere() -> NearMiss:
+    return NearMiss(
+        entry=LedgerEntry(
+            date=date(2024, 4, 2),
+            narration="—",
+            source_account="Assets:B:SPK:Checking",
+            target_account="Expenses:Fitness:Gym",
+            amount=Decimal("-49.50"),
+            currency="EUR",
+        ),
+        score=1.0,
+        reason="different_bucket",
+    )
+
+
+class TestNearMissRendering:
+    def test_empty_renders_nothing(self):
+        console = _console()
+        render_near_misses(console, (), "Assets:B:SPK")
+        assert console.export_text() == ""
+
+    def test_below_threshold_renders_score_and_threshold_note(self):
+        console = _console()
+        render_near_misses(console, (_miss_below(),), "Assets:B:SPK")
+        out = console.export_text()
+        assert "Closest existing on" in out
+        assert "Assets:B:SPK" in out
+        assert "0.31" in out
+        assert "below threshold" in out
+
+    def test_different_bucket_names_the_other_account(self):
+        console = _console()
+        render_near_misses(console, (_miss_elsewhere(),), "Assets:B:SPK")
+        out = console.export_text()
+        assert "Same amount/date elsewhere" in out
+        assert "Assets:B:SPK:Checking" in out
+        assert "not in this bank's bucket" in out
+
+    def test_both_render_in_order(self):
+        console = _console()
+        render_near_misses(
+            console,
+            (_miss_below(), _miss_elsewhere()),
+            "Assets:B:SPK",
+        )
+        out = console.export_text()
+        # below_threshold line precedes different_bucket line
+        assert out.index("Closest existing") < out.index("Same amount/date")

@@ -9,9 +9,15 @@ from beancount_importer.models import LedgerEntry, SourceTransaction
 
 # Tunable: candidates further apart than this are not considered.
 DEFAULT_MAX_DATE_DAYS = 14
-# Score weights: text contributes the most, date proximity is a tie-breaker.
-TEXT_WEIGHT = 0.7
-DATE_WEIGHT = 0.3
+# Score weights: amount equality is a hard filter (no weight), so the variable
+# part is text + date proximity. Weighted equally so a same-day, zero-overlap
+# row still scores 0.5 — well above the default `min_score=0.35`. With the
+# previous 0.7/0.3 split a same-day row with rule-cleaned narration would
+# score 0.30 and silently fail to find its own existing entry. Raising the
+# date weight reflects how much identifying signal the booking date already
+# carries when the amount has already passed the hard filter.
+TEXT_WEIGHT = 0.5
+DATE_WEIGHT = 0.5
 SEPA_BONUS = 0.5  # added (then clipped to 1.0) when SEPA refs match exactly
 # Cross-bank "transit" matches (entries where the source posting was inferred
 # by beancount, e.g. the PayPal leg of an SPK→PayPal transfer) compare a

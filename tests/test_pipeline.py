@@ -26,6 +26,10 @@ from beancount_importer.pipeline import (
     compute_bean_provenance_stats,
     run,
 )
+from beancount_importer.pipeline import (
+    _apply_rule_overrides,
+    _compute_near_misses,
+)
 from beancount_importer.replay import DecisionLog
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.tags import ActiveTag, TagState
@@ -1624,3 +1628,265 @@ class TestHasCsvMatch:
         stats = compute_bean_provenance_stats(session, tmp_path)
         assert stats[("Assets:B:SPK", 2024)].bean_unmatched == 1
 
+
+# ── Rule-rewrite for matching ─────────────────────────────────────────────────
+
+
+from beancount_importer.models import LedgerEntry, SourceTransaction
+
+
+def _make_txn(
+    *,
+    booking_date: date = date(2024, 4, 2),
+    amount: Decimal = Decimal("-49.50"),
+    currency: str = "EUR",
+    bank_key: str = "spk",
+    payee: str | None = "Frankfurter Turn-u.Sport- Gemeinschaft 1847 j.P.",
+    description: str | None = "0614870/Vereinsbeitrag FTG Frankfurt FOLGELASTSCHRIFT",
+) -> SourceTransaction:
+    return SourceTransaction(
+        booking_date=booking_date,
+        amount=amount,
+        currency=currency,
+        bank_key=bank_key,
+        payee=payee,
+        description=description,
+    )
+
+
+class TestApplyRuleOverrides:
+    """Rule-driven payee/narration substitution used by dedup + scoring."""
+
+    def test_no_rule_returns_identity(self):
+        txn = _make_txn()
+        assert _apply_rule_overrides(txn, None) is txn
+
+    def test_rule_without_overrides_returns_identity(self):
+        # `target_account` set, but no override_payee / override_narration —
+        # the txn should be returned unchanged so callers can short-circuit.
+        rule = CategorizationRule(
+            target_account="Expenses:Fitness:Gym",
+            payee_pattern="FTG",
+        )
+        txn = _make_txn()
+        assert _apply_rule_overrides(txn, rule) is txn
+
+    def test_payee_override_substitutes_payee(self):
+        rule = CategorizationRule(
+            target_account="Expenses:Fitness:Gym",
+            payee_pattern="FTG",
+            override_payee="FTG Frankfurt",
+        )
+        txn = _make_txn()
+        rewritten = _apply_rule_overrides(txn, rule)
+        assert rewritten.payee == "FTG Frankfurt"
+        assert rewritten.description == txn.description  # untouched
+        assert rewritten.amount == txn.amount  # untouched
+
+    def test_narration_override_substitutes_description(self):
+        # Rules write into `entry.narration` via `override_narration`; the
+        # match-side mirror substitutes into `txn.description` (the field the
+        # scorer concatenates with payee for text similarity).
+        rule = CategorizationRule(
+            target_account="Expenses:Fitness:Gym",
+            payee_pattern="FTG",
+            override_narration="FTG monthly dues",
+        )
+        txn = _make_txn()
+        rewritten = _apply_rule_overrides(txn, rule)
+        assert rewritten.description == "FTG monthly dues"
+        assert rewritten.payee == txn.payee
+
+
+class TestPipelineRuleRewriteForDedup:
+    """End-to-end: an entry written with rule overrides applied dedups against
+    its raw CSV row on the next import. Without the rewrite, the txn-side
+    content hash uses raw payee/description while the entry-side uses the
+    rule-cleaned versions, and dedup silently misses.
+    """
+
+    def test_dedup_catches_rule_cleaned_entry_on_second_import(
+        self, tmp_path: Path
+    ):
+        # SPK.bean: an entry written previously with the rule applied —
+        # cleaned payee + raw narration (the user kept the description).
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-04-02 * "FTG Frankfurt" "0614870/Vereinsbeitrag FTG Frankfurt FOLGELASTSCHRIFT"
+              Assets:B:SPK  -49.50 EUR
+              Expenses:Fitness:Gym  49.50 EUR
+        """))
+        # CSV: same row, raw payee.
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "02.04.24;Frankfurter Turn-u.Sport- Gemeinschaft 1847 j.P.;"
+            "0614870/Vereinsbeitrag FTG Frankfurt FOLGELASTSCHRIFT;-49,50;EUR;\n"
+        )
+        rule = CategorizationRule(
+            target_account="Expenses:Fitness:Gym",
+            payee_pattern="FTG|Frankfurter Turn",
+            override_payee="FTG Frankfurt",
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, rules=(rule,), options=ImportOptions())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 1
+        # Dedup should have caught it via the rewritten txn's content hash.
+        assert results[0].action == "skip"
+        assert results[0].skip_reason == "duplicate"
+
+
+class TestComputeNearMisses:
+    """The diagnostic helper that surfaces "almost-a-match" entries."""
+
+    def test_below_threshold_in_bucket(self):
+        txn = _make_txn()
+        # An entry on the same bucket with same amount/date but text that
+        # makes the score land below `min_score`. Scorer's date_proximity
+        # term gives 0.5 (DATE_WEIGHT) plus a tiny text contribution; with
+        # min_score raised high enough we force a below-threshold result.
+        in_bucket = [
+            LedgerEntry(
+                date=date(2024, 4, 2),
+                narration="totally different",
+                source_account="Assets:B:SPK",
+                target_account="Expenses:Fitness:Gym",
+                amount=Decimal("-49.50"),
+                currency="EUR",
+                payee="totally different",
+            ),
+        ]
+        misses = _compute_near_misses(
+            txn,
+            in_bucket=in_bucket,
+            cross_bucket=in_bucket,
+            bank_account="Assets:B:SPK",
+            min_score=0.95,
+        )
+        assert len(misses) == 1
+        assert misses[0].reason == "below_threshold"
+        assert misses[0].score < 0.95
+
+    def test_different_bucket(self):
+        txn = _make_txn()
+        # Same amount/currency/date, but on a sub-account the bucket lookup
+        # never reaches.
+        elsewhere = LedgerEntry(
+            date=date(2024, 4, 2),
+            narration="FTG",
+            source_account="Assets:B:SPK:Checking",
+            target_account="Expenses:Fitness:Gym",
+            amount=Decimal("-49.50"),
+            currency="EUR",
+        )
+        misses = _compute_near_misses(
+            txn,
+            in_bucket=[],
+            cross_bucket=[elsewhere],
+            bank_account="Assets:B:SPK",
+            min_score=0.35,
+        )
+        assert any(m.reason == "different_bucket" for m in misses)
+        diff = next(m for m in misses if m.reason == "different_bucket")
+        assert diff.entry.source_account == "Assets:B:SPK:Checking"
+
+    def test_skips_amount_inferred_cross_bucket(self):
+        # Inferred-amount entries are cross-bank transit legs the scorer
+        # already handles via reversed-sign matching — surfacing them as
+        # "different bucket" would be misleading double-counting.
+        txn = _make_txn()
+        transit = LedgerEntry(
+            date=date(2024, 4, 2),
+            narration="PayPal",
+            source_account="Assets:B:PayPal",
+            target_account="Assets:B:SPK",
+            amount=Decimal("49.50"),
+            currency="EUR",
+            amount_inferred=True,
+        )
+        misses = _compute_near_misses(
+            txn,
+            in_bucket=[],
+            cross_bucket=[transit],
+            bank_account="Assets:B:SPK",
+            min_score=0.35,
+        )
+        assert all(m.reason != "different_bucket" for m in misses)
+
+    def test_no_misses_when_nothing_close(self):
+        txn = _make_txn()
+        misses = _compute_near_misses(
+            txn,
+            in_bucket=[],
+            cross_bucket=[],
+            bank_account="Assets:B:SPK",
+            min_score=0.35,
+        )
+        assert misses == ()
+
+
+class TestPipelineNearMissesPlumbing:
+    """The pipeline only computes near-misses when no real candidates land."""
+
+    def test_near_misses_populated_when_no_candidates(self, tmp_path: Path):
+        # Existing entry on a sub-account so the scorer's bucket misses it
+        # but the cross-bucket diagnostic catches it.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Netflix Abo"
+              Assets:B:SPK:Checking  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        (tmp_path / "SPK_jan.csv").write_text(textwrap.dedent("""\
+            Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz
+            15.01.24;Netflix;Netflix Abo;-15,99;EUR;
+        """))
+        captured: list[CategorizeContext] = []
+
+        def categ(ctx: CategorizeContext) -> CategoryProposal:
+            captured.append(ctx)
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Streaming"),),
+            )
+
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        run(session, tmp_path, categ, NoopReporter())
+        assert len(captured) == 1
+        misses = captured[0].near_misses
+        assert any(m.reason == "different_bucket" for m in misses)
+
+    def test_near_misses_empty_when_candidates_exist(self, base_dir: Path):
+        # An existing entry close enough to score above threshold but not
+        # an exact content-hash match (dedup misses, scorer catches). The
+        # diagnostic must stay quiet on rows that had at least one
+        # candidate — it's only meant for "nothing landed" cases.
+        (base_dir / "transactions").mkdir()
+        (base_dir / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Old narration"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        captured: list[CategorizeContext] = []
+
+        def categ(ctx: CategorizeContext) -> CategoryProposal:
+            captured.append(ctx)
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Streaming"),),
+            )
+
+        session = make_session(base_dir)
+        run(session, base_dir, categ, NoopReporter())
+        netflix = next(c for c in captured if c.txn.payee == "Netflix")
+        assert netflix.candidates  # scorer found the entry
+        assert netflix.near_misses == ()

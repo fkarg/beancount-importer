@@ -39,6 +39,12 @@ from beancount_importer.models import (
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.tags import ActiveTag
 
+# Avoid an import cycle by typing through a TYPE_CHECKING shim — `pipeline`
+# imports from `categorizer/host` which imports this module.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from beancount_importer.pipeline import NearMiss
+
 
 @dataclass(frozen=True)
 class ConfirmContext:
@@ -65,6 +71,11 @@ class ConfirmContext:
     # the string variant above drives the per-screen state header only.
     current_active_tag: ActiveTag | None = None
     similar_upcoming: int = 0
+    # Diagnostic-only: rendered above the hotkey row when no entry was
+    # matched. Surfaces *why* the user is being prompted instead of seeing
+    # a silent skip — usually a sub-account placement or rule-cleaned text
+    # that drifted under `min_score`.
+    near_misses: tuple[NearMiss, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,6 +133,7 @@ def render(console: Console, ctx: ConfirmContext) -> None:
     _render_provenance(console, ctx)
     _render_raw_block(console, ctx)
     _render_will_write_block(console, ctx)
+    render_near_misses(console, ctx.near_misses, ctx.bank_account)
     _render_hotkeys(console, ctx)
     bottom_rule(console)
 
@@ -241,6 +253,40 @@ def _render_will_write_field(
     else:
         suffix = " [dim](new)[/]"
     console.print(f"    {label_padded}[yellow]{rendered}[/]{suffix}")
+
+
+def render_near_misses(
+    console: Console,
+    near_misses: tuple,
+    bank_account: str,
+) -> None:
+    """Render at most one diagnostic line per `NearMiss`.
+
+    Shared by Screen 1 (`confirm`) and Screen 2 (`pick`) so the reasons
+    surface identically regardless of which prompt the user lands on.
+    `bank_account` is the txn's source-side account, used to make the
+    `different_bucket` line concretely tell the user *which* bucket the
+    closer entry was supposed to be in.
+    """
+    if not near_misses:
+        return
+    for miss in near_misses:
+        if miss.reason == "below_threshold":
+            console.print(
+                f"  [yellow]⚠[/]  Closest existing on [dim]{bank_account}[/]: "
+                f"{miss.entry.date.isoformat()} "
+                f"{miss.entry.amount:+} {miss.entry.currency} "
+                f"[dim](score {miss.score:.2f}, below threshold)[/]"
+            )
+        else:  # different_bucket
+            console.print(
+                f"  [yellow]⚠[/]  Same amount/date elsewhere: "
+                f"[dim]{miss.entry.source_account}[/] "
+                f"{miss.entry.date.isoformat()} "
+                f"{miss.entry.amount:+} {miss.entry.currency} "
+                f"[dim](not in this bank's bucket)[/]"
+            )
+    console.print()
 
 
 def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:

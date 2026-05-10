@@ -319,6 +319,7 @@ def _run_confirm(
             active_tag=ctx.active_tag.tag if ctx.active_tag else None,
             tag_remaining=_tag_remaining(ctx),
             current_active_tag=ctx.active_tag,
+            near_misses=ctx.near_misses if matched_entry is None else (),
         )
         decision = run_confirm(console, confirm_ctx)
         if decision.action != "change_account":
@@ -403,6 +404,7 @@ def _ask_pick(console: Console, ctx: CategorizeContext) -> PickDecision:
         year=ctx.txn.booking_date.year,
         active_tag=ctx.active_tag.tag if ctx.active_tag else None,
         tag_remaining=_tag_remaining(ctx),
+        near_misses=ctx.near_misses,
     )
     return run_pick(console, pick_ctx)
 

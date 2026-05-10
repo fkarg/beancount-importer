@@ -26,6 +26,7 @@ from typing import Literal
 from rich.console import Console
 from rich.prompt import Prompt
 
+from beancount_importer.categorizer.confirm import render_near_misses
 from beancount_importer.categorizer.header import HeaderContext, render_header
 from beancount_importer.categorizer.screen import (
     ask_hotkey,
@@ -34,6 +35,10 @@ from beancount_importer.categorizer.screen import (
     styled_account,
 )
 from beancount_importer.models import LedgerEntry, SourceTransaction
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from beancount_importer.pipeline import NearMiss
 
 
 # How many suggestions land on the top screen. The design doc settles on 5
@@ -57,6 +62,7 @@ class PickContext:
     year: int = 0
     active_tag: str | None = None
     tag_remaining: int | None = None
+    near_misses: tuple[NearMiss, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,7 @@ def render(console: Console, ctx: PickContext) -> None:
     console.print()
 
     _render_suggestions(console, ctx)
+    render_near_misses(console, ctx.near_misses, ctx.bank_account)
     _render_hotkeys(console)
     bottom_rule(console)
 
