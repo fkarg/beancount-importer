@@ -431,6 +431,7 @@ def _process_transaction(
             min_score=config.matching.min_score,
             match_txn=match_txn,
         )
+        _claim_matched_entry(result, existing)
         return result, _advance_tag(working_tag, txn.booking_date), working_rules
 
     # 2. Drop confirmed duplicates entirely. Claim the matched entry
@@ -614,6 +615,15 @@ def _process_transaction(
         result, new_rules_list = _apply_merge_decision(
             result, merge_decision, txn, bank, working_rules
         )
+
+    # 11. Claim the matched entry from the bucket only on outcomes that
+    # actually consume it. `update` (auto-merge or user-confirmed) and
+    # silent `keep` both land here with `action == "update"` and a set
+    # `matched_entry`; the user-driven `skip`/`block`/`import_new`/`quit`
+    # outcomes have already cleared `matched_entry` in `_apply_merge_decision`
+    # and must NOT remove the entry from the bucket — a subsequent
+    # identical CSV row needs to still see it.
+    _claim_matched_entry(result, existing)
     return result, next_tag, new_rules_list
 
 
@@ -804,14 +814,6 @@ def _build_result(
     new_entry_text = ""
     if best is not None:
         proposed_changes = _diff_changes(best, proposal, matched_rule)
-        # Claim the matched entry from the bucket the caller passed in,
-        # so a subsequent identical CSV row pairs with a different
-        # entry. Without this the multi-match case (two identical CSVs
-        # + two identical bean entries) would both attribute to the
-        # same entry, leaving its sibling orphan in the bean-side
-        # provenance count. `best` is guaranteed to be in `existing`
-        # because `find_candidates` selects from it.
-        existing.remove(best)
     else:
         new_entry_text = _format_new_entry(bank, txn, proposal)
 
@@ -830,6 +832,21 @@ def _build_result(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _claim_matched_entry(result: ImportResult, bucket: list[LedgerEntry]) -> None:
+    """Remove the matched entry from `bucket` if `result` actually consumed it.
+
+    Called once per txn after the merge prompt has resolved (or after the
+    replay path emits its result). Only `update` outcomes consume an entry —
+    `skip`/`new`/`quit` either declined to use the candidate or never had
+    one. Without this gating, a user-driven `import_new` / `skip` / `block`
+    decision would silently drop the matched entry from the in-session
+    bucket, leaving subsequent identical CSV rows unable to find it.
+    """
+    if result.action != "update" or result.matched_entry is None:
+        return
+    bucket.remove(result.matched_entry)
 
 
 def _apply_rule_overrides(

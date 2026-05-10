@@ -379,3 +379,191 @@ class TestBlockRuleEdges:
         if r.action == "skip" and r.skip_reason == "user_blocked":
             # The block degraded gracefully — no rule synthesized.
             assert r.new_rule is None
+
+
+# ── Claim-ordering regression: matched entry stays in bucket on declines ──────
+
+
+def _write_one_entry_two_csv(tmp_path: Path) -> Path:
+    """Setup: 1 bean entry + 2 identical CSV rows that produce non-empty diff.
+
+    Both CSV rows match the bean entry under the `min_score` threshold and
+    propose payee/narration changes, so the merge prompt fires. The two
+    CSVs are byte-identical; the bucket has one entry to claim.
+    """
+    csv = tmp_path / "SPK_2024.csv"
+    csv.write_text(
+        "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung\n"
+        "09.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
+        "09.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
+    )
+    bean_dir = tmp_path / "transactions"
+    bean_dir.mkdir()
+    bean = bean_dir / "SPK.bean"
+    bean.write_text(
+        textwrap.dedent("""\
+        2024-03-09 * "Spotify" "Music subscription"
+          Assets:B:SPK            -15.00 EUR
+          Expenses:Subscriptions
+        """)
+    )
+    return tmp_path
+
+
+class TestClaimOrderingOnDeclineDecisions:
+    """The matched entry must stay in the bucket when the user *declines*
+    to consume it — `skip`, `block`, `import_new`, `quit`. Pre-fix, the
+    claim ran inside `_build_result` before the merge prompt resolved, so
+    a subsequent identical CSV row had nothing left to match against and
+    silently degraded to `action=new` instead of re-prompting.
+    """
+
+    def test_skip_leaves_entry_for_subsequent_identical_csv(self, tmp_path: Path):
+        _write_one_entry_two_csv(tmp_path)
+        calls: list[str] = []
+
+        def merge_fn(ctx: MergeContext) -> MergeDecision:
+            calls.append("called")
+            return MergeDecision(action="skip")
+
+        results = run(
+            _session(tmp_path),
+            tmp_path,
+            _categorize_to("Expenses:Subscriptions"),
+            NoopReporter(),
+            merge_fn=merge_fn,
+        )
+        assert len(results) == 2
+        # Both rows reached the merge prompt; the second only does so if
+        # the first didn't claim the entry.
+        assert len(calls) == 2
+        assert all(r.action == "skip" and r.skip_reason == "user_skipped" for r in results)
+
+    def test_block_leaves_entry_for_subsequent_identical_csv(self, tmp_path: Path):
+        # First row: prompts → block → installs a `suppress_updates` rule
+        # AND skips. Second row: matches the rule, finds the bucket entry
+        # still there, scores it, and lands as a silent zero-diff update
+        # (suppress_updates → empty proposed_changes, merge prompt
+        # short-circuited). Pre-fix, the bucket had been emptied by row
+        # 1's premature claim, so row 2 found no candidates and emitted
+        # `action=new` instead — observably different.
+        _write_one_entry_two_csv(tmp_path)
+        calls = 0
+
+        def merge_fn(ctx: MergeContext) -> MergeDecision:
+            nonlocal calls
+            calls += 1
+            return MergeDecision(action="block")
+
+        results = run(
+            _session(tmp_path),
+            tmp_path,
+            _categorize_to("Expenses:Subscriptions"),
+            NoopReporter(),
+            merge_fn=merge_fn,
+        )
+        assert len(results) == 2
+        # Merge prompt fires once (row 1 only); row 2 is suppressed by
+        # the rule before reaching the prompt.
+        assert calls == 1
+        assert results[0].action == "skip"
+        assert results[0].skip_reason == "user_blocked"
+        # Row 2 silently consumed the entry — the regression check.
+        assert results[1].action == "update"
+        assert results[1].matched_entry is not None
+        assert results[1].proposed_changes == []
+
+    def test_import_new_leaves_entry_for_subsequent_identical_csv(self, tmp_path: Path):
+        # `import_new` says "this is a fresh entry, the candidate was a
+        # false match". The bucket entry must remain so a *third* row
+        # could legitimately match it. Here we use 2 identical CSVs +
+        # 1 entry: both rows hit the merge prompt and end up as `new`,
+        # because the second row also still sees the candidate.
+        _write_one_entry_two_csv(tmp_path)
+        calls = 0
+
+        def merge_fn(ctx: MergeContext) -> MergeDecision:
+            nonlocal calls
+            calls += 1
+            return MergeDecision(action="import_new")
+
+        results = run(
+            _session(tmp_path),
+            tmp_path,
+            _categorize_to("Expenses:Subscriptions"),
+            NoopReporter(),
+            merge_fn=merge_fn,
+        )
+        assert len(results) == 2
+        # Pre-fix the second row degraded to plain `new` without firing
+        # merge_fn (because the bucket had been emptied by row 1's
+        # premature claim). Post-fix, both rows fire the prompt.
+        assert calls == 2
+        assert all(r.action == "new" and r.matched_entry is None for r in results)
+
+
+class TestClaimOrderingOnConsumingDecisions:
+    """When the user *does* consume the entry — `update` or silent `keep` —
+    a subsequent identical CSV row must NOT re-claim the same entry.
+    Two identical CSVs + two identical bean entries should pair 1:1.
+    """
+
+    def _two_entries_two_csv(self, tmp_path: Path) -> None:
+        csv = tmp_path / "SPK_2024.csv"
+        csv.write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung\n"
+            "09.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
+            "09.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
+        )
+        bean_dir = tmp_path / "transactions"
+        bean_dir.mkdir()
+        # Two identical bean entries differing only by line position —
+        # the writer emits unique `(file_path, line_start)` pairs.
+        bean = bean_dir / "SPK.bean"
+        bean.write_text(
+            textwrap.dedent("""\
+            2024-03-09 * "Spotify" "Music subscription"
+              Assets:B:SPK            -15.00 EUR
+              Expenses:Subscriptions
+
+            2024-03-09 * "Spotify" "Music subscription"
+              Assets:B:SPK            -15.00 EUR
+              Expenses:Subscriptions
+            """)
+        )
+
+    def test_update_pairs_distinct_entries(self, tmp_path: Path):
+        self._two_entries_two_csv(tmp_path)
+        merge_fn = lambda ctx: MergeDecision(action="update")  # noqa: E731
+        results = run(
+            _session(tmp_path),
+            tmp_path,
+            _categorize_to("Expenses:Subscriptions"),
+            NoopReporter(),
+            merge_fn=merge_fn,
+        )
+        assert len(results) == 2
+        keys = [
+            (r.matched_entry.file_path, r.matched_entry.line_start)
+            for r in results
+            if r.matched_entry is not None
+        ]
+        assert len(keys) == 2 and len(set(keys)) == 2
+
+    def test_keep_pairs_distinct_entries(self, tmp_path: Path):
+        self._two_entries_two_csv(tmp_path)
+        merge_fn = lambda ctx: MergeDecision(action="keep")  # noqa: E731
+        results = run(
+            _session(tmp_path),
+            tmp_path,
+            _categorize_to("Expenses:Subscriptions"),
+            NoopReporter(),
+            merge_fn=merge_fn,
+        )
+        assert len(results) == 2
+        keys = [
+            (r.matched_entry.file_path, r.matched_entry.line_start)
+            for r in results
+            if r.matched_entry is not None
+        ]
+        assert len(keys) == 2 and len(set(keys)) == 2
