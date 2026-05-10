@@ -2252,3 +2252,221 @@ class TestNNPairingViaCandidates:
         # One skip (dedup), two new — order depends on iteration but
         # the multiset is fixed.
         assert sorted(actions) == ["new", "new", "skip"]
+
+
+# ── Edge cases: near-miss diagnostic, auto-threshold, skip-claim, empty state ─
+
+
+class TestNearMissRealWorld:
+    """Realistic near-miss scenarios. The existing `_compute_near_misses`
+    tests force `min_score=0.95` to manufacture a below-threshold result;
+    these use the production default 0.35 and demonstrate the diagnostic
+    fires on text drift alone.
+    """
+
+    def test_text_drift_produces_below_threshold_miss(self):
+        # Real-world drift: same amount, but text and date have
+        # diverged enough that the score lands below the production
+        # default min_score=0.35. We use distinct gibberish tokens
+        # (token_set_ratio is sensitive even to short shared tokens
+        # like "a"/"the") and a 13-day offset to keep date_proximity
+        # near zero. Score ~0.08 — well below 0.35.
+        txn = _make_txn(
+            booking_date=date(2024, 4, 2),
+            payee="qqqqq",
+            description="zzzzz",
+        )
+        in_bucket = [
+            LedgerEntry(
+                date=date(2024, 4, 15),
+                payee="alpha",
+                narration="beta",
+                source_account="Assets:B:SPK",
+                target_account="Expenses:Misc",
+                amount=Decimal("-49.50"),
+                currency="EUR",
+            )
+        ]
+        misses = _compute_near_misses(
+            txn,
+            in_bucket=in_bucket,
+            cross_bucket=in_bucket,
+            bank_account="Assets:B:SPK",
+            min_score=0.35,
+        )
+        assert len(misses) == 1
+        assert misses[0].reason == "below_threshold"
+        assert misses[0].score < 0.35
+
+    def test_emits_at_most_one_below_threshold_and_one_different_bucket(self):
+        # Cap-of-2 contract: one near-miss per reason. Setup both a
+        # below-threshold in-bucket entry and a different-bucket entry
+        # → the helper returns exactly two NearMiss objects, one of
+        # each reason. The break-after-first-hit in each pass is what
+        # prevents a flood of diagnostic noise.
+        txn = _make_txn(
+            booking_date=date(2024, 4, 2),
+            amount=Decimal("-49.50"),
+            payee="qqqqq",
+            description="zzzzz",
+        )
+        # In-bucket entry: same source_account, scores below threshold.
+        in_bucket_weak = LedgerEntry(
+            date=date(2024, 4, 15),
+            payee="alpha",
+            narration="beta",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Misc",
+            amount=Decimal("-49.50"),
+            currency="EUR",
+        )
+        # Cross-bucket entry: same date+amount on a sibling source
+        # account the bucket lookup never reaches.
+        cross_bucket_hit = LedgerEntry(
+            date=date(2024, 4, 2),
+            payee="FTG",
+            narration="FTG",
+            source_account="Assets:B:SPK:Checking",
+            target_account="Expenses:Fitness:Gym",
+            amount=Decimal("-49.50"),
+            currency="EUR",
+        )
+        misses = _compute_near_misses(
+            txn,
+            in_bucket=[in_bucket_weak],
+            cross_bucket=[in_bucket_weak, cross_bucket_hit],
+            bank_account="Assets:B:SPK",
+            min_score=0.35,
+        )
+        reasons = sorted(m.reason for m in misses)
+        assert reasons == ["below_threshold", "different_bucket"]
+
+
+class TestAutoThresholdRequiresRule:
+    """`auto_threshold` only short-circuits the categorize prompt when a
+    rule is *also* matched — without a rule there's no proposal to
+    auto-apply, so the categorize_fn must still run.
+    """
+
+    def test_high_score_without_rule_still_calls_categorize(self, tmp_path: Path):
+        # Strong candidate (clean exact match minus the SEPA ref) but no
+        # rule matches the row. categorize_fn must be invoked.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Netflix Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "16.01.24;Netflix;Netflix Abo Feb;-15,99;EUR;\n"
+        )
+        called: list = []
+
+        def categ(ctx):
+            called.append(ctx.txn)
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:From-Categ"),),
+            )
+
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        # auto_threshold set but no rules registered.
+        session = ImportSession(
+            config=cfg,
+            options=ImportOptions(auto_threshold=0.5),
+        )
+        run(session, tmp_path, categ, NoopReporter())
+        assert len(called) == 1
+
+
+class TestSkipPatternDoesNotClaim:
+    """A `skip_update_patterns` hit must not consume a candidate entry —
+    same family as Bug #1 (claim-only-when-consumed). Without the gate,
+    a subsequent row that legitimately matches the entry would lose its
+    candidate to a phantom claim.
+    """
+
+    def test_skip_pattern_does_not_claim_candidate(self, tmp_path: Path):
+        # Pattern fires on a row that *would* have a scoring candidate
+        # (text drift makes dedup miss). The skip_rule path returns
+        # before reaching `_build_result`, so the candidate must remain
+        # available — the assertion checks the matched_entry shape, but
+        # the deeper guarantee is that the bucket isn't mutated when
+        # the pattern wins.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Old narration"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        # CSV row's narration differs from the entry's → dedup misses,
+        # but a candidate would still score above min_score on payee+date.
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;Netflix;Different narration text;-15,99;EUR;\n"
+        )
+        skip_pattern = SkipUpdatePattern(
+            bank_key="spk",
+            field="payee",
+            pattern="Netflix",
+        )
+        session = make_session(tmp_path, skip_patterns=(skip_pattern,))
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 1
+        r = results[0]
+        # skip_rule path returns early — never inspects candidates,
+        # never sets matched_entry, never claims from the bucket.
+        assert r.action == "skip"
+        assert r.skip_reason == "skip_rule"
+        assert r.matched_entry is None
+
+
+class TestEmptyState:
+    """Pipeline contract holds at the empty edges — no CSV, no ledger,
+    or both — without crashes or surprising defaults.
+    """
+
+    def test_empty_csv_returns_no_results(self, tmp_path: Path):
+        # CSV file exists but has only a header row.
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+        )
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-01-15 * "Netflix" "Netflix Abo"
+              Assets:B:SPK  -15.99 EUR
+              Expenses:Streaming  15.99 EUR
+        """))
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert results == []
+
+    def test_empty_ledger_emits_all_rows_as_new(self, tmp_path: Path):
+        # Bean dir exists but is empty — every CSV row goes through
+        # categorize and lands as `action=new` with new_entry_text set.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "SPK_jan.csv").write_text(textwrap.dedent("""\
+            Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz
+            15.01.24;Netflix;Netflix Abo;-15,99;EUR;
+            16.01.24;Rewe;REWE Filiale;-42,50;EUR;
+        """))
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 2
+        assert all(r.action == "new" for r in results)
+        assert all(r.matched_entry is None for r in results)
+        assert all(r.new_entry_text for r in results)
+
+    def test_empty_csv_and_empty_ledger_no_error(self, tmp_path: Path):
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+        )
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert results == []
