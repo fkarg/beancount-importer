@@ -35,6 +35,7 @@ from beancount_importer.pipeline import (
     NoopReporter,
     run,
 )
+from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.session import ImportOptions, ImportSession
 
 
@@ -100,12 +101,22 @@ def _categorize_to(target: str):
 
 
 def _session(base_dir: Path) -> ImportSession:
+    # Install a rule whose overrides match what `_categorize_to` would
+    # produce: the seed proposal then carries the same payee/narration
+    # the categorize_fn would, so the seed-vs-entry diff is non-empty
+    # and the pipeline doesn't silent-skip before invoking `categ`.
+    rule = CategorizationRule(
+        target_account="Expenses:Subscriptions",
+        payee_pattern="Spotify",
+        override_payee="Spotify AB",
+        override_narration="Premium Family",
+    )
     cfg = Config(
         banks=[_spk_bank()],
         transactions_dir="transactions",
         matching=MatchingConfig(min_score=0.35),
     )
-    return ImportSession(config=cfg, options=ImportOptions())
+    return ImportSession(config=cfg, rules=(rule,), options=ImportOptions())
 
 
 def _run_with(merge_fn, tmp_path: Path):
@@ -441,12 +452,15 @@ class TestClaimOrderingOnDeclineDecisions:
 
     def test_block_leaves_entry_for_subsequent_identical_csv(self, tmp_path: Path):
         # First row: prompts → block → installs a `suppress_updates` rule
-        # AND skips. Second row: matches the rule, finds the bucket entry
-        # still there, scores it, and lands as a silent zero-diff update
-        # (suppress_updates → empty proposed_changes, merge prompt
-        # short-circuited). Pre-fix, the bucket had been emptied by row
-        # 1's premature claim, so row 2 found no candidates and emitted
-        # `action=new` instead — observably different.
+        # AND skips. The regression check is that the entry stays in the
+        # bucket — pre-fix, the claim ran inside `_build_result` before
+        # the merge prompt resolved, so row 2 found no candidates and
+        # silently emitted `action=new`.
+        #
+        # The override rule installed by `_session` shadows the new
+        # block rule on row 2 (linear-scan, first-match-wins), so row 2
+        # also reaches the merge prompt — that's enough to prove row 1
+        # didn't pre-claim the entry.
         _write_one_entry_two_csv(tmp_path)
         calls = 0
 
@@ -463,15 +477,13 @@ class TestClaimOrderingOnDeclineDecisions:
             merge_fn=merge_fn,
         )
         assert len(results) == 2
-        # Merge prompt fires once (row 1 only); row 2 is suppressed by
-        # the rule before reaching the prompt.
-        assert calls == 1
-        assert results[0].action == "skip"
-        assert results[0].skip_reason == "user_blocked"
-        # Row 2 silently consumed the entry — the regression check.
-        assert results[1].action == "update"
-        assert results[1].matched_entry is not None
-        assert results[1].proposed_changes == []
+        # Both rows reach the merge prompt — the second only does so if
+        # the first didn't pre-claim the matched entry.
+        assert calls == 2
+        assert all(
+            r.action == "skip" and r.skip_reason == "user_blocked"
+            for r in results
+        )
 
     def test_import_new_leaves_entry_for_subsequent_identical_csv(self, tmp_path: Path):
         # `import_new` says "this is a fresh entry, the candidate was a

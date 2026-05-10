@@ -47,99 +47,31 @@ from beancount_importer.pipeline import (
     CategorizeContext,
     MergeContext,
     MergeDecision,
-    _diff_changes,
 )
 
 
 def make_screen_categorizer(
     console: Console,
-    *,
-    min_delta: float = 0.15,
 ) -> Callable[[CategorizeContext], CategoryProposal]:
     """Return a `CategorizeFn` that drives Screens 1, 2, and 4.
 
-    `min_delta` is the minimum score gap between the top two candidates
-    that's still considered "decisive" — gaps smaller than this trigger
-    Screen 4 (ambiguous match selection). Default matches
-    `MatchingConfig.min_delta`. The closure has no other per-session
-    state — every call works from the `CategorizeContext` plus the
-    global `Console`.
+    The pipeline pre-computes silent-skip and ambiguity detection: by the
+    time `_fn` runs, we know there's a real choice to make. `ctx.is_ambiguous`
+    routes to Screen 4; `ctx.seed_proposal` (set when a rule matched or a
+    top candidate exists) seeds Screen 1; otherwise Path B (Screen 2 →
+    Screen 1) picks from scratch.
     """
 
     def _fn(ctx: CategorizeContext) -> CategoryProposal:
-        # Path A: a rule matched OR a top candidate exists. Build the
-        # provisional proposal first; the diff against the candidate
-        # set decides whether the user gets involved.
-        if ctx.matched_rule is not None or ctx.candidates:
-            proposal, kind, matched_entry = _initial_proposal(ctx)
-            ambiguous = (
-                ctx.matched_rule is None
-                and _is_ambiguous(ctx.candidates, min_delta)
-            )
-            # Silent-match check runs BEFORE the ambiguity check.
-            # When the candidates are ambiguous AND every one of them
-            # produces a zero diff against this proposal (e.g. two
-            # identical bean entries on the same date), there's no
-            # real choice — picking either is a no-op. Otherwise we
-            # only need to check the diff target (top candidate / the
-            # rule-side matched entry).
-            diff_targets = (
-                _ambiguous_set(ctx.candidates, min_delta)
-                if ambiguous
-                else _single_diff_target(matched_entry, ctx.candidates)
-            )
-            if diff_targets and all(
-                not _diff_changes(e, proposal, ctx.matched_rule)
-                for e in diff_targets
-            ):
-                return proposal
-
-            # Real ambiguity: at least one ambiguous candidate would
-            # actually produce a write. The user picks which existing
-            # entry this CSV row is supposed to pair with.
-            if ambiguous:
-                return _run_ambiguous(console, ctx)
-
-            return _run_confirm(console, ctx, proposal, kind, matched_entry)
-
-        # Path B: nothing to suggest. Screen 2 picks an account, then
-        # Screen 1 confirms. Skip/quit at either step short-circuits.
+        if ctx.is_ambiguous:
+            return _run_ambiguous(console, ctx)
+        if ctx.seed_proposal is not None:
+            kind = "auto_matched" if ctx.matched_rule is not None else "top_candidate"
+            matched_entry = ctx.candidates[0][0] if ctx.candidates else None
+            return _run_confirm(console, ctx, ctx.seed_proposal, kind, matched_entry)
         return _run_pick_then_confirm(console, ctx)
 
     return _fn
-
-
-def _ambiguous_set(
-    candidates: tuple[tuple, ...],
-    min_delta: float,
-) -> list:
-    """All candidates within `min_delta` of the top score.
-
-    The "ambiguous" set the user would see on Screen 4 — by checking
-    each one's diff against the proposal, we can prove silent-skip
-    is safe even when the scorer can't decide between them.
-    """
-    if not candidates:
-        return []
-    top_score = candidates[0][1]
-    return [
-        entry for (entry, score) in candidates
-        if (top_score - score) < min_delta
-    ]
-
-
-def _single_diff_target(matched_entry, candidates: tuple[tuple, ...]) -> list:
-    """The single entry the pipeline will diff this proposal against.
-
-    `matched_entry` is set on the `top_candidate` provenance; for
-    `auto_matched` we fall back to the top scorer candidate (the
-    pipeline's _process_transaction does the same fallback).
-    """
-    if matched_entry is not None:
-        return [matched_entry]
-    if candidates:
-        return [candidates[0][0]]
-    return []
 
 
 def make_screen_merge_fn(
@@ -189,21 +121,6 @@ def _merge_tag_remaining(ctx: MergeContext) -> int | None:
     return max(0, delta)
 
 
-def _is_ambiguous(
-    candidates: tuple[tuple, ...],
-    min_delta: float,
-) -> bool:
-    """Two or more candidates with the top scores within `min_delta`.
-
-    Single-candidate hits are unambiguous by definition. Wide gaps
-    (top is decisively better) are also unambiguous — the user gets
-    Screen 1 with the top entry's target reused.
-    """
-    if len(candidates) < 2:
-        return False
-    return (candidates[0][1] - candidates[1][1]) < min_delta
-
-
 # ── Path A0: ambiguous → Screen 4 → Screen 1 / Screen 2 ──────────────────────
 
 
@@ -247,47 +164,6 @@ def _run_ambiguous(
 
 
 # ── Path A: rule / top-candidate → Screen 1 ───────────────────────────────────
-
-
-def _initial_proposal(
-    ctx: CategorizeContext,
-):
-    """Build the seed proposal + Screen-1 kind when a rule or candidate hit.
-
-    Returns `(proposal, kind, matched_entry_or_None)`. Rule wins over
-    candidate — the user's authored override is more authoritative than
-    a fuzzy match's target reuse.
-    """
-    if ctx.matched_rule is not None:
-        rule = ctx.matched_rule
-        # When a rule fires AND the matcher found an existing entry,
-        # pass the entry through so Screen 1 can highlight which
-        # fields the rule actually changes. The kind stays
-        # `auto_matched` (the rule is the user-facing provenance);
-        # the entry is only used by the diff-aware "Will write" block.
-        candidate = ctx.candidates[0][0] if ctx.candidates else None
-        return (
-            CategoryProposal(
-                action="categorize",
-                postings=(Posting(account=rule.target_account),),
-                payee=rule.override_payee,
-                narration=rule.override_narration,
-                tag=rule.tag,
-                rule_used=rule,
-            ),
-            "auto_matched",
-            candidate,
-        )
-    # ctx.candidates is non-empty (Path A's other branch).
-    top_entry, _score = ctx.candidates[0]
-    return (
-        CategoryProposal(
-            action="categorize",
-            postings=(Posting(account=top_entry.target_account),),
-        ),
-        "top_candidate",
-        top_entry,
-    )
 
 
 def _run_confirm(

@@ -336,7 +336,7 @@ def main(
     categorize: CategorizeFn = (
         make_preview_categorizer()
         if preview
-        else make_screen_categorizer(console, min_delta=config.matching.min_delta)
+        else make_screen_categorizer(console)
     )
     # Preview is non-interactive; auto-merge mirrors today's behaviour by
     # passing no `merge_fn`. Real interactive runs get Screen 3 wired up.

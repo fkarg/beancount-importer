@@ -21,7 +21,11 @@ from beancount_importer.models import (
     LedgerEntry,
     SourceTransaction,
 )
-from beancount_importer.pipeline import CategorizeContext
+from beancount_importer.pipeline import (
+    CategorizeContext,
+    _is_ambiguous_match,
+    _seed_proposal,
+)
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.tags import ActiveTag
 
@@ -52,7 +56,15 @@ def _entry(target: str, amount: Decimal = Decimal("-12.50")) -> LedgerEntry:
     )
 
 
-def _ctx(**overrides) -> CategorizeContext:
+def _ctx(*, min_delta: float = 0.15, **overrides) -> CategorizeContext:
+    """Build a CategorizeContext mirroring what the pipeline would hand the host.
+
+    `seed_proposal` and `is_ambiguous` are derived from `matched_rule` +
+    `candidates` the same way `_process_transaction` does it. Tests that
+    want to override the routing flags directly can pass them in
+    `overrides`. Tests that want a different ambiguity threshold pass
+    `min_delta=`.
+    """
     base = {
         "txn": _txn(),
         "rules": (),
@@ -65,6 +77,15 @@ def _ctx(**overrides) -> CategorizeContext:
         "progress": (1, 10),
     }
     base.update(overrides)
+    base.setdefault(
+        "seed_proposal",
+        _seed_proposal(base["matched_rule"], base["candidates"]),
+    )
+    base.setdefault(
+        "is_ambiguous",
+        base["matched_rule"] is None
+        and _is_ambiguous_match(base["candidates"], min_delta),
+    )
     return CategorizeContext(**base)  # type: ignore[arg-type]
 
 
@@ -276,28 +297,6 @@ class TestChangeAccount:
         )
         assert proposal.action == "quit"
 
-    def test_silent_match_when_top_candidate_diff_is_empty(self, monkeypatch):
-        # The top candidate's target matches the seed proposal exactly,
-        # and the proposal carries no payee/narration override — so the
-        # diff is empty. Screen 1 must not fire; the pipeline should
-        # classify this as a silent "already matched" row. Real-world
-        # case: dedup missed (e.g. narration was hand-edited) but the
-        # scorer correctly identified the row.
-        def fail_if_called(*_args, **_kwargs):
-            raise AssertionError(
-                "Prompt.ask must NOT be called for silent-match rows"
-            )
-
-        monkeypatch.setattr("rich.prompt.Prompt.ask", fail_if_called)
-        existing = (_entry("Expenses:Food"),)
-        # No rule, but the candidate above min_score with matching target.
-        categorizer = make_screen_categorizer(_console())
-        proposal = categorizer(_ctx(candidates=((existing[0], 0.95),)))
-        # Returned proposal carries the candidate's target; pipeline will
-        # diff it against the same entry and produce empty changes.
-        assert proposal.action == "categorize"
-        assert proposal.target_account == "Expenses:Food"
-
     def test_screen_1_still_fires_when_diff_is_non_empty(self, monkeypatch):
         # If the seed proposal would actually change something on the
         # existing entry (e.g. rule overrides the payee), Screen 1 must
@@ -455,7 +454,7 @@ def test_existing_entries_with_blank_accounts_dont_pollute_counts(monkeypatch):
 
 
 class TestAmbiguous:
-    def _amb_ctx(self) -> CategorizeContext:
+    def _amb_ctx(self, *, min_delta: float = 0.15) -> CategorizeContext:
         # Two candidates within the default min_delta=0.15 — clearly
         # ambiguous. Different target accounts so the picked one is
         # observable in the resulting proposal.
@@ -475,7 +474,7 @@ class TestAmbiguous:
             amount=Decimal("-12.50"),
             currency="EUR",
         )
-        return _ctx(candidates=((c1, 0.90), (c2, 0.88)))
+        return _ctx(candidates=((c1, 0.90), (c2, 0.88)), min_delta=min_delta)
 
     def test_enter_picks_top_candidate_on_screen_4(self, monkeypatch):
         # Screen 4 enter == pick #1; Screen 1 enter confirms.
@@ -556,78 +555,24 @@ class TestAmbiguous:
         assert proposal.target_account == "Expenses:Rule"
         assert "Multiple ledger entries" not in console.export_text()
 
-    def test_min_delta_param_lowers_ambiguity_bar(self, monkeypatch):
+    def test_tight_min_delta_still_flags_ambiguous(self, monkeypatch):
         # With min_delta=0.05, the same 0.90/0.88 candidates still trip
-        # the ambiguity check (delta 0.02 < 0.05). Confirms the param
-        # actually flows.
+        # the ambiguity check (delta 0.02 < 0.05). The pipeline now owns
+        # the threshold — `_ctx(min_delta=...)` mirrors that here.
         monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("", ""))
         console = _console()
-        categorizer = make_screen_categorizer(console, min_delta=0.05)
-        categorizer(self._amb_ctx())
+        categorizer = make_screen_categorizer(console)
+        categorizer(self._amb_ctx(min_delta=0.05))
         assert "Multiple ledger entries" in console.export_text()
 
-    def test_min_delta_zero_disables_screen_4(self, monkeypatch):
+    def test_zero_min_delta_routes_to_screen_1(self, monkeypatch):
         # `min_delta=0.0` means "only show ambiguous when scores are
         # exactly equal" — the 0.90/0.88 case slips through to Screen 1.
         monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
         console = _console()
-        categorizer = make_screen_categorizer(console, min_delta=0.0)
-        categorizer(self._amb_ctx())
+        categorizer = make_screen_categorizer(console)
+        categorizer(self._amb_ctx(min_delta=0.0))
         assert "Multiple ledger entries" not in console.export_text()
-
-    def test_ambiguous_with_zero_diff_across_all_silently_returns(self, monkeypatch):
-        # Ambiguous-but-equivalent: two near-tied candidates whose
-        # target_accounts agree, paired against a seed proposal that
-        # carries no payee/narration override → every candidate produces
-        # an empty diff. There's no real choice to make; demanding the
-        # user pick one is busy-work. Screen 4 must NOT fire.
-        def fail_if_called(*_args, **_kwargs):
-            raise AssertionError(
-                "Prompt.ask must NOT fire when ambiguous candidates "
-                "all produce zero diff against the proposal"
-            )
-
-        monkeypatch.setattr("rich.prompt.Prompt.ask", fail_if_called)
-        # Two ambiguous candidates, IDENTICAL target_account, no rule
-        # → seed proposal targets the same account, diff is empty for
-        # both. (Real-world: two duplicate ledger entries on the same
-        # day for the same merchant.)
-        c1 = LedgerEntry(
-            date=date(2024, 3, 1),
-            payee="Coffee Shop",
-            narration="Latte",
-            source_account="Assets:B:SPK",
-            target_account="Expenses:Food",
-            amount=Decimal("-12.50"),
-            currency="EUR",
-        )
-        c2 = LedgerEntry(
-            date=date(2024, 3, 1),
-            payee="Coffee Shop",
-            narration="Latte",
-            source_account="Assets:B:SPK",
-            target_account="Expenses:Food",
-            amount=Decimal("-12.50"),
-            currency="EUR",
-        )
-        # Seed proposal carries no rule-driven payee/narration override;
-        # the entries' payee/narration match the txn's. _diff_changes
-        # will produce an empty list for both candidates, so the
-        # silent-skip gate fires before Screen 4 even considers running.
-        aligned_txn = SourceTransaction(
-            booking_date=date(2024, 3, 1),
-            amount=Decimal("-12.50"),
-            currency="EUR",
-            payee="Coffee Shop",
-            description="Latte",
-            bank_key="spk",
-        )
-        categorizer = make_screen_categorizer(_console())
-        proposal = categorizer(
-            _ctx(txn=aligned_txn, candidates=((c1, 0.90), (c2, 0.88)))
-        )
-        assert proposal.action == "categorize"
-        assert proposal.target_account == "Expenses:Food"
 
     def test_ambiguous_with_one_diff_target_still_fires_screen_4(self, monkeypatch):
         # The "all zero diff" gate must NOT mask real ambiguity.

@@ -1504,7 +1504,16 @@ class TestPipelineUpdateChanges:
 
     def test_payee_narration_account_diffs_proposed(self, tmp_path: Path):
         base = self._setup(tmp_path)
-        session = self._session_with(base)
+        # A rule with overrides ensures the seed proposal differs from
+        # the existing entry across all three fields, so the pipeline
+        # doesn't silent-skip before invoking categorize_fn.
+        session = self._session_with(
+            base,
+            target_account="Expenses:New",
+            payee_pattern="NewPayee",
+            override_payee="NewPayee",
+            override_narration="new narration",
+        )
 
         def categ(ctx):
             return CategoryProposal(
@@ -1571,10 +1580,16 @@ class TestPipelineUpdateChanges:
 
     def test_suppress_account_updates_drops_account_change(self, tmp_path: Path):
         base = self._setup(tmp_path)
+        # Overrides on the rule ensure the seed produces a non-empty
+        # diff (payee, narration) even with the account change
+        # suppressed — otherwise the pipeline silent-skips before
+        # categorize_fn fires.
         session = self._session_with(
             base,
             target_account="Expenses:New",
             payee_pattern="NewPayee",
+            override_payee="NewPayee",
+            override_narration="new narration",
             suppress_account_updates=True,
         )
 
@@ -1970,6 +1985,11 @@ class TestPipelineNearMissesPlumbing:
         # an exact content-hash match (dedup misses, scorer catches). The
         # diagnostic must stay quiet on rows that had at least one
         # candidate — it's only meant for "nothing landed" cases.
+        #
+        # A rule with override_narration ensures the seed proposal
+        # differs from the existing entry; without it the pipeline
+        # silent-skips before invoking categorize_fn and we never
+        # observe the context.
         (base_dir / "transactions").mkdir()
         (base_dir / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
             2024-01-15 * "Netflix" "Old narration"
@@ -1985,7 +2005,12 @@ class TestPipelineNearMissesPlumbing:
                 postings=(Posting(account="Expenses:Streaming"),),
             )
 
-        session = make_session(base_dir)
+        rule = CategorizationRule(
+            target_account="Expenses:Streaming",
+            payee_pattern="Netflix",
+            override_narration="Netflix Abo",
+        )
+        session = make_session(base_dir, rules=(rule,))
         run(session, base_dir, categ, NoopReporter())
         netflix = next(c for c in captured if c.txn.payee == "Netflix")
         assert netflix.candidates  # scorer found the entry
@@ -2344,13 +2369,18 @@ class TestNearMissRealWorld:
 
 class TestAutoThresholdRequiresRule:
     """`auto_threshold` only short-circuits the categorize prompt when a
-    rule is *also* matched — without a rule there's no proposal to
-    auto-apply, so the categorize_fn must still run.
+    rule is *also* matched — without a rule, the auto-apply path doesn't
+    fire. The fallback flow either silent-skips a clean match (no diff
+    against the candidate) or routes through `categorize_fn` for rows
+    that genuinely need user input.
     """
 
-    def test_high_score_without_rule_still_calls_categorize(self, tmp_path: Path):
+    def test_high_score_without_rule_silent_skips_clean_match(self, tmp_path: Path):
         # Strong candidate (clean exact match minus the SEPA ref) but no
-        # rule matches the row. categorize_fn must be invoked.
+        # rule. Without a rule, the seed proposal carries no overrides,
+        # so the diff against the matched entry is empty and the pipeline
+        # silent-skips before invoking `categorize_fn`. The result is a
+        # zero-change update — the user has nothing to consent to.
         (tmp_path / "transactions").mkdir()
         (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
             2024-01-15 * "Netflix" "Netflix Abo"
@@ -2380,8 +2410,61 @@ class TestAutoThresholdRequiresRule:
             config=cfg,
             options=ImportOptions(auto_threshold=0.5),
         )
-        run(session, tmp_path, categ, NoopReporter())
-        assert len(called) == 1
+        results = run(session, tmp_path, categ, NoopReporter())
+        # categorize_fn never fires — pipeline silent-skipped.
+        assert called == []
+        # Result is a no-op update against the matched entry.
+        assert len(results) == 1
+        assert results[0].action == "update"
+        assert results[0].proposed_changes == []
+        assert results[0].matched_entry is not None
+
+    def test_ambiguous_zero_diff_silent_skips(self, tmp_path: Path):
+        # Two near-tied candidates with identical target_accounts and
+        # matching payee/narration → every ambiguous candidate produces
+        # an empty diff against the seed proposal. There's no real
+        # choice to make; the pipeline must silent-skip rather than
+        # routing to Screen 4.
+        #
+        # The CSV row's narration differs from both entries' so dedup
+        # misses (otherwise the duplicate path would short-circuit
+        # ahead of silent-skip).
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
+            2024-03-01 * "Coffee Shop" "Latte"
+              Assets:B:SPK  -12.50 EUR
+              Expenses:Food  12.50 EUR
+
+            2024-03-02 * "Coffee Shop" "Latte"
+              Assets:B:SPK  -12.50 EUR
+              Expenses:Food  12.50 EUR
+        """))
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "01.03.24;Coffee Shop;Cappuccino;-12,50;EUR;\n"
+        )
+        called: list = []
+
+        def categ(ctx):
+            called.append(ctx.txn)
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Food"),),
+            )
+
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, categ, NoopReporter())
+        # categorize_fn never fires — pipeline silent-skipped both
+        # ambiguous candidates because all produce a zero diff.
+        assert called == []
+        assert len(results) == 1
+        assert results[0].action == "update"
+        assert results[0].proposed_changes == []
 
 
 class TestSkipPatternDoesNotClaim:
