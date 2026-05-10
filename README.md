@@ -237,14 +237,15 @@ enable it once per clone:
 uv run pre-commit install
 ```
 
+## WIP
+
+- audit rule-matching invariances against the reference implementation (some
+  rows the reference matches still don't match here)
+- internal refactor pass — see [docs/refactor-smells.md](docs/refactor-smells.md)
+
 ## Todo
 
-- fix double-counting of transaction count in summary overview
-- config file paths should be relative to finances root, not config file
-- add section for other _present_ .bean files
-- adapt cli to reference implementation, just much improved
-    - map out available tui options / paths and behavior
-    - reimplement those in better and much more modularly
 - add more expansive setup and 'help' modes (part of init) to reduce friction of getting started
 - pdf ocr input for provenance
+- fuzzy picker/filter for full account list (dependency: prompt_toolkit has been evaluated as a good fit before)
 
