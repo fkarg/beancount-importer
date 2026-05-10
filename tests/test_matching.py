@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from datetime import date
+from datetime import date, timedelta
 
 from beancount_importer.matching.normalize import normalize_text
 from beancount_importer.matching.scorer import similarity_score, levenshtein_distance, lcs_length
@@ -583,6 +583,86 @@ class TestScoreCandidateBonuses:
             make_entry(payee="Baz", narration="Qux", date=date(2024, 1, 22)),
         )
         assert score_candidate(txn, entry) > baseline
+
+
+# ── Score weights: the 0.5/0.5 text/date contract ───────────────────────────
+
+
+class TestScoreWeights:
+    """`scorer.TEXT_WEIGHT == DATE_WEIGHT == 0.5` is load-bearing.
+
+    The d166727 rebalance was chosen so that a same-day, zero-text-overlap
+    row scores 0.5 (above the default `min_score=0.35`), letting a
+    rule-cleaned narration that drifted away from the original CSV text
+    still find its existing entry. Pin the contract here — a regression
+    on the weights would silently re-prompt previously-imported rows.
+    """
+
+    def test_same_day_zero_text_overlap_scores_at_date_weight(self):
+        # Disjoint vocabulary on text → token_set_ratio == 0 → text == 0.
+        # Same booking date → date_proximity == 1.0 → score == DATE_WEIGHT.
+        txn = make_txn(
+            booking_date=date(2024, 1, 15),
+            payee="Alpha",
+            description="Beta",
+        )
+        entry = make_entry(
+            date=date(2024, 1, 15),
+            payee="",
+            narration="",
+        )
+        from beancount_importer.matching.scorer import DATE_WEIGHT
+
+        score = score_candidate(txn, entry)
+        assert score == DATE_WEIGHT
+        assert score == 0.5
+
+    def test_same_day_zero_text_overlap_clears_default_min_score(self):
+        # The whole point of the 0.5/0.5 split: such a row must be a
+        # candidate, not get filtered as "below threshold".
+        txn = make_txn(
+            booking_date=date(2024, 1, 15),
+            payee="Alpha",
+            description="Beta",
+        )
+        entry = make_entry(
+            date=date(2024, 1, 15),
+            payee="",
+            narration="",
+        )
+        candidates = find_candidates(txn, [entry], min_score=0.35)
+        assert len(candidates) == 1
+
+    def test_identical_same_day_scores_one(self):
+        # Both signals at maximum → ceiling at 1.0.
+        txn = make_txn(payee="Netflix", description="Netflix Abo")
+        entry = make_entry(payee="Netflix", narration="Netflix Abo")
+        assert score_candidate(txn, entry) == 1.0
+
+    def test_far_date_full_text_match_plateaus_at_text_weight(self):
+        # Full text overlap, max-distance date → date proximity floor
+        # → score should equal TEXT_WEIGHT.
+        from beancount_importer.matching.scorer import (
+            DEFAULT_MAX_DATE_DAYS,
+            TEXT_WEIGHT,
+        )
+
+        txn = make_txn(booking_date=date(2024, 1, 15), payee="Netflix")
+        entry = make_entry(
+            payee="Netflix",
+            narration="Netflix Abo",
+            date=date(2024, 1, 15) + timedelta(days=DEFAULT_MAX_DATE_DAYS),
+        )
+        score = score_candidate(txn, entry)
+        # text == 1.0, date_proximity == 0.0 → score == TEXT_WEIGHT.
+        assert score == TEXT_WEIGHT
+
+    def test_weights_sum_to_one(self):
+        # If this drifts, the score range is no longer [0, 1] and the
+        # default `min_score=0.35` interpretation breaks.
+        from beancount_importer.matching.scorer import DATE_WEIGHT, TEXT_WEIGHT
+
+        assert TEXT_WEIGHT + DATE_WEIGHT == 1.0
 
 
 # ── PayPal counterpart: currency mismatch ───────────────────────────────────

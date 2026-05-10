@@ -575,6 +575,91 @@ class TestAmbiguous:
         categorizer(self._amb_ctx())
         assert "Multiple ledger entries" not in console.export_text()
 
+    def test_ambiguous_with_zero_diff_across_all_silently_returns(self, monkeypatch):
+        # Ambiguous-but-equivalent: two near-tied candidates whose
+        # target_accounts agree, paired against a seed proposal that
+        # carries no payee/narration override → every candidate produces
+        # an empty diff. There's no real choice to make; demanding the
+        # user pick one is busy-work. Screen 4 must NOT fire.
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError(
+                "Prompt.ask must NOT fire when ambiguous candidates "
+                "all produce zero diff against the proposal"
+            )
+
+        monkeypatch.setattr("rich.prompt.Prompt.ask", fail_if_called)
+        # Two ambiguous candidates, IDENTICAL target_account, no rule
+        # → seed proposal targets the same account, diff is empty for
+        # both. (Real-world: two duplicate ledger entries on the same
+        # day for the same merchant.)
+        c1 = LedgerEntry(
+            date=date(2024, 3, 1),
+            payee="Coffee Shop",
+            narration="Latte",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Food",
+            amount=Decimal("-12.50"),
+            currency="EUR",
+        )
+        c2 = LedgerEntry(
+            date=date(2024, 3, 1),
+            payee="Coffee Shop",
+            narration="Latte",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Food",
+            amount=Decimal("-12.50"),
+            currency="EUR",
+        )
+        # Seed proposal carries no rule-driven payee/narration override;
+        # the entries' payee/narration match the txn's. _diff_changes
+        # will produce an empty list for both candidates, so the
+        # silent-skip gate fires before Screen 4 even considers running.
+        aligned_txn = SourceTransaction(
+            booking_date=date(2024, 3, 1),
+            amount=Decimal("-12.50"),
+            currency="EUR",
+            payee="Coffee Shop",
+            description="Latte",
+            bank_key="spk",
+        )
+        categorizer = make_screen_categorizer(_console())
+        proposal = categorizer(
+            _ctx(txn=aligned_txn, candidates=((c1, 0.90), (c2, 0.88)))
+        )
+        assert proposal.action == "categorize"
+        assert proposal.target_account == "Expenses:Food"
+
+    def test_ambiguous_with_one_diff_target_still_fires_screen_4(self, monkeypatch):
+        # The "all zero diff" gate must NOT mask real ambiguity.
+        # If even one candidate within `min_delta` would produce a
+        # non-empty diff (different target_account here), Screen 4
+        # must still render. This is the regression check for the
+        # silent-skip-on-zero-diff branch.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("", ""))
+        c1 = LedgerEntry(
+            date=date(2024, 3, 1),
+            payee="Coffee Shop",
+            narration="Latte",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Food",
+            amount=Decimal("-12.50"),
+            currency="EUR",
+        )
+        c2 = LedgerEntry(
+            date=date(2024, 3, 1),
+            payee="Coffee Shop",
+            narration="Latte",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Travel",  # different!
+            amount=Decimal("-12.50"),
+            currency="EUR",
+        )
+        console = _console()
+        categorizer = make_screen_categorizer(console)
+        categorizer(_ctx(candidates=((c1, 0.90), (c2, 0.88))))
+        # Screen 4 is the "Multiple ledger entries" view.
+        assert "Multiple ledger entries" in console.export_text()
+
 
 def test_progress_threaded_to_screens(monkeypatch):
     monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
