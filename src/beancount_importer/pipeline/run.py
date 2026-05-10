@@ -588,7 +588,7 @@ def _try_matcher(
             skip_reason="cross_source_match",
             matched_entry=matched,
         )
-    return state.evolve(matcher_proposal=_proposal_from_outcome(outcome, state.txn))
+    return state.evolve(matcher_proposal=_proposal_from_outcome(outcome))
 
 
 def _score_candidates(
@@ -1080,16 +1080,13 @@ def _matches_skip_pattern(patterns, txn: SourceTransaction) -> bool:
     return False
 
 
-def _proposal_from_outcome(
-    outcome: MatchOutcome, txn: SourceTransaction
-) -> CategoryProposal:
+def _proposal_from_outcome(outcome: MatchOutcome) -> CategoryProposal:
     """Build a categorize proposal from a `rewrite_target` matcher outcome.
 
     The target account comes from the matcher; metadata is folded in verbatim.
     Payee/narration are left to the existing source transaction defaults so a
     later rule or user override can still tweak them.
     """
-    del txn  # currently unused; kept for symmetry with `_proposal_from_rule`
     assert outcome.target_account is not None
     return CategoryProposal(
         action="categorize",

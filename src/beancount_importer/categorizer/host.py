@@ -1,19 +1,23 @@
-"""Screen-driven `CategorizeFn` host.
+"""Screen-driven `CategorizeFn` and `MergeFn` host.
 
-Bridges the pipeline's `CategorizeContext → CategoryProposal` slot to
-the new screen-based prompt layer (`confirm`, `pick`, …). Routing logic:
+Bridges the pipeline's user-facing slots (`CategorizeContext →
+CategoryProposal`, `MergeContext → MergeDecision`) to the screen-based
+prompt layer (`confirm`, `pick`, `ambiguous`, `collision`).
 
-- **Rule matched or top candidate exists** → Screen 1 (`confirm`) with
-  the appropriate kind. Enter confirms; edits loop in-place.
-- **No rule, no candidate** → Screen 2 (`pick`) → Screen 1 (`fresh_pick`).
-- **Skip / quit** at any screen → return a proposal carrying that action.
+Routing — see `docs/screen-graph.md` for the full edge map:
 
-Screen 4 (ambiguous match) and Screen 3 (collision) are not routed here
-yet — they need additional pipeline plumbing (an "ambiguity threshold"
-read of candidate scores, and a hook between `_build_result` and
-`_persist_results`). The host stays narrow until those land so the
-integration is provably no-regression against today's auto-pick-top
-behaviour.
+- **Ambiguous candidates** (`ctx.is_ambiguous`) → Screen 4 → Screen 1 or
+  Screen 2 depending on user choice.
+- **Seed proposal exists** (rule matched or top candidate) → Screen 1
+  with `kind=auto_matched` (rule) or `top_candidate`. Enter confirms;
+  `[c]` round-trips to Screen 2 and back.
+- **No seed** → Screen 2 (pick) → Screen 1 (`fresh_pick`).
+- **Merge prompt** (pipeline detects an `update` would change fields)
+  → Screen 3 (collision), six outcomes 1:1 with `MergeDecision.action`.
+
+The pipeline pre-computes silent-skip and ambiguity detection (see
+`CategorizeContext.seed_proposal` / `is_ambiguous`); by the time `_fn`
+runs, there's a real choice to make.
 """
 
 from __future__ import annotations
@@ -108,17 +112,7 @@ def make_screen_merge_fn(
 
 
 def _merge_tag_remaining(ctx: MergeContext) -> int | None:
-    """Days remaining for a `duration`-mode active tag in a `MergeContext`.
-
-    Mirrors `_tag_remaining` but operates on `MergeContext` (which has
-    its own `active_tag` field). The two contexts intentionally don't
-    share a base class — they describe different pipeline phases.
-    """
-    tag = ctx.active_tag
-    if tag is None or tag.mode != "duration" or tag.until_date is None:
-        return None
-    delta = (tag.until_date - ctx.txn.booking_date).days
-    return max(0, delta)
+    return _remaining_days(ctx.active_tag, ctx.txn.booking_date)
 
 
 # ── Path A0: ambiguous → Screen 4 → Screen 1 / Screen 2 ──────────────────────
@@ -146,10 +140,8 @@ def _run_ambiguous(
         tag_remaining=_tag_remaining(ctx),
     )
     decision = run_ambiguous(console, amb_ctx)
-    if decision.action == "skip":
-        return CategoryProposal(action="skip")
-    if decision.action == "quit":
-        return CategoryProposal(action="quit")
+    if (short := _short_circuit_proposal(decision.action)) is not None:
+        return short
     if decision.action == "import_new":
         return _run_pick_then_confirm(console, ctx)
     # action == "pick" — Screen 4 guarantees an entry on this branch.
@@ -203,10 +195,8 @@ def _run_confirm(
         # `[c]` round-trip: pick a new account, then re-render Screen 1.
         # Skip / quit on Screen 2 short-circuits the whole categorize call.
         pick = _ask_pick(console, ctx)
-        if pick.action == "skip":
-            return CategoryProposal(action="skip")
-        if pick.action == "quit":
-            return CategoryProposal(action="quit")
+        if (short := _short_circuit_proposal(pick.action)) is not None:
+            return short
         assert pick.account is not None
         assert decision.proposal is not None
         proposal = decision.proposal.model_copy(
@@ -218,10 +208,8 @@ def _run_confirm(
 
 def _confirm_to_proposal(decision: ConfirmDecision) -> CategoryProposal:
     """Map a Screen-1 outcome to a `CategoryProposal` the pipeline understands."""
-    if decision.action == "skip":
-        return CategoryProposal(action="skip")
-    if decision.action == "quit":
-        return CategoryProposal(action="quit")
+    if (short := _short_circuit_proposal(decision.action)) is not None:
+        return short
     # `confirm` always carries a proposal; the dataclass guarantees it.
     assert decision.proposal is not None
     return decision.proposal
@@ -240,10 +228,8 @@ def _run_pick_then_confirm(
     prompt, since there's no proposal to confirm.
     """
     pick_decision = _ask_pick(console, ctx)
-    if pick_decision.action == "skip":
-        return CategoryProposal(action="skip")
-    if pick_decision.action == "quit":
-        return CategoryProposal(action="quit")
+    if (short := _short_circuit_proposal(pick_decision.action)) is not None:
+        return short
 
     assert pick_decision.account is not None  # `pick` always carries one
     seed = CategoryProposal(
@@ -288,16 +274,34 @@ def _ask_pick(console: Console, ctx: CategorizeContext) -> PickDecision:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _tag_remaining(ctx: CategorizeContext) -> int | None:
+def _remaining_days(tag, booking_date) -> int | None:
     """Days remaining for a `duration`-mode active tag; None otherwise.
 
-    Computed inline rather than as a method on `ActiveTag` because the
-    tag model is shared across persistence/serialisation paths and
-    "days until expiry" is a UI-layer concern. The screens render the
-    `(N left)` suffix iff this returns non-None.
+    Computed at the UI layer rather than as a method on `ActiveTag`
+    because the tag model is shared across persistence/serialisation
+    paths and "days until expiry" is a UI concern. The screens render
+    the `(N left)` suffix iff this returns non-None.
     """
-    tag = ctx.active_tag
     if tag is None or tag.mode != "duration" or tag.until_date is None:
         return None
-    delta = (tag.until_date - ctx.txn.booking_date).days
+    delta = (tag.until_date - booking_date).days
     return max(0, delta)
+
+
+def _tag_remaining(ctx: CategorizeContext) -> int | None:
+    return _remaining_days(ctx.active_tag, ctx.txn.booking_date)
+
+
+def _short_circuit_proposal(action: str) -> CategoryProposal | None:
+    """Translate a screen's `skip` / `quit` action into a bubble-up proposal.
+
+    Returns None for any other action so the caller falls through to
+    its own routing. Centralises the otherwise-duplicated two-line
+    `if action == "skip" / "quit": return ...` boilerplate that every
+    screen-runner needs.
+    """
+    if action == "skip":
+        return CategoryProposal(action="skip")
+    if action == "quit":
+        return CategoryProposal(action="quit")
+    return None
