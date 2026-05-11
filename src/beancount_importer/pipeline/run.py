@@ -28,7 +28,7 @@ from beancount_importer.matching.registry import (
     first_outcome,
     load_matchers,
 )
-from beancount_importer.matching.scorer import DEFAULT_MAX_DATE_DAYS, find_candidates
+from beancount_importer.matching.scorer import find_candidates
 from beancount_importer.models import (
     CategoryProposal,
     ImportResult,
@@ -383,7 +383,12 @@ def _process_transaction(
     state = short_circuit  # may carry a matcher_proposal forward
 
     # Proposal phase.
-    state = _score_candidates(state, existing=existing, min_score=config.matching.min_score)
+    state = _score_candidates(
+        state,
+        existing=existing,
+        min_score=config.matching.min_score,
+        max_date_days=config.matching.max_date_days,
+    )
     state = _resolve_proposal(
         state,
         config=config,
@@ -416,6 +421,7 @@ def _process_transaction(
         new_rule=state.new_rule,
         tag_state_delta=state.tag_delta,
         min_score=config.matching.min_score,
+        max_date_days=config.matching.max_date_days,
         match_txn=state.match_txn,
         narration_max_length=config.narration_max_length,
         paypal_account=config.paypal_account,
@@ -535,6 +541,7 @@ def _try_replay(
         new_rule=None,
         tag_state_delta=None,
         min_score=config.matching.min_score,
+        max_date_days=config.matching.max_date_days,
         match_txn=state.match_txn,
         narration_max_length=config.narration_max_length,
         paypal_account=config.paypal_account,
@@ -632,10 +639,16 @@ def _score_candidates(
     *,
     existing: list[LedgerEntry],
     min_score: float,
+    max_date_days: int,
 ) -> _TxnState:
     """Score the rule-rewritten txn against `existing` and stash candidates."""
     assert state.match_txn is not None
-    candidates = find_candidates(state.match_txn, existing, min_score=min_score)
+    candidates = find_candidates(
+        state.match_txn,
+        existing,
+        min_score=min_score,
+        max_date_days=max_date_days,
+    )
     return state.evolve(candidates=tuple(candidates))
 
 
@@ -695,6 +708,7 @@ def _resolve_proposal(
             cross_bucket=existing_all,
             bank_account=bank.account,
             min_score=config.matching.min_score,
+            max_date_days=config.matching.max_date_days,
         )
         if not state.candidates
         else ()
@@ -941,6 +955,7 @@ def _build_result(
     new_rule: CategorizationRule | None,
     tag_state_delta: TagStateDelta | None,
     min_score: float,
+    max_date_days: int,
     match_txn: SourceTransaction | None = None,
     narration_max_length: int | None = None,
     paypal_account: str | None = None,
@@ -971,7 +986,9 @@ def _build_result(
 
     # categorize action: decide new vs. update by inspecting top candidate.
     score_txn = match_txn if match_txn is not None else txn
-    candidates = find_candidates(score_txn, existing, min_score=min_score)
+    candidates = find_candidates(
+        score_txn, existing, min_score=min_score, max_date_days=max_date_days
+    )
     best: LedgerEntry | None = candidates[0][0] if candidates else None
     action = "update" if best is not None else "new"
 
@@ -1051,6 +1068,7 @@ def _compute_near_misses(
     cross_bucket: list[LedgerEntry],
     bank_account: str,
     min_score: float,
+    max_date_days: int,
 ) -> tuple[NearMiss, ...]:
     """Surface the closest "almost-a-match" entry for diagnostic display.
 
@@ -1068,7 +1086,9 @@ def _compute_near_misses(
 
     # In-bucket: same source_account, scorer ran but everything fell below
     # min_score. Re-score with no floor and pick the best below the cutoff.
-    below = find_candidates(txn, in_bucket, min_score=0.0)
+    below = find_candidates(
+        txn, in_bucket, min_score=0.0, max_date_days=max_date_days
+    )
     for entry, score in below:
         if score < min_score:
             misses.append(NearMiss(entry=entry, score=score, reason="below_threshold"))
@@ -1090,14 +1110,14 @@ def _compute_near_misses(
         if abs(entry.amount) != target_amount:
             continue
         days = abs((entry.date - txn.booking_date).days)
-        if days > DEFAULT_MAX_DATE_DAYS:
+        if days > max_date_days:
             continue
         if closest is None or days < closest[0]:
             closest = (days, entry)
     if closest is not None:
         # Synthesize a confidence figure analogous to the scorer's date
         # proximity term so the screen can render a single comparable score.
-        score = 1.0 - (closest[0] / DEFAULT_MAX_DATE_DAYS)
+        score = 1.0 - (closest[0] / max_date_days)
         misses.append(NearMiss(entry=closest[1], score=score, reason="different_bucket"))
 
     return tuple(misses)

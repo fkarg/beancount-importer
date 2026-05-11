@@ -246,8 +246,10 @@ class TestTransformsConfig:
 class TestMatchingConfig:
     def test_defaults(self):
         m = MatchingConfig()
-        assert m.min_score == 0.35
+        assert m.min_score == 0.5
         assert m.min_delta == 0.15
+        assert m.max_date_days == 7
+        assert m.dedup_max_date_days == 5
         assert m.transfer_tolerance_days == 5
 
     def test_override_via_toml(self, tmp_path: Path):

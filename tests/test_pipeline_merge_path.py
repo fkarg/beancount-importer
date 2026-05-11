@@ -62,27 +62,26 @@ def _spk_bank() -> BankConfig:
 def _write_collision_setup(tmp_path: Path) -> Path:
     """Bean file + CSV that produce one collision and zero new rows.
 
-    The existing bean entry was imported with the OLD payee/narration;
-    the CSV row carries the NEW values, so the diff is non-empty and
-    `_build_result` returns `action="update"` with two proposed_changes.
+    The existing bean entry was imported with the OLD payee; the CSV
+    row carries the NEW payee + narration, so the diff is non-empty
+    and `_build_result` returns `action="update"`.
 
-    Dates sit 8 days apart on purpose — close enough for the scorer to
-    match by date-proximity + text overlap, far enough that the strict
-    dedup path (`dedup_max_date_days=5`) doesn't fire and let the row
-    silent-skip. Without that gap the row's amount + date pair is a
-    definitive duplicate and the merge prompt never gets reached.
+    Dates sit 6 days apart — close enough for the scorer at the
+    tightened 7-day window, far enough that the strict dedup path
+    (`dedup_max_date_days=5`) doesn't fire. Bean narration matches the
+    CSV's Verwendungszweck so the token overlap clears the score floor.
     """
     csv = tmp_path / "SPK_2024.csv"
     csv.write_text(
         "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung\n"
-        "17.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
+        "15.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
     )
     bean_dir = tmp_path / "transactions"
     bean_dir.mkdir()
     bean = bean_dir / "SPK.bean"
     bean.write_text(
         textwrap.dedent("""\
-        2024-03-09 * "Spotify" "Music subscription"
+        2024-03-09 * "Spotify" "Premium Family"
           Assets:B:SPK            -15.00 EUR
           Expenses:Subscriptions
         """)
@@ -167,7 +166,7 @@ class TestMergeDecisionRouting:
         # Proposal mirrors the existing entry so replay reproduces.
         assert r.proposal is not None
         assert r.proposal.payee == "Spotify"
-        assert r.proposal.narration == "Music subscription"
+        assert r.proposal.narration == "Premium Family"
         assert r.proposal.target_account == "Expenses:Subscriptions"
 
     def test_skip_decision_drops_to_skip(self, tmp_path: Path):
@@ -409,19 +408,19 @@ def _write_one_entry_two_csv(tmp_path: Path) -> Path:
     CSVs are byte-identical; the bucket has one entry to claim.
     """
     csv = tmp_path / "SPK_2024.csv"
-    # Both rows sit 8 days after the bean entry — beyond `dedup_max_date_days=5`
+    # Both rows sit 6 days after the bean entry — beyond `dedup_max_date_days=5`
     # so dedup doesn't fire, inside the scorer window so the merge prompt does.
     csv.write_text(
         "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung\n"
-        "17.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
-        "17.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
+        "15.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
+        "15.03.24;Spotify AB;Premium Family;-15,00;EUR\n"
     )
     bean_dir = tmp_path / "transactions"
     bean_dir.mkdir()
     bean = bean_dir / "SPK.bean"
     bean.write_text(
         textwrap.dedent("""\
-        2024-03-09 * "Spotify" "Music subscription"
+        2024-03-09 * "Spotify" "Premium Family"
           Assets:B:SPK            -15.00 EUR
           Expenses:Subscriptions
         """)

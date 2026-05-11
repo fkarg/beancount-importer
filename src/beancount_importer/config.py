@@ -110,15 +110,19 @@ class TransformsConfig(BaseModel):
 class MatchingConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    min_score: float = 0.35
+    # Tightened post-audit: 0.5 paired with the Phase 2 diff suppressions
+    # avoids both the old false-positive prompts (text drift under 0.35)
+    # and the new false-negatives where a coincidental amount+text match
+    # would otherwise propose an update.
+    min_score: float = 0.5
     min_delta: float = 0.15
-    # Maximum date gap for the scorer to admit a candidate. Phase 1 keeps the
-    # reference's wide 14-day window so behaviour matches the pre-rewrite
-    # importer; Phase 4 tightens to 7 once the dedup-side suppressions land.
-    max_date_days: int = 14
-    # Tighter window for `find_definitive_duplicate` (Phase 2). The strict
-    # dedup path stays narrower than the scoring window so accidental
-    # silent-skips across week-plus distances can't happen.
+    # Maximum date gap for the scorer to admit a candidate. 7 days
+    # comfortably covers the typical SPK→PayPal lag without straying into
+    # "any same-amount row this month" territory.
+    max_date_days: int = 7
+    # Tighter window for `find_definitive_duplicate`. Strict dedup stays
+    # narrower than the scoring window so accidental silent-skips across
+    # week-plus distances can't happen.
     dedup_max_date_days: int = 5
     transfer_tolerance_days: int = 5
     transit_account: str = "Assets:Extern:Transit"

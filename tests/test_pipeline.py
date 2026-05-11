@@ -1364,11 +1364,11 @@ class TestPipelineAutoCategorize:
               Assets:B:SPK  -15.99 EUR
               Expenses:Streaming  15.99 EUR
         """))
-        # CSV row sits 8 days after the bean entry — outside the strict
+        # CSV row sits 6 days after the bean entry — outside the strict
         # 5-day dedup window so the auto-threshold path actually runs.
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "23.01.24;Netflix;Netflix Abo Feb;-15,99;EUR;\n"
+            "21.01.24;Netflix;Netflix Abo Feb;-15,99;EUR;\n"
         )
 
         called = []
@@ -1499,12 +1499,12 @@ class TestPipelineUpdateChanges:
               Assets:B:SPK  -15.99 EUR
               Expenses:Old  15.99 EUR
         """))
-        # CSV date sits 8 days after the bean entry — outside the strict
+        # CSV date sits 6 days after the bean entry — outside the strict
         # `dedup_max_date_days=5` window (so the merge path runs) but well
         # within the scorer's window (so the entry is still a candidate).
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "23.01.24;NewPayee;new narration;-15,99;EUR;\n"
+            "21.01.24;NewPayee;new narration;-15,99;EUR;\n"
         )
         return tmp_path
 
@@ -1896,6 +1896,7 @@ class TestComputeNearMisses:
             cross_bucket=in_bucket,
             bank_account="Assets:B:SPK",
             min_score=0.95,
+            max_date_days=7,
         )
         assert len(misses) == 1
         assert misses[0].reason == "below_threshold"
@@ -1919,6 +1920,7 @@ class TestComputeNearMisses:
             cross_bucket=[elsewhere],
             bank_account="Assets:B:SPK",
             min_score=0.35,
+            max_date_days=7,
         )
         assert any(m.reason == "different_bucket" for m in misses)
         diff = next(m for m in misses if m.reason == "different_bucket")
@@ -1944,6 +1946,7 @@ class TestComputeNearMisses:
             cross_bucket=[transit],
             bank_account="Assets:B:SPK",
             min_score=0.35,
+            max_date_days=7,
         )
         assert all(m.reason != "different_bucket" for m in misses)
 
@@ -1955,6 +1958,7 @@ class TestComputeNearMisses:
             cross_bucket=[],
             bank_account="Assets:B:SPK",
             min_score=0.35,
+            max_date_days=7,
         )
         assert misses == ()
 
@@ -2303,12 +2307,11 @@ class TestNearMissRealWorld:
     """
 
     def test_text_drift_produces_below_threshold_miss(self):
-        # Real-world drift: same amount, but text and date have
-        # diverged enough that the score lands below the production
-        # default min_score=0.35. We use distinct gibberish tokens
-        # (token_set_ratio is sensitive even to short shared tokens
-        # like "a"/"the") and a 13-day offset to keep date_proximity
-        # near zero. Score ~0.08 — well below 0.35.
+        # Real-world drift: same amount, but text has diverged enough
+        # that the score lands below the production default 0.35.
+        # Distinct gibberish tokens give zero text overlap; a 6-day
+        # offset (inside the 7-day scorer window) means the date term
+        # contributes ~0.07, well below the cutoff.
         txn = _make_txn(
             booking_date=date(2024, 4, 2),
             payee="qqqqq",
@@ -2316,7 +2319,7 @@ class TestNearMissRealWorld:
         )
         in_bucket = [
             LedgerEntry(
-                date=date(2024, 4, 15),
+                date=date(2024, 4, 8),
                 payee="alpha",
                 narration="beta",
                 source_account="Assets:B:SPK",
@@ -2331,6 +2334,7 @@ class TestNearMissRealWorld:
             cross_bucket=in_bucket,
             bank_account="Assets:B:SPK",
             min_score=0.35,
+            max_date_days=7,
         )
         assert len(misses) == 1
         assert misses[0].reason == "below_threshold"
@@ -2350,7 +2354,7 @@ class TestNearMissRealWorld:
         )
         # In-bucket entry: same source_account, scores below threshold.
         in_bucket_weak = LedgerEntry(
-            date=date(2024, 4, 15),
+            date=date(2024, 4, 8),
             payee="alpha",
             narration="beta",
             source_account="Assets:B:SPK",
@@ -2375,6 +2379,7 @@ class TestNearMissRealWorld:
             cross_bucket=[in_bucket_weak, cross_bucket_hit],
             bank_account="Assets:B:SPK",
             min_score=0.35,
+            max_date_days=7,
         )
         reasons = sorted(m.reason for m in misses)
         assert reasons == ["below_threshold", "different_bucket"]
@@ -2495,13 +2500,13 @@ class TestSkipPatternDoesNotClaim:
               Assets:B:SPK  -15.99 EUR
               Expenses:Streaming  15.99 EUR
         """))
-        # CSV row sits 8 days after the bean entry — outside the strict
+        # CSV row sits 6 days after the bean entry — outside the strict
         # `dedup_max_date_days=5` window so dedup doesn't win first, but
         # inside the scorer window so a candidate would surface if the
         # skip-pattern path didn't short-circuit.
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "23.01.24;Netflix;Different narration text;-15,99;EUR;\n"
+            "21.01.24;Netflix;Different narration text;-15,99;EUR;\n"
         )
         skip_pattern = SkipUpdatePattern(
             bank_key="spk",
@@ -2937,7 +2942,7 @@ class TestDiffSuppressions:
     """Phase 2 diff suppressions: truncation-equivalence (A1/A8),
     timestamp-narration (A2), multi-posting category guard (A4).
 
-    The fixture in every test below puts the CSV row 8 days after the
+    The fixture in every test below puts the CSV row 6 days after the
     bean entry so dedup doesn't fire — that way the row reaches
     `_diff_changes` where the suppressions live.
     """
@@ -2960,7 +2965,7 @@ class TestDiffSuppressions:
         )
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "23.01.24;Acme;Acme Inc — Subscription Plan A;-10,00;EUR;\n"
+            "21.01.24;Acme;Acme Inc — Subscription Plan A;-10,00;EUR;\n"
         )
 
         def categ(ctx):
@@ -2993,7 +2998,7 @@ class TestDiffSuppressions:
         )
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "23.01.24;BK;2024-01-23T12:00 Debit;-10,00;EUR;\n"
+            "21.01.24;BK;2024-01-23T12:00 Debit;-10,00;EUR;\n"
         )
 
         def categ(ctx):
@@ -3029,7 +3034,7 @@ class TestDiffSuppressions:
         )
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "08.02.24;Employer;NewSalaryNarration;2000,00;EUR;\n"
+            "06.02.24;Employer;NewSalaryNarration;2000,00;EUR;\n"
         )
 
         def categ(ctx):

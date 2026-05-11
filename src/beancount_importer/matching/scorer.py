@@ -7,8 +7,9 @@ from beancount_importer.matching.normalize import normalize_text
 from beancount_importer.models import LedgerEntry, SourceTransaction
 
 
-# Tunable: candidates further apart than this are not considered.
-DEFAULT_MAX_DATE_DAYS = 14
+# Tunable fallback for direct callers; the pipeline overrides this via
+# `MatchingConfig.max_date_days`. Keep in line with that default.
+DEFAULT_MAX_DATE_DAYS = 7
 # Score weights: amount equality is a hard filter (no weight), so the variable
 # part is text + date proximity. Weighted equally so a same-day, zero-overlap
 # row still scores 0.5 — well above the default `min_score=0.35`. With the
