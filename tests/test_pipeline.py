@@ -385,6 +385,26 @@ class TestPipelineYearFilter:
         assert len(results) == 3
 
 
+# ── Zero-amount filter ───────────────────────────────────────────────────────
+
+
+class TestPipelineZeroAmountFilter:
+    def test_drops_exact_zero_rows(self, base_dir: Path):
+        # Zero-amount rows (e.g. cancellation entries some banks emit)
+        # have no meaningful proposal — they must not reach the categorizer.
+        (base_dir / "SPK_jan.csv").write_text(textwrap.dedent("""\
+            Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz
+            15.01.24;Netflix;Netflix Abo;-15,99;EUR;A
+            16.01.24;Cancellation;Voided;0,00;EUR;B
+            17.01.24;Other;Foo;-2,00;EUR;C
+        """))
+        session = make_session(base_dir)
+        results = run(session, base_dir, fixed_categorize(), NoopReporter())
+        amounts = {r.source_txn.amount for r in results}
+        assert Decimal("0") not in amounts
+        assert len(results) == 2
+
+
 # ── Bank filter ──────────────────────────────────────────────────────────────
 
 

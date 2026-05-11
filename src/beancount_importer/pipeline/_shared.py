@@ -145,5 +145,8 @@ def _parse_all_inputs(
                 continue
             if allowed is not None:
                 rows = [t for t in rows if t.booking_date.year in allowed]
+            # Zero-amount rows produce no useful proposal and would
+            # waste a categorizer prompt — drop before they enter the pipeline.
+            rows = [t for t in rows if t.amount != 0]
             flat.extend(rows)
     return flat
