@@ -535,9 +535,16 @@ class TestPipelineCrossBank:
         results = run(session, tmp_path, fixed_categorize(), NoopReporter())
         assert len(results) == 1
         assert results[0].action == "skip"
-        assert results[0].skip_reason == "cross_source_match"
+        # Cheap dedup picks up the inferred-PayPal leg first; the
+        # cross-source matcher would have caught it too. Either path
+        # produces the same end state — the row is skipped and the
+        # matched entry is one of the two legs of the SPK→PayPal
+        # transit transaction.
+        assert results[0].skip_reason in ("duplicate", "cross_source_match")
         assert results[0].matched_entry is not None
-        assert results[0].matched_entry.source_account == "Assets:B:N26"
+        assert results[0].matched_entry.source_account in (
+            "Assets:B:N26", "Assets:B:PayPal"
+        )
 
 
 class TestPipelineMatchers:
@@ -613,17 +620,18 @@ class TestPipelineMatchers:
         must remove from the bank-scoped bucket too, otherwise the
         bucket retains a phantom matched entry that downstream
         scoring/dedup would re-consider for sibling rows.
+
+        Sign-flipped amounts (CSV +29.06, bean -29.06) keep the strict
+        dedup (which insists on exact-amount equality) from firing, so
+        the matcher path actually runs — `abs(amount)` matching is the
+        matcher's lane.
         """
         self._spk_csv(
             tmp_path / "SPK_2024.csv",
-            "03.05.24;Uber;Uber Trip;-29,06;EUR;",
+            "03.05.24;Uber;Uber Trip;29,06;EUR;",
         )
         bean_dir = tmp_path / "transactions"
         bean_dir.mkdir()
-        # Same-bank entry: source on SPK with paypal: metadata. CSV
-        # description differs from narration so plain dedup misses; the
-        # settled matcher catches it via amount + metadata-date + text
-        # overlap on "Uber".
         (bean_dir / "SPK.bean").write_text(
             '2024-04-29 * "PayPal" "Uber"\n'
             "  Assets:B:SPK   -29.06 EUR\n"
@@ -749,7 +757,10 @@ class TestPipelineMatchers:
 
         assert len(results) == 1
         assert results[0].action == "skip"
-        assert results[0].skip_reason == "cross_source_match"
+        # Either the cheap dedup catches the row (same amount/date/currency
+        # as the already-booked N26 leg) or the cross-source matcher does;
+        # both are acceptable here and produce the same end state.
+        assert results[0].skip_reason in ("duplicate", "cross_source_match")
         assert results[0].matched_entry is not None
 
 
@@ -1353,10 +1364,11 @@ class TestPipelineAutoCategorize:
               Assets:B:SPK  -15.99 EUR
               Expenses:Streaming  15.99 EUR
         """))
-        # New CSV row identical except no SEPA reference (so dedup doesn't fire).
+        # CSV row sits 8 days after the bean entry — outside the strict
+        # 5-day dedup window so the auto-threshold path actually runs.
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "16.01.24;Netflix;Netflix Abo Feb;-15,99;EUR;\n"
+            "23.01.24;Netflix;Netflix Abo Feb;-15,99;EUR;\n"
         )
 
         called = []
@@ -1487,9 +1499,12 @@ class TestPipelineUpdateChanges:
               Assets:B:SPK  -15.99 EUR
               Expenses:Old  15.99 EUR
         """))
+        # CSV date sits 8 days after the bean entry — outside the strict
+        # `dedup_max_date_days=5` window (so the merge path runs) but well
+        # within the scorer's window (so the entry is still a candidate).
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "16.01.24;NewPayee;new narration;-15,99;EUR;\n"
+            "23.01.24;NewPayee;new narration;-15,99;EUR;\n"
         )
         return tmp_path
 
@@ -1982,17 +1997,20 @@ class TestPipelineNearMissesPlumbing:
 
     def test_near_misses_empty_when_candidates_exist(self, base_dir: Path):
         # An existing entry close enough to score above threshold but not
-        # an exact content-hash match (dedup misses, scorer catches). The
-        # diagnostic must stay quiet on rows that had at least one
-        # candidate — it's only meant for "nothing landed" cases.
+        # a definitive dedup match (date gap > dedup_max_date_days, gap
+        # within scorer window). The diagnostic must stay quiet on rows
+        # that had at least one candidate — it's only meant for "nothing
+        # landed" cases.
         #
         # A rule with override_narration ensures the seed proposal
         # differs from the existing entry; without it the pipeline
         # silent-skips before invoking categorize_fn and we never
         # observe the context.
         (base_dir / "transactions").mkdir()
+        # 7 days after the CSV's Netflix row (15.01.24): outside the
+        # strict 5-day dedup window, inside the 14-day scorer window.
         (base_dir / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
-            2024-01-15 * "Netflix" "Old narration"
+            2024-01-22 * "Netflix" "Old narration"
               Assets:B:SPK  -15.99 EUR
               Expenses:Streaming  15.99 EUR
         """))
@@ -2151,15 +2169,15 @@ class TestPipelineRuleRewriteOverrideNarration:
         assert results[0].action == "skip"
         assert results[0].skip_reason == "duplicate"
 
-    def test_changed_override_re_prompts_previously_imported_row(
+    def test_changed_override_does_not_re_prompt_previously_imported_row(
         self, tmp_path: Path
     ):
-        # Documents the trade-off: editing a rule's override_payee between
-        # runs makes the previously-imported entry's content hash diverge
-        # from the freshly-rewritten txn, so the row re-prompts. Without
-        # this guarantee in tests, a future "fix" could silently skip
-        # legitimate re-prompts.
-        # First run with the OLD rule writes an entry tagged "Old Name".
+        # Under the new dedup architecture, amount + currency + date-window
+        # equality is definitive — the user's bean entry is the source of
+        # truth, so a re-imported CSV row silent-skips even when the rule's
+        # override_payee was edited between runs. This used to re-prompt
+        # because the content hash incorporated the rule-rewritten payee;
+        # the audit flagged that as an A-type regression.
         (tmp_path / "transactions").mkdir()
         (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
             2024-04-02 * "Old Name" "0614870/Vereinsbeitrag FTG Frankfurt FOLGELASTSCHRIFT"
@@ -2171,8 +2189,6 @@ class TestPipelineRuleRewriteOverrideNarration:
             "02.04.24;Frankfurter Turn-u.Sport- Gemeinschaft 1847 j.P.;"
             "0614870/Vereinsbeitrag FTG Frankfurt FOLGELASTSCHRIFT;-49,50;EUR;\n"
         )
-        # Second run with a NEW override_payee — content hash now uses
-        # "FTG Frankfurt", which doesn't match "Old Name" on disk.
         new_rule = CategorizationRule(
             target_account="Expenses:Fitness:Gym",
             payee_pattern="FTG|Frankfurter Turn",
@@ -2187,13 +2203,10 @@ class TestPipelineRuleRewriteOverrideNarration:
             config=cfg, rules=(new_rule,), options=ImportOptions()
         )
         results = run(session, tmp_path, fixed_categorize(), NoopReporter())
-        # The row didn't dedup — it found a candidate and produced an
-        # update with non-empty diff.
         assert len(results) == 1
         r = results[0]
-        assert r.action == "update"
-        assert r.matched_entry is not None
-        assert r.proposed_changes  # diff non-empty: payee change visible
+        assert r.action == "skip"
+        assert r.skip_reason == "duplicate"
 
 
 class TestNNPairingViaCandidates:
@@ -2376,11 +2389,9 @@ class TestAutoThresholdRequiresRule:
     """
 
     def test_high_score_without_rule_silent_skips_clean_match(self, tmp_path: Path):
-        # Strong candidate (clean exact match minus the SEPA ref) but no
-        # rule. Without a rule, the seed proposal carries no overrides,
-        # so the diff against the matched entry is empty and the pipeline
-        # silent-skips before invoking `categorize_fn`. The result is a
-        # zero-change update — the user has nothing to consent to.
+        # Same amount + same date-window + same currency → dedup skips
+        # before the auto-threshold path even runs. categorize_fn never
+        # fires, the result is `skip / duplicate` (the cheap path won).
         (tmp_path / "transactions").mkdir()
         (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent("""\
             2024-01-15 * "Netflix" "Netflix Abo"
@@ -2405,18 +2416,15 @@ class TestAutoThresholdRequiresRule:
             transactions_dir="transactions",
             matching=MatchingConfig(min_score=0.35),
         )
-        # auto_threshold set but no rules registered.
         session = ImportSession(
             config=cfg,
             options=ImportOptions(auto_threshold=0.5),
         )
         results = run(session, tmp_path, categ, NoopReporter())
-        # categorize_fn never fires — pipeline silent-skipped.
         assert called == []
-        # Result is a no-op update against the matched entry.
         assert len(results) == 1
-        assert results[0].action == "update"
-        assert results[0].proposed_changes == []
+        assert results[0].action == "skip"
+        assert results[0].skip_reason == "duplicate"
         assert results[0].matched_entry is not None
 
     def test_ambiguous_zero_diff_silent_skips(self, tmp_path: Path):
@@ -2487,11 +2495,13 @@ class TestSkipPatternDoesNotClaim:
               Assets:B:SPK  -15.99 EUR
               Expenses:Streaming  15.99 EUR
         """))
-        # CSV row's narration differs from the entry's → dedup misses,
-        # but a candidate would still score above min_score on payee+date.
+        # CSV row sits 8 days after the bean entry — outside the strict
+        # `dedup_max_date_days=5` window so dedup doesn't win first, but
+        # inside the scorer window so a candidate would surface if the
+        # skip-pattern path didn't short-circuit.
         (tmp_path / "SPK_jan.csv").write_text(
             "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
-            "15.01.24;Netflix;Different narration text;-15,99;EUR;\n"
+            "23.01.24;Netflix;Different narration text;-15,99;EUR;\n"
         )
         skip_pattern = SkipUpdatePattern(
             bank_key="spk",
@@ -2553,3 +2563,201 @@ class TestEmptyState:
         session = make_session(tmp_path)
         results = run(session, tmp_path, fixed_categorize(), NoopReporter())
         assert results == []
+
+
+class TestDiffChangesDirect:
+    """Unit tests for `_diff_changes` itself. The end-to-end tests in
+    TestDiffSuppressions exercise the suppressions through the pipeline,
+    but the seed-silent-skip path swallows rows before `_diff_changes`
+    runs in many cases. These tests construct an entry + proposal and
+    drive the helper directly.
+    """
+
+    def _entry(self, **kw) -> LedgerEntry:
+        defaults = dict(
+            date=date(2024, 1, 15),
+            narration="Acme Inc",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:X",
+            amount=Decimal("-10.00"),
+            currency="EUR",
+        )
+        return LedgerEntry(**(defaults | kw))
+
+    def _proposal(self, **kw) -> CategoryProposal:
+        defaults = dict(
+            action="categorize",
+            postings=(Posting(account="Expenses:X"),),
+        )
+        return CategoryProposal(**(defaults | kw))
+
+    def test_truncation_equivalent_suppresses_narration_change(self):
+        from beancount_importer.pipeline.run import _diff_changes
+        entry = self._entry(narration="Acme Inc")
+        proposal = self._proposal(narration="Acme Inc — Subscription Plan A")
+        changes = _diff_changes(entry, proposal, None)
+        assert all(c.field != "narration" for c in changes)
+
+    def test_timestamp_proposal_does_not_overwrite_real_narration(self):
+        from beancount_importer.pipeline.run import _diff_changes
+        entry = self._entry(narration="Burger King")
+        proposal = self._proposal(narration="2024-01-23T12:00 Debit")
+        changes = _diff_changes(entry, proposal, None)
+        assert all(c.field != "narration" for c in changes)
+
+    def test_non_timestamp_proposal_overwrites_narration(self):
+        from beancount_importer.pipeline.run import _diff_changes
+        entry = self._entry(narration="Burger King")
+        proposal = self._proposal(narration="New narration text")
+        changes = _diff_changes(entry, proposal, None)
+        assert any(c.field == "narration" for c in changes)
+
+    def test_empty_existing_narration_falls_through_truncation(self):
+        # `_is_truncation_equivalent` returns False when one side is
+        # empty — that path lets the timestamp/regular suppressions
+        # downstream do their work without crashing on the empty string.
+        from beancount_importer.pipeline.run import _diff_changes
+        entry = self._entry(narration="")
+        proposal = self._proposal(narration="Something new")
+        changes = _diff_changes(entry, proposal, None)
+        assert any(c.field == "narration" for c in changes)
+
+    def test_multi_posting_entry_suppresses_account_change(self):
+        from beancount_importer.pipeline.run import _diff_changes
+        entry = self._entry(target_account="Income:Salary", has_multiple_postings=True)
+        proposal = self._proposal(
+            postings=(Posting(account="Income:OtherSalary"),),
+        )
+        changes = _diff_changes(entry, proposal, None)
+        assert all(c.field != "account" for c in changes)
+
+    def test_amount_inferred_entry_short_circuits(self):
+        from beancount_importer.pipeline.run import _diff_changes
+        entry = self._entry(amount_inferred=True)
+        proposal = self._proposal(narration="anything", payee="Acme")
+        assert _diff_changes(entry, proposal, None) == []
+
+
+class TestDiffSuppressions:
+    """Phase 2 diff suppressions: truncation-equivalence (A1/A8),
+    timestamp-narration (A2), multi-posting category guard (A4).
+
+    The fixture in every test below puts the CSV row 8 days after the
+    bean entry so dedup doesn't fire — that way the row reaches
+    `_diff_changes` where the suppressions live.
+    """
+
+    def _setup(self, tmp_path: Path, *, bean_body: str) -> Path:
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(textwrap.dedent(bean_body))
+        return tmp_path
+
+    def test_truncation_equivalent_narration_no_diff(self, tmp_path: Path):
+        # Bean narration is a prefix of the (longer) CSV description —
+        # a previous run silently truncated it. No field change.
+        self._setup(
+            tmp_path,
+            bean_body="""\
+                2024-01-15 * "Acme" "Acme Inc"
+                  Assets:B:SPK  -10.00 EUR
+                  Expenses:X  10.00 EUR
+            """,
+        )
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "23.01.24;Acme;Acme Inc — Subscription Plan A;-10,00;EUR;\n"
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:X"),),
+                payee=ctx.txn.payee,
+                narration=ctx.txn.description,
+            )
+
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, categ, NoopReporter())
+        assert results[0].action == "update"
+        fields = {c.field for c in results[0].proposed_changes}
+        assert "narration" not in fields
+
+    def test_timestamp_narration_does_not_overwrite_real_narration(
+        self, tmp_path: Path
+    ):
+        # Bean entry has a human-typed narration ("Burger King"). CSV
+        # row's description is a transport-only timestamp string. The
+        # proposal must not propose to clobber the human narration.
+        self._setup(
+            tmp_path,
+            bean_body="""\
+                2024-01-15 * "BK" "Burger King"
+                  Assets:B:SPK  -10.00 EUR
+                  Expenses:Food  10.00 EUR
+            """,
+        )
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "23.01.24;BK;2024-01-23T12:00 Debit;-10,00;EUR;\n"
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Food"),),
+                payee=ctx.txn.payee,
+                narration=ctx.txn.description,
+            )
+
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, categ, NoopReporter())
+        fields = {c.field for c in results[0].proposed_changes}
+        assert "narration" not in fields
+
+    def test_multi_posting_category_guard_suppresses_account_change(
+        self, tmp_path: Path
+    ):
+        # Multi-posting salary entry — a rule that routes to a different
+        # account would otherwise propose a category change, but
+        # rewriting the user-authored deduction spread is wrong. The
+        # guard suppresses the account field; the proposal still
+        # propagates other fields the rule may change.
+        self._setup(
+            tmp_path,
+            bean_body="""\
+                2024-01-31 * "Employer" "Salary"
+                  Assets:B:SPK  2000.00 EUR
+                  Income:Salary  -3000.00 EUR
+                  Expenses:Tax  500.00 EUR
+                  Expenses:Insurance  500.00 EUR
+            """,
+        )
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "08.02.24;Employer;NewSalaryNarration;2000,00;EUR;\n"
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Income:OtherSalary"),),
+                payee=ctx.txn.payee,
+                narration=ctx.txn.description,
+            )
+
+        # Rule forces the proposal target to differ from the entry's
+        # target_account, otherwise the seed-silent-skip path swallows
+        # the row before `_diff_changes` runs.
+        rule = CategorizationRule(
+            target_account="Income:OtherSalary",
+            payee_pattern="Employer",
+        )
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, rules=(rule,), options=ImportOptions())
+        results = run(session, tmp_path, categ, NoopReporter())
+        fields = {c.field for c in results[0].proposed_changes}
+        assert "account" not in fields

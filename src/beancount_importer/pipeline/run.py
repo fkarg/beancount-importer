@@ -11,6 +11,7 @@ one `run()` call. The session itself is frozen.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,7 +21,7 @@ from pydantic import BaseModel, ConfigDict
 
 from beancount_importer.beancount_io.writer import format_transaction
 from beancount_importer.config import BankConfig
-from beancount_importer.matching.dedup import find_duplicate
+from beancount_importer.matching.dedup import find_definitive_duplicate
 from beancount_importer.matching.registry import (
     MatcherHook,
     MatchOutcome,
@@ -400,6 +401,7 @@ def _process_transaction(
         tag_state_delta=state.tag_delta,
         min_score=config.matching.min_score,
         match_txn=state.match_txn,
+        narration_max_length=config.narration_max_length,
     )
 
     new_rules_list = list(state.working_rules)
@@ -421,7 +423,12 @@ def _process_transaction(
             )
         )
         result, new_rules_list = _apply_merge_decision(
-            result, merge_decision, txn, bank, list(state.working_rules)
+            result,
+            merge_decision,
+            txn,
+            bank,
+            list(state.working_rules),
+            narration_max_length=config.narration_max_length,
         )
 
     # Claim the matched entry only on outcomes that actually consume it
@@ -469,7 +476,11 @@ def _short_circuit(
     if replay is not None:
         return replay
 
-    dedup = _try_dedup(state, existing=existing)
+    dedup = _try_dedup(
+        state,
+        existing=existing,
+        max_date_days=config.matching.dedup_max_date_days,
+    )
     if dedup is not None:
         return dedup
 
@@ -508,6 +519,7 @@ def _try_replay(
         tag_state_delta=None,
         min_score=config.matching.min_score,
         match_txn=state.match_txn,
+        narration_max_length=config.narration_max_length,
     )
     _claim_matched_entry(result, existing)
     return result
@@ -517,14 +529,20 @@ def _try_dedup(
     state: _TxnState,
     *,
     existing: list[LedgerEntry],
+    max_date_days: int,
 ) -> ImportResult | None:
     """Drop confirmed duplicates and claim the matched entry.
 
     Without claiming, two identical CSVs would both point at entry A
     and leave entry B looking like a CSV-orphan in the preview report.
+    `find_definitive_duplicate` deliberately returns None when 2+
+    candidates fit; those fall through to the scorer + merge prompt
+    so the user disambiguates instead of dedup picking blindly.
     """
     assert state.match_txn is not None  # set by _resolve_rule
-    duplicate = find_duplicate(state.match_txn, existing)
+    duplicate = find_definitive_duplicate(
+        state.match_txn, existing, max_date_days=max_date_days
+    )
     if duplicate is None:
         return None
     existing.remove(duplicate)
@@ -756,6 +774,8 @@ def _apply_merge_decision(
     txn: SourceTransaction,
     bank: BankConfig,
     working_rules: list[CategorizationRule],
+    *,
+    narration_max_length: int | None = None,
 ) -> tuple[ImportResult, list[CategorizationRule]]:
     """Translate a Screen-3 outcome into a finalised `ImportResult`.
 
@@ -816,7 +836,9 @@ def _apply_merge_decision(
         # Fresh entry instead of touching the matched one. The proposal
         # already came from the categorizer; we just reformat it as a
         # new-entry text and clear the matched-entry pointer.
-        new_text = _format_new_entry(bank, txn, result.proposal)
+        new_text = _format_new_entry(
+            bank, txn, result.proposal, narration_max_length=narration_max_length
+        )
         return (
             result.model_copy(
                 update={
@@ -902,6 +924,7 @@ def _build_result(
     tag_state_delta: TagStateDelta | None,
     min_score: float,
     match_txn: SourceTransaction | None = None,
+    narration_max_length: int | None = None,
 ) -> ImportResult:
     """Assemble the per-row result.
 
@@ -938,7 +961,9 @@ def _build_result(
     if best is not None:
         proposed_changes = _diff_changes(best, proposal, matched_rule)
     else:
-        new_entry_text = _format_new_entry(bank, txn, proposal)
+        new_entry_text = _format_new_entry(
+            bank, txn, proposal, narration_max_length=narration_max_length
+        )
 
     return ImportResult(
         source_txn=txn,
@@ -1066,8 +1091,6 @@ def _advance_tag(tag: ActiveTag | None, booking_date) -> ActiveTag | None:
 
 
 def _matches_skip_pattern(patterns, txn: SourceTransaction) -> bool:
-    import re
-
     for p in patterns:
         if p.field == "payee":
             haystack = txn.payee or ""
@@ -1210,9 +1233,28 @@ def _derive_rule(txn: SourceTransaction, proposal: CategoryProposal) -> Categori
 
 
 def _escape_for_regex(s: str) -> str:
-    import re
-
     return re.escape(s.strip())
+
+
+_TIMESTAMP_NARRATION_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?"
+    r"\s*(Debit|Credit|Lastschrift|Gutschrift)?\s*$"
+)
+
+
+def _is_truncation_equivalent(proposal: str, existing: str) -> bool:
+    """True when one string is a prefix of the other (after rstrip).
+
+    The writer silently truncates narrations to `narration_max_length`;
+    re-importing the same row with the original (longer) narration must
+    not register as a field change. Symmetric: the existing entry might
+    be the longer one if the user lowered the truncation length.
+    """
+    p = proposal.rstrip()
+    e = existing.rstrip()
+    if not p or not e:
+        return False
+    return p.startswith(e) or e.startswith(p)
 
 
 def _diff_changes(
@@ -1242,12 +1284,32 @@ def _diff_changes(
             changes.append(ProposedChange("payee", entry.payee or "", proposal.payee))
 
     if proposal.narration and proposal.narration != entry.narration:
-        if not (rule and rule.suppress_narration_updates):
-            changes.append(
-                ProposedChange("narration", entry.narration, proposal.narration)
+        # A1/A8: a re-imported CSV row whose narration was previously
+        # truncated at write time differs by suffix only. Don't propose
+        # rewinding the truncation as a field change.
+        if not _is_truncation_equivalent(proposal.narration, entry.narration):
+            # A2: bare CSV `Type`-shaped values (timestamp + Debit/Credit)
+            # are pure transport metadata, not anything the user typed.
+            # Suppress the overwrite when the existing entry already has
+            # a real narration ("Burger King") and no rule forces it.
+            timestamp_proposal = bool(
+                _TIMESTAMP_NARRATION_RE.match(proposal.narration)
             )
+            real_existing = bool(
+                entry.narration and not _TIMESTAMP_NARRATION_RE.match(entry.narration)
+            )
+            if not (timestamp_proposal and real_existing and rule is None):
+                if not (rule and rule.suppress_narration_updates):
+                    changes.append(
+                        ProposedChange("narration", entry.narration, proposal.narration)
+                    )
 
     if proposal.target_account and proposal.target_account != entry.target_account:
+        # A4: salary / multi-leg entries are user-authored structures; a
+        # single CSV row should not rewrite the merchant-side account
+        # away from whatever the user spread across the deduction legs.
+        if entry.has_multiple_postings:
+            return changes
         if not (rule and rule.suppress_account_updates):
             changes.append(
                 ProposedChange("account", entry.target_account, proposal.target_account)

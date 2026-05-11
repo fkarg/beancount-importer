@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 from beancount_importer.matching.normalize import normalize_text
 from beancount_importer.matching.scorer import similarity_score, levenshtein_distance, lcs_length
-from beancount_importer.matching.dedup import dedup_key, is_duplicate
+from beancount_importer.matching.dedup import find_definitive_duplicate, is_duplicate
 from beancount_importer.models import SourceTransaction, LedgerEntry
 
 
@@ -130,108 +130,88 @@ class TestLcsLength:
         assert lcs_length("ABC", "abc") == 3
 
 
-# ── dedup_key ────────────────────────────────────────────────────────────────
+# ── find_definitive_duplicate ────────────────────────────────────────────────
 
-class TestDedupKey:
-    def test_uses_sepa_ref_when_present(self):
+class TestFindDefinitiveDuplicate:
+    """Dedup: SEPA-reference equality is definitive; otherwise we require
+    exact (amount, currency) and a date-pair overlap within tolerance.
+    Multi-candidate cases deliberately fall through to the scorer.
+    """
+
+    def test_empty_list(self):
         txn = make_txn(sepa_reference="NETFLIX-001")
-        assert dedup_key(txn) == "sepa:NETFLIX-001"
+        assert find_definitive_duplicate(txn, [], max_date_days=5) is None
 
-    def test_uses_hash_when_no_sepa(self):
-        txn = make_txn(sepa_reference="")
-        key = dedup_key(txn)
-        assert key.startswith("hash:")
+    def test_sepa_ref_is_definitive(self):
+        # Sepa-ref equality wins even when amounts and dates differ —
+        # the user's bank guarantees the reference is unique.
+        txn = make_txn(
+            sepa_reference="NETFLIX-001",
+            amount=Decimal("-15.99"),
+            booking_date=date(2024, 1, 15),
+        )
+        entry = make_entry(
+            metadata={"sepa_ref": "NETFLIX-001"},
+            amount=Decimal("-15.99"),
+            date=date(2024, 1, 22),
+        )
+        assert find_definitive_duplicate(txn, [entry], max_date_days=5) is entry
 
-    def test_hash_deterministic(self):
-        txn = make_txn(sepa_reference="")
-        assert dedup_key(txn) == dedup_key(txn)
+    def test_sepa_ref_metadata_alias_recognised(self):
+        # Older entries used `sepa_reference` instead of `sepa_ref`; both
+        # spellings must count as the same key.
+        txn = make_txn(sepa_reference="REF-007")
+        entry = make_entry(metadata={"sepa_reference": "REF-007"})
+        assert find_definitive_duplicate(txn, [entry], max_date_days=5) is entry
 
-    def test_different_amounts_different_hash(self):
-        t1 = make_txn(sepa_reference="", amount=Decimal("-10"))
-        t2 = make_txn(sepa_reference="", amount=Decimal("-20"))
-        assert dedup_key(t1) != dedup_key(t2)
+    def test_amount_currency_date_match_silent_skips(self):
+        txn = make_txn(sepa_reference="", booking_date=date(2024, 3, 15))
+        entry = make_entry(date=date(2024, 3, 17))
+        assert find_definitive_duplicate(txn, [entry], max_date_days=5) is entry
 
-    def test_different_sepa_different_key(self):
-        t1 = make_txn(sepa_reference="REF-001")
-        t2 = make_txn(sepa_reference="REF-002")
-        assert dedup_key(t1) != dedup_key(t2)
-
-
-# ── is_duplicate ─────────────────────────────────────────────────────────────
-
-class TestIsDuplicate:
-    def test_not_duplicate_when_empty_list(self):
-        txn = make_txn(sepa_reference="NETFLIX-001")
-        assert not is_duplicate(txn, [])
-
-    def test_detects_sepa_match(self):
-        txn = make_txn(sepa_reference="NETFLIX-001")
-        entry = make_entry(metadata={"sepa_ref": "NETFLIX-001"})
-        assert is_duplicate(txn, [entry])
-
-    def test_no_false_positive_different_sepa(self):
-        txn = make_txn(sepa_reference="NETFLIX-002")
-        entry = make_entry(metadata={"sepa_ref": "NETFLIX-001"})
-        assert not is_duplicate(txn, [entry])
-
-    def test_not_duplicate_different_amounts(self):
-        t1 = make_txn(sepa_reference="", amount=Decimal("-10"))
-        e = make_entry(amount=Decimal("-20"), narration="other")
-        assert not is_duplicate(t1, [e])
-
-    def test_detects_content_match_on_cash_withdrawal(self):
-        # Real-world regression: cash withdrawal at SPK ATM has no SEPA
-        # ref, falls back to the content hash. Previously the txn hash
-        # used `bank_key="spk"` while the entry hash used
-        # `source_account="Assets:B:SPK"` — different strings, so the
-        # hashes never matched and dedup quietly missed every cash row.
-        # Verify the content path now matches across the bank/account
-        # naming gap.
+    def test_value_date_matches_metadata_date(self):
+        # Plugin-rewritten entry on the value-date (paypal: 2024-03-17).
+        # The txn's value_date matches the metadata-derived date even when
+        # booking_date is days away.
         txn = make_txn(
             sepa_reference="",
-            booking_date=date(2024, 12, 23),
-            amount=Decimal("-240.00"),
-            payee="GA NR00003062 BLZ72051210 1",
-            description="23.12/13.45UHR AICHACH BARGELDAUSZAHLUNG",
-            bank_key="spk",
+            booking_date=date(2024, 3, 15),
+            value_date=date(2024, 3, 17),
         )
         entry = make_entry(
-            date=date(2024, 12, 23),
-            amount=Decimal("-240.00"),
-            payee="GA NR00003062 BLZ72051210 1",
-            narration="23.12/13.45UHR AICHACH BARGELDAUSZAHLUNG",
-            source_account="Assets:B:SPK",
+            date=date(2024, 3, 20),
+            metadata_dates=(date(2024, 3, 17),),
         )
-        assert is_duplicate(txn, [entry])
+        assert find_definitive_duplicate(txn, [entry], max_date_days=5) is entry
 
-    def test_detects_match_when_txn_has_sepa_but_entry_lacks_metadata(self):
-        # Real-world regression: the writer doesn't emit `sepa_ref`
-        # metadata, so a re-import of a SEPA-bearing CSV row used to
-        # silently miss its own previously-imported entry — the txn
-        # side keyed `sepa:X` while the entry side fell through to
-        # the content hash. Dedup now compares key *sets*, so the
-        # shared content hash catches this case.
-        txn = make_txn(
-            sepa_reference="1034114065753",
-            payee="PayPal Europe S.a.r.l. et Cie S.C.A",
-            description="1034114065753/. Uber, Ihr Einkauf bei Uber FOLGELASTSCHRIFT",
-        )
-        entry = make_entry(
-            payee="PayPal Europe S.a.r.l. et Cie S.C.A",
-            narration="1034114065753/. Uber, Ihr Einkauf bei Uber FOLGELASTSCHRIFT",
-            metadata={},
-        )
-        assert is_duplicate(txn, [entry])
+    def test_no_match_when_amount_differs(self):
+        txn = make_txn(sepa_reference="", amount=Decimal("-10.00"))
+        entry = make_entry(amount=Decimal("-20.00"))
+        assert find_definitive_duplicate(txn, [entry], max_date_days=5) is None
 
-    def test_detects_content_match_when_payee_only_differs_in_capitalisation(self):
-        # Sanity: hashes are case-sensitive (we don't normalise here —
-        # that's the scorer's job). If a user lowercased the payee in
-        # the bean file, dedup should NOT fire and the matcher's fuzzy
-        # path takes over. Keeps the contract honest about what dedup
-        # buys you (exact match, fast path).
-        txn = make_txn(sepa_reference="", payee="NETFLIX")
-        entry = make_entry(payee="netflix")
-        assert not is_duplicate(txn, [entry])
+    def test_no_match_when_currency_differs(self):
+        txn = make_txn(sepa_reference="", currency="USD")
+        entry = make_entry(currency="EUR")
+        assert find_definitive_duplicate(txn, [entry], max_date_days=5) is None
+
+    def test_no_match_when_outside_date_window(self):
+        txn = make_txn(sepa_reference="", booking_date=date(2024, 1, 15))
+        entry = make_entry(date=date(2024, 1, 25))
+        assert find_definitive_duplicate(txn, [entry], max_date_days=5) is None
+
+    def test_multi_candidate_falls_through(self):
+        # Two same-week entries with the same amount: dedup deliberately
+        # abstains so the user can disambiguate in the merge prompt.
+        txn = make_txn(sepa_reference="", booking_date=date(2024, 1, 15))
+        e1 = make_entry(date=date(2024, 1, 15))
+        e2 = make_entry(date=date(2024, 1, 16))
+        assert find_definitive_duplicate(txn, [e1, e2], max_date_days=5) is None
+
+    def test_is_duplicate_wrapper(self):
+        txn = make_txn(sepa_reference="NETFLIX-001")
+        entry = make_entry(metadata={"sepa_ref": "NETFLIX-001"})
+        assert is_duplicate(txn, [entry])
+        assert not is_duplicate(txn, [])
 
 
 # ── transfers: heuristic ─────────────────────────────────────────────────────

@@ -192,8 +192,13 @@ class GenericCsvParser:
             if isinstance(csv_cfg.field_description, list)
             else [csv_cfg.field_description]
         )
+        # Bank-specific noise values (e.g. N26's `Type: Presentment`) are
+        # dropped at the part level — comparing the trimmed value
+        # case-insensitively against the configured blacklist.
+        blacklist = {b.strip().lower() for b in csv_cfg.field_description_blacklist}
         parts = [row.get(f, "").strip() for f in desc_fields if f]
-        joined = " ".join(p for p in parts if p)
+        parts = [p for p in parts if p and p.lower() not in blacklist]
+        joined = " ".join(parts)
         description = joined or None
 
         sepa_reference = ""

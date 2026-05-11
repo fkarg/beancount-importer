@@ -1,107 +1,111 @@
 """Dedup: silent-skip on second import of the same row.
 
 Callers must pre-filter `existing` to entries from the same bank as
-`txn` — `is_duplicate` does *not* re-check the source account. This
-matters because the txn-side carries `bank_key` (e.g. "spk") while
-the entry-side carries `source_account` (e.g. "Assets:B:SPK"); they
-intentionally don't appear in the hash so the two sides are
-comparable. The pipeline's per-bank bucketing in
-`_process_transaction`'s caller is what enforces the bank match.
+`txn` — `find_definitive_duplicate` does *not* re-check the source
+account. The pipeline's per-bank bucketing enforces the bank match.
 
-Two-key match: each side produces a SET of candidate keys (always a
-content hash, plus a `sepa:<ref>` key when one is available), and a
-duplicate is declared when the sets intersect. This handles the
-common case where the CSV row carries a SEPA reference but the
-existing bean entry — written by an importer that doesn't emit
-`sepa_ref` metadata — only has the content-hash key. Without the
-fallback, every SEPA-bearing row whose existing entry lacks the
-metadata gets re-prompted on every import.
+Strategy: SEPA-reference equality wins definitively. Otherwise filter
+candidates by `(amount, currency)` and require at least one txn-side
+date (booking or value date) to land within `max_date_days` of any
+entry-side date (entry.date or one of its metadata_dates, i.e. the
+plugin-expanded `actual:` / `paypal:` / `settle:` dates). The function
+returns a single matching candidate only — when two or more entries
+fit, dedup deliberately abstains so the scorer + merge prompt can
+disambiguate (handles the common case of multiple identical
+amount/date pairs in the same week).
 
-Description-vs-narration: the content hash uses raw description on the
-txn side and narration on the entry side. They line up *iff* the user
-hasn't edited the bean file's narration after the first import. Edits
-break the content-hash path — that's a real risk for users who clean
-up their ledgers, but the cure (storing the original raw description
-on every entry) costs more than it pays. The SEPA path survives
-narration edits as long as `sepa_ref` is present somewhere.
+`value_date` is checked first on the txn side because plugin-rewritten
+entries usually land on the value-date, biasing the cheap path toward
+the hit. SEPA shortcuts all of this.
 """
 
 from __future__ import annotations
 
-import hashlib
+from datetime import date
 
-from beancount_importer.models import SourceTransaction, LedgerEntry
-
-
-def dedup_key(txn: SourceTransaction) -> str:
-    """Primary dedup key: SEPA reference if present, else content hash.
-
-    Kept for callers that want a single canonical key (e.g. logging or
-    tests). Dedup itself uses `_txn_keys` / `_entry_keys`, which
-    return *all* candidate keys so a SEPA-bearing txn still matches
-    an entry that only carries the content-hash key.
-    """
-    if txn.sepa_reference:
-        return f"sepa:{txn.sepa_reference}"
-    return _content_hash(txn)
+from beancount_importer.models import LedgerEntry, SourceTransaction
 
 
-def _content_hash(txn: SourceTransaction) -> str:
-    parts = "|".join([
-        str(txn.booking_date),
-        str(txn.amount),
-        txn.currency,
-        txn.payee or "",
-        txn.description or "",
-    ])
-    digest = hashlib.sha256(parts.encode()).hexdigest()[:16]
-    return f"hash:{digest}"
+def _txn_candidate_dates(txn: SourceTransaction) -> tuple[date, ...]:
+    """Dates the txn side might collide on. `value_date` first because it
+    matches plugin-rewritten entries (`actual:`/`paypal:`/`settle:`) more
+    often than the raw booking date."""
+    if txn.value_date is None:
+        return (txn.booking_date,)
+    if txn.value_date == txn.booking_date:
+        return (txn.booking_date,)
+    return (txn.value_date, txn.booking_date)
 
 
-def _txn_keys(txn: SourceTransaction) -> set[str]:
-    keys = {_content_hash(txn)}
-    if txn.sepa_reference:
-        keys.add(f"sepa:{txn.sepa_reference}")
-    return keys
+def _entry_candidate_dates(entry: LedgerEntry) -> tuple[date, ...]:
+    """Entry-side dates: the entry's own date plus any metadata-derived
+    dates from `actual:`/`paypal:`/`settle:` postings."""
+    return (entry.date, *entry.metadata_dates)
 
 
-def _entry_keys(entry: LedgerEntry) -> set[str]:
-    parts = "|".join([
-        str(entry.date),
-        str(entry.amount),
-        entry.currency,
-        entry.payee or "",
-        entry.narration,
-    ])
-    digest = hashlib.sha256(parts.encode()).hexdigest()[:16]
-    keys = {f"hash:{digest}"}
-    sepa = entry.metadata.get("sepa_ref") or entry.metadata.get("sepa_reference", "")
-    if sepa:
-        keys.add(f"sepa:{sepa}")
-    return keys
+def _entry_sepa(entry: LedgerEntry) -> str:
+    return entry.metadata.get("sepa_ref") or entry.metadata.get("sepa_reference", "")
 
 
-def is_duplicate(txn: SourceTransaction, existing: list[LedgerEntry]) -> bool:
-    """Return True if any existing entry has the same dedup key.
-
-    Callers must have already filtered `existing` to the same-bank
-    bucket; the hashes deliberately omit account/bank fields.
-    """
-    return find_duplicate(txn, existing) is not None
-
-
-def find_duplicate(
-    txn: SourceTransaction, existing: list[LedgerEntry]
+def find_definitive_duplicate(
+    txn: SourceTransaction,
+    entries: list[LedgerEntry],
+    *,
+    max_date_days: int,
 ) -> LedgerEntry | None:
-    """Return the first entry whose keys overlap `txn`'s, or None.
+    """Return the sole entry that definitively duplicates `txn`, or None.
 
-    Used by the pipeline to "claim" the matched entry — without it,
-    two identical CSV rows would both dedup-skip pointing at the
-    *same* entry, leaving its sibling looking like a CSV-orphan in
-    the preview report.
+    Match rules:
+    - If `txn.sepa_reference` is non-empty, the first entry with the same
+      `sepa_ref`/`sepa_reference` metadata wins immediately (date and amount
+      ignored — the reference is the user's source of truth).
+    - Otherwise: filter `entries` by exact (amount, currency) match, then
+      require any txn-side candidate date to be within `max_date_days` of
+      any entry-side candidate date. If exactly one entry passes, return it.
+      If zero or 2+ entries pass, return None so the scorer + merge prompt
+      can decide.
+
+    Returning None on multi-candidate cases is deliberate: two identical
+    same-week rows are exactly the situation where a silent dedup-skip
+    would attach the wrong CSV row to the wrong entry. The merge prompt
+    sees both and gives the user the choice.
     """
-    keys = _txn_keys(txn)
-    for entry in existing:
-        if keys & _entry_keys(entry):
-            return entry
-    return None
+    if txn.sepa_reference:
+        for entry in entries:
+            if _entry_sepa(entry) == txn.sepa_reference:
+                return entry
+        # No SEPA-side match: fall through to date/amount path. Some banks
+        # ship SEPA-bearing rows whose existing entry was written by a
+        # different importer that never persisted the reference; the date
+        # window is enough to recognise them.
+
+    txn_dates = _txn_candidate_dates(txn)
+    matches: list[LedgerEntry] = []
+    for entry in entries:
+        if entry.amount != txn.amount:
+            continue
+        if entry.currency != txn.currency:
+            continue
+        entry_dates = _entry_candidate_dates(entry)
+        if any(
+            abs((td - ed).days) <= max_date_days
+            for td in txn_dates
+            for ed in entry_dates
+        ):
+            matches.append(entry)
+            if len(matches) > 1:
+                return None
+    return matches[0] if matches else None
+
+
+def is_duplicate(
+    txn: SourceTransaction,
+    existing: list[LedgerEntry],
+    *,
+    max_date_days: int = 5,
+) -> bool:
+    """Thin wrapper for callers that only need a boolean."""
+    return (
+        find_definitive_duplicate(txn, existing, max_date_days=max_date_days)
+        is not None
+    )

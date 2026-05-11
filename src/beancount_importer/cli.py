@@ -19,6 +19,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from beancount_importer import __version__, source_hash
 from beancount_importer.beancount_io.writer import append_entry, apply_update
 from beancount_importer.config import Config
 from beancount_importer.models import (
@@ -49,6 +50,26 @@ app = typer.Typer(
     add_completion=False,
     help="Modular beancount CSV importer.",
 )
+
+
+def _version_callback(value: bool) -> None:
+    """Print "bean-import <version> (<source-hash>)" and exit.
+
+    Install-time metadata version + live source-tree hash. The version
+    comes from the installed .dist-info (snapshotted by uv/pip at
+    install time) and can be stale for editable installs. The src hash,
+    by contrast, is computed from the .py files Python is currently
+    importing — so if the two don't match a known-good reference, the
+    user can tell at a glance whether the running code matches what
+    they think they have installed.
+    """
+    if not value:
+        return
+    typer.echo(f"bean-import {__version__} ({source_hash()})")
+    raise typer.Exit()
+
+
+
 # `emoji=False` is essential: account paths like `Assets:B:SPK` and
 # `Liabilities:CreditCard:Visa` contain `:X:` substrings that Rich's emoji
 # subsystem would otherwise rewrite into emoji glyphs.
@@ -275,6 +296,15 @@ def main(
             help="Migrate a legacy importer setup in the current directory, then exit",
         ),
     ] = False,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Print version (with source-tree hash) and exit",
+        ),
+    ] = False,
 ) -> None:
     """Import CSV transactions into beancount ledger files.
 
@@ -286,6 +316,8 @@ def main(
         bean-import --init                   # scaffold a new project
         bean-import --migrate                # migrate legacy setup
     """
+    del version  # handled via callback; only present in signature for --help
+
     if init:
         _run_init(Path("."))
         return

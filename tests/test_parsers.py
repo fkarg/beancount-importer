@@ -462,6 +462,44 @@ class TestGenericCsvParserExtras:
         txns = list(parser.parse(str(f)))
         assert txns[0].currency == "EUR"
 
+    def test_field_description_blacklist_drops_noise_values(self, tmp_path: Path):
+        # N26 ships rows with `Type: Presentment` in the description-column
+        # set, which is pure transport noise. The blacklist drops parts
+        # whose trimmed value equals (case-insensitively) any listed
+        # string before joining.
+        toml = textwrap.dedent("""\
+            [[banks]]
+            key = "n26"
+            display_name = "N26"
+            account = "Assets:B:N26"
+            file_glob = "N26_*.csv"
+            output_file = "n26.bean"
+
+            [banks.csv]
+            delimiter = ","
+            date_format = ["%Y-%m-%d"]
+            amount_locale = "en"
+            field_date = "Booking Date"
+            field_amount = "Amount (EUR)"
+            field_payee = "Partner Name"
+            field_description = ["Type", "Payment Reference"]
+            field_description_blacklist = ["Presentment"]
+        """)
+        cfg_path = tmp_path / "n26.toml"
+        cfg_path.write_text(toml)
+        cfg = Config.load(cfg_path).banks[0]
+        text = textwrap.dedent("""\
+            Booking Date,Amount (EUR),Partner Name,Type,Payment Reference
+            2024-01-15,-9.50,Acme,Presentment,Coffee
+            2024-01-16,-1.00,Acme,Direct Debit,Coffee
+        """)
+        f = tmp_path / "n26.csv"
+        f.write_text(text)
+        parser = GenericCsvParser(cfg)
+        txns = list(parser.parse(str(f)))
+        assert txns[0].description == "Coffee"
+        assert txns[1].description == "Direct Debit Coffee"
+
     def test_original_amount_and_currency(self, tmp_path: Path):
         toml = textwrap.dedent("""\
             [[banks]]
