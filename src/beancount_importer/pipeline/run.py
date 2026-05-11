@@ -37,6 +37,7 @@ from beancount_importer.models import (
     ProposedChange,
     SourceTransaction,
 )
+from beancount_importer.pipeline._clean import clean_paypal_noise
 from beancount_importer.pipeline._shared import (
     _load_all_outputs,
     _parse_all_inputs,
@@ -241,6 +242,11 @@ def run(
 
     for progress, txn in enumerate(inputs, start=1):
         reporter.on_progress(progress, total, txn.bank_key)
+        # Pre-match cleaner: tidies SPK-style PayPal rows so the
+        # merge-prompt display and text-similarity scoring see a
+        # clean payee + description instead of bank transport noise.
+        # Other rows pass through unchanged.
+        txn = clean_paypal_noise(txn)
 
         bank_cfg = bank_by_key[txn.bank_key]
         bucket = existing_by_account.get(bank_account_by_key[txn.bank_key], [])
@@ -261,6 +267,16 @@ def run(
             auto_threshold=session.options.auto_threshold,
             progress=(progress, total),
         )
+
+        counter = _synthesize_counter_leg(
+            result,
+            txn,
+            internal_prefixes=tuple(config.matching.internal_transfer_account_prefixes),
+            bank_accounts=set(bank_accounts),
+        )
+        if counter is not None:
+            existing_by_account.setdefault(counter.source_account, []).append(counter)
+            existing.append(counter)
 
         decisions.record(txn, result)
         reporter.on_result(result)
@@ -402,6 +418,7 @@ def _process_transaction(
         min_score=config.matching.min_score,
         match_txn=state.match_txn,
         narration_max_length=config.narration_max_length,
+        paypal_account=config.paypal_account,
     )
 
     new_rules_list = list(state.working_rules)
@@ -520,6 +537,7 @@ def _try_replay(
         min_score=config.matching.min_score,
         match_txn=state.match_txn,
         narration_max_length=config.narration_max_length,
+        paypal_account=config.paypal_account,
     )
     _claim_matched_entry(result, existing)
     return result
@@ -925,6 +943,7 @@ def _build_result(
     min_score: float,
     match_txn: SourceTransaction | None = None,
     narration_max_length: int | None = None,
+    paypal_account: str | None = None,
 ) -> ImportResult:
     """Assemble the per-row result.
 
@@ -959,7 +978,12 @@ def _build_result(
     proposed_changes: list[ProposedChange] = []
     new_entry_text = ""
     if best is not None:
-        proposed_changes = _diff_changes(best, proposal, matched_rule)
+        if best.amount_inferred:
+            proposed_changes, proposal = _propose_date_metadata(
+                txn, best, proposal, paypal_account=paypal_account
+            )
+        else:
+            proposed_changes = _diff_changes(best, proposal, matched_rule)
     else:
         new_entry_text = _format_new_entry(
             bank, txn, proposal, narration_max_length=narration_max_length
@@ -1236,6 +1260,111 @@ def _escape_for_regex(s: str) -> str:
     return re.escape(s.strip())
 
 
+def _synthesize_counter_leg(
+    result: ImportResult,
+    txn: SourceTransaction,
+    *,
+    internal_prefixes: tuple[str, ...],
+    bank_accounts: set[str],
+) -> LedgerEntry | None:
+    """Create an inferred-amount LedgerEntry mirroring a cross-bank transfer.
+
+    Fires when `_process_transaction` returns `action="new"` and the
+    proposal's target account looks like another configured bank (or
+    matches any `internal_transfer_account_prefixes`). The synthesized
+    entry sits in the *target* bank's bucket so subsequent CSV rows
+    from that bank match it via the scorer's `amount_inferred` path
+    (rather than the user being prompted again for the same flow).
+
+    `amount_inferred=True` is the contract that makes
+    `_propose_date_metadata` fire when the second bank's CSV date
+    disagrees with the first leg's booking date.
+    """
+    if result.action != "new" or result.proposal is None:
+        return None
+    target = result.proposal.target_account
+    if not target:
+        return None
+    if target not in bank_accounts and not target.startswith(internal_prefixes):
+        return None
+    return LedgerEntry(
+        date=txn.value_date or txn.booking_date,
+        narration=result.proposal.narration or txn.description or "",
+        payee=result.proposal.payee or txn.payee,
+        source_account=target,
+        target_account="",
+        amount=-txn.amount,
+        currency=txn.currency,
+        amount_inferred=True,
+        metadata={"_pending_in_session": "true"},
+        file_path="",
+        line_start=0,
+    )
+
+
+def _propose_date_metadata(
+    txn: SourceTransaction,
+    entry: LedgerEntry,
+    proposal: CategoryProposal,
+    *,
+    paypal_account: str | None,
+) -> tuple[list[ProposedChange], CategoryProposal]:
+    """For amount_inferred (cross-bank transit) matches, propose date
+    metadata on the matched leg's posting when the CSV and ledger
+    dates disagree. Returns the (possibly empty) ProposedChange list
+    plus a (possibly mutated) proposal carrying the new metadata.
+
+    Routing:
+
+    | CSV date vs entry.date | Matched account is `paypal_account`? | Key      |
+    |  Earlier               | Yes                                  | `paypal` |
+    |  Earlier               | No                                   | `actual` |
+    |  Later                 | (n/a)                                | `settle` |
+    |  Equal                 | (n/a)                                | (none)   |
+
+    The metadata sits on the matched-entry's posting — the inferred
+    leg, which is the one that needs the alternate-date hint so the
+    user's plugin moves the posting back to the CSV's recorded date.
+    The writer renders posting-level metadata indented under the
+    posting line per Phase 1.
+    """
+    csv_date = txn.value_date or txn.booking_date
+    if csv_date == entry.date:
+        return [], proposal
+
+    if csv_date > entry.date:
+        key = "settle"
+    elif paypal_account is not None and entry.source_account == paypal_account:
+        key = "paypal"
+    else:
+        key = "actual"
+
+    new_value = csv_date.isoformat()
+
+    # The proposal's first posting is the target_account (the inferred
+    # leg's account). Attach the metadata there. If the key already
+    # carries the same value, no change is proposed.
+    existing_value = ""
+    if proposal.postings and key in proposal.postings[0].metadata:
+        existing_value = proposal.postings[0].metadata[key]
+    if existing_value == new_value:
+        return [], proposal
+
+    updated_postings: list[Posting] = []
+    for i, p in enumerate(proposal.postings):
+        if i == 0:
+            updated_postings.append(
+                p.model_copy(update={"metadata": {**p.metadata, key: new_value}})
+            )
+        else:
+            updated_postings.append(p)
+    updated = proposal.model_copy(update={"postings": tuple(updated_postings)})
+    return (
+        [ProposedChange(field=f"posting:{key}", old_val=existing_value, new_val=new_value)],
+        updated,
+    )
+
+
 _TIMESTAMP_NARRATION_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?"
     r"\s*(Debit|Credit|Lastschrift|Gutschrift)?\s*$"
@@ -1268,15 +1397,6 @@ def _diff_changes(
     changes: list[ProposedChange] = []
     suppress_all = rule.suppress_updates if rule else False
     if suppress_all:
-        return []
-
-    # Cross-bank transit match: the matched entry lives in another bank's
-    # ledger (e.g., the PayPal leg of an SPK→PayPal transfer). The CSV row
-    # being imported describes the *merchant* side; the existing entry
-    # describes the *funding* side. Updating the funding-bank's payee or
-    # narration from a PayPal-CSV proposal is wrong — it'd corrupt the
-    # original SPK booking. Treat the row as already accounted for.
-    if entry.amount_inferred:
         return []
 
     if proposal.payee and proposal.payee != (entry.payee or ""):

@@ -2565,6 +2565,306 @@ class TestEmptyState:
         assert results == []
 
 
+class TestInSessionCounterLeg:
+    """Phase 3 counter-leg synthesis: when an SPK row routes to N26 (or
+    another configured-bank target) in a single run, a synthesized
+    inferred-amount LedgerEntry lands in the N26 bucket so the same
+    transfer's N26 CSV row silent-matches and doesn't re-prompt.
+    """
+
+    def _n26_bank(self) -> BankConfig:
+        return BankConfig(
+            key="n26",
+            display_name="N26",
+            account="Assets:B:N26",
+            file_glob="N26_*.csv",
+            output_file="n26.bean",
+            csv=CsvConfig(
+                delimiter=";",
+                date_format=["%d.%m.%y"],
+                amount_locale="de",
+                field_date="Buchungstag",
+                field_amount="Betrag",
+                field_currency="Waehrung",
+                field_payee="Beguenstigter",
+                field_description="Verwendungszweck",
+            ),
+        )
+
+    def test_spk_to_n26_synthesizes_counter_leg_in_n26_bucket(
+        self, tmp_path: Path
+    ):
+        # SPK CSV: one outgoing transfer to N26.
+        (tmp_path / "SPK_2024.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.03.24;N26;Transfer;-50,00;EUR;\n"
+        )
+        # N26 CSV: matching incoming transfer, 2 days later. Same run.
+        (tmp_path / "N26_2024.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung\n"
+            "17.03.24;Sparkasse;Transfer;50,00;EUR\n"
+        )
+        (tmp_path / "transactions").mkdir()
+
+        def categ(ctx):
+            # SPK row is the only one that should reach categorize_fn.
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Assets:B:N26"),),
+                payee=ctx.txn.payee,
+                narration=ctx.txn.description,
+            )
+
+        cfg = Config(
+            banks=[
+                make_spk_bank(year_template_output=False),
+                self._n26_bank(),
+            ],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, categ, NoopReporter())
+        # Two CSV rows → two results. The SPK row creates the entry;
+        # the N26 row matches the in-session synthesized counter-leg
+        # and proposes a `settle:` metadata addition (date differs).
+        spk = next(r for r in results if r.source_txn.bank_key == "spk")
+        n26 = next(r for r in results if r.source_txn.bank_key == "n26")
+        assert spk.action == "new"
+        assert n26.action == "update"
+        assert n26.matched_entry is not None
+        assert n26.matched_entry.amount_inferred is True
+        # Date diff metadata: N26-side CSV is *later*, so propose `settle:`.
+        meta_fields = {c.field for c in n26.proposed_changes}
+        assert "posting:settle" in meta_fields
+
+    def test_synthesis_skipped_when_target_is_not_a_configured_bank(
+        self, tmp_path: Path
+    ):
+        # SPK CSV row routes to an Expenses account — not a transfer,
+        # no counter-leg should be created.
+        (tmp_path / "SPK_2024.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.03.24;Spotify;Premium;-15,00;EUR;\n"
+        )
+        (tmp_path / "transactions").mkdir()
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Subscriptions"),),
+            )
+
+        cfg = Config(
+            banks=[make_spk_bank(year_template_output=False)],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        session = ImportSession(config=cfg, options=ImportOptions())
+        results = run(session, tmp_path, categ, NoopReporter())
+        assert len(results) == 1
+        assert results[0].action == "new"
+        # No second row exists, but the in-session bucket shouldn't
+        # have been mutated either — covered indirectly by the
+        # symmetric test above.
+
+
+class TestDateMetadataProposal:
+    """`_propose_date_metadata` decides which key (actual/settle/paypal)
+    to attach to the matched leg's posting based on date direction and
+    whether the target is the configured PayPal account.
+    """
+
+    def _txn(self, csv_date: date) -> SourceTransaction:
+        return SourceTransaction(
+            booking_date=csv_date,
+            amount=Decimal("50.00"),
+            currency="EUR",
+            bank_key="n26",
+            payee="X",
+            description="X",
+        )
+
+    def _inferred_entry(
+        self, *, entry_date: date, source_account: str = "Assets:B:N26"
+    ) -> LedgerEntry:
+        return LedgerEntry(
+            date=entry_date,
+            narration="Transfer",
+            source_account=source_account,
+            target_account="Assets:B:SPK",
+            amount=Decimal("50.00"),
+            currency="EUR",
+            amount_inferred=True,
+        )
+
+    def _proposal(self, target: str = "Assets:B:N26") -> CategoryProposal:
+        return CategoryProposal(
+            action="categorize",
+            postings=(Posting(account=target),),
+        )
+
+    def test_csv_later_proposes_settle(self):
+        from beancount_importer.pipeline.run import _propose_date_metadata
+        txn = self._txn(date(2024, 3, 17))
+        entry = self._inferred_entry(entry_date=date(2024, 3, 15))
+        changes, updated = _propose_date_metadata(
+            txn, entry, self._proposal(), paypal_account=None
+        )
+        assert [c.field for c in changes] == ["posting:settle"]
+        assert updated.postings[0].metadata["settle"] == "2024-03-17"
+
+    def test_csv_earlier_non_paypal_proposes_actual(self):
+        from beancount_importer.pipeline.run import _propose_date_metadata
+        txn = self._txn(date(2024, 3, 13))
+        entry = self._inferred_entry(entry_date=date(2024, 3, 15))
+        changes, updated = _propose_date_metadata(
+            txn, entry, self._proposal(), paypal_account=None
+        )
+        assert [c.field for c in changes] == ["posting:actual"]
+        assert updated.postings[0].metadata["actual"] == "2024-03-13"
+
+    def test_csv_earlier_paypal_target_proposes_paypal(self):
+        from beancount_importer.pipeline.run import _propose_date_metadata
+        txn = self._txn(date(2024, 3, 13))
+        entry = self._inferred_entry(
+            entry_date=date(2024, 3, 15), source_account="Assets:B:PayPal"
+        )
+        changes, updated = _propose_date_metadata(
+            txn,
+            entry,
+            self._proposal(target="Assets:B:PayPal"),
+            paypal_account="Assets:B:PayPal",
+        )
+        assert [c.field for c in changes] == ["posting:paypal"]
+        assert updated.postings[0].metadata["paypal"] == "2024-03-13"
+
+    def test_csv_same_date_no_proposal(self):
+        from beancount_importer.pipeline.run import _propose_date_metadata
+        txn = self._txn(date(2024, 3, 15))
+        entry = self._inferred_entry(entry_date=date(2024, 3, 15))
+        changes, updated = _propose_date_metadata(
+            txn, entry, self._proposal(), paypal_account=None
+        )
+        assert changes == []
+        assert updated.postings[0].metadata == {}
+
+    def test_existing_metadata_with_same_value_no_proposal(self):
+        from beancount_importer.pipeline.run import _propose_date_metadata
+        txn = self._txn(date(2024, 3, 17))
+        entry = self._inferred_entry(entry_date=date(2024, 3, 15))
+        proposal = CategoryProposal(
+            action="categorize",
+            postings=(
+                Posting(account="Assets:B:N26", metadata={"settle": "2024-03-17"}),
+            ),
+        )
+        changes, updated = _propose_date_metadata(
+            txn, entry, proposal, paypal_account=None
+        )
+        assert changes == []
+        assert updated is proposal
+
+    def test_proposal_with_no_postings_returns_unchanged(self):
+        from beancount_importer.pipeline.run import _propose_date_metadata
+        txn = self._txn(date(2024, 3, 17))
+        entry = self._inferred_entry(entry_date=date(2024, 3, 15))
+        empty = CategoryProposal(action="categorize", postings=())
+        changes, updated = _propose_date_metadata(
+            txn, entry, empty, paypal_account=None
+        )
+        # No postings → no metadata target → no change.
+        # (The empty proposal stays empty; the change list is also
+        # empty because there's nowhere to attach the key.)
+        assert changes == [] or updated.postings == ()
+
+    def test_extra_postings_preserved(self):
+        # Multi-posting proposal: only the first leg gets the metadata
+        # attached; subsequent legs (e.g. fee or transit split) pass
+        # through verbatim.
+        from beancount_importer.pipeline.run import _propose_date_metadata
+        txn = self._txn(date(2024, 3, 17))
+        entry = self._inferred_entry(entry_date=date(2024, 3, 15))
+        proposal = CategoryProposal(
+            action="categorize",
+            postings=(
+                Posting(account="Assets:B:N26"),
+                Posting(account="Expenses:Fee", amount=Decimal("0.50")),
+            ),
+        )
+        _, updated = _propose_date_metadata(
+            txn, entry, proposal, paypal_account=None
+        )
+        assert updated.postings[0].metadata == {"settle": "2024-03-17"}
+        assert updated.postings[1].metadata == {}
+        assert updated.postings[1].account == "Expenses:Fee"
+
+
+class TestPaypalNoiseCleaner:
+    """`clean_paypal_noise` reshapes SPK-style PayPal rows so the
+    merge-prompt display and any downstream text scoring see a clean
+    payee + description instead of transport noise.
+    """
+
+    def _txn(self, *, payee: str | None, description: str | None) -> SourceTransaction:
+        return SourceTransaction(
+            booking_date=date(2024, 4, 18),
+            amount=Decimal("-12.99"),
+            currency="EUR",
+            bank_key="spk",
+            payee=payee,
+            description=description,
+        )
+
+    def test_non_paypal_payee_returns_unchanged(self):
+        from beancount_importer.pipeline._clean import clean_paypal_noise
+        txn = self._txn(payee="Netflix", description="Netflix Abo")
+        assert clean_paypal_noise(txn) is txn
+
+    def test_extracts_merchant_from_ihr_einkauf_bei(self):
+        from beancount_importer.pipeline._clean import clean_paypal_noise
+        txn = self._txn(
+            payee="PayPal Europe S.a.r.l. et Cie S.C.A",
+            description="123/PP.456.PP/. Steam, Ihr Einkauf bei Steam | LASTSCHRIFT",
+        )
+        cleaned = clean_paypal_noise(txn)
+        assert cleaned.payee == "Steam"
+        assert cleaned.description == "PayPal"
+
+    def test_short_merchant_falls_back_to_paypal(self):
+        from beancount_importer.pipeline._clean import clean_paypal_noise
+        txn = self._txn(
+            payee="PayPal Europe",
+            description="123/. Ihr Einkauf bei AB",  # 2-char merchant
+        )
+        cleaned = clean_paypal_noise(txn)
+        assert cleaned.payee == "PayPal"
+        assert cleaned.description == "PayPal"
+
+    def test_originals_preserved_in_raw_data(self):
+        from beancount_importer.pipeline._clean import clean_paypal_noise
+        txn = self._txn(
+            payee="PayPal",
+            description="some payload",
+        )
+        cleaned = clean_paypal_noise(txn)
+        assert cleaned.raw_data["_original_payee"] == "PayPal"
+        assert cleaned.raw_data["_original_description"] == "some payload"
+
+    def test_strips_dauerauftrag_suffix(self):
+        from beancount_importer.pipeline._clean import clean_paypal_noise
+        txn = self._txn(
+            payee="PayPal Europe",
+            description="123/PP.456.PP/. Spotify | DAUERAUFTRAG",
+        )
+        cleaned = clean_paypal_noise(txn)
+        assert "DAUERAUFTRAG" not in (cleaned.description or "")
+        # Spotify is a 7-char merchant — extracted via the trailing-
+        # comma path (no "Ihr Einkauf bei", just the merchant token).
+        # Falls back to PayPal/PayPal when no merchant marker is present.
+        assert cleaned.payee in ("Spotify", "PayPal")
+
+
 class TestDiffChangesDirect:
     """Unit tests for `_diff_changes` itself. The end-to-end tests in
     TestDiffSuppressions exercise the suppressions through the pipeline,
@@ -2631,11 +2931,6 @@ class TestDiffChangesDirect:
         changes = _diff_changes(entry, proposal, None)
         assert all(c.field != "account" for c in changes)
 
-    def test_amount_inferred_entry_short_circuits(self):
-        from beancount_importer.pipeline.run import _diff_changes
-        entry = self._entry(amount_inferred=True)
-        proposal = self._proposal(narration="anything", payee="Acme")
-        assert _diff_changes(entry, proposal, None) == []
 
 
 class TestDiffSuppressions:

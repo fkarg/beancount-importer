@@ -82,6 +82,13 @@ def find_definitive_duplicate(
     txn_dates = _txn_candidate_dates(txn)
     matches: list[LedgerEntry] = []
     for entry in entries:
+        # Inferred-amount entries are cross-bank transit legs — let them
+        # flow through to the scorer + `_diff_changes`, which can propose
+        # `actual:`/`settle:`/`paypal:` metadata when the two CSV dates
+        # disagree. Dedup-silent-skipping them here would deny that
+        # affordance.
+        if entry.amount_inferred:
+            continue
         if entry.amount != txn.amount:
             continue
         if entry.currency != txn.currency:
