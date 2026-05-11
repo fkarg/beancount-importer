@@ -9,14 +9,15 @@ right where applicable):
 ```
 ✓  2024-03-04  -12.50 EUR  Starbucks         → ↓ Expenses:Food          (rule)
 ↻  2024-03-07  +5.00 EUR   Refund            → ↑ Income:Refunds         (replay)
-…  2024-03-08  -12.50 EUR  Starbucks                                  duplicate
+…  2024-03-08  -12.50 EUR  Starbucks                                  matched
 ✎  2024-03-09  -15.00 EUR  Spotify           → ↓ Expenses:Subscriptions (updated)
 ```
 
 Glyph legend:
 - `✓` written cleanly (rule-driven or user-confirmed)
 - `↻` replayed from decision log
-- `…` skipped (duplicate / skip-rule / cross-source / empty-diff)
+- `…` matched (already in the ledger — no action needed) or skipped
+  (user-installed pattern or Screen 3 decision)
 - `✎` updated existing entry
 - `⚠` needs follow-up
 
@@ -71,22 +72,39 @@ def _classify(result: ImportResult) -> tuple[str, str]:
     The glyph leads the line; the suffix labels the path taken
     ((rule), (you), (replay), reason text). Suffixes are deliberately
     short — the user is scanning, not reading prose.
+
+    The three internal "matched-via-different-mechanism" outcomes —
+    cheap dedup, cross-source matcher, and seed-silent-skip — all
+    collapse to one user-facing `matched` label. The mechanism only
+    surfaces as a parenthetical when it carries useful information
+    (cross-source match → the row's counterpart lives on another bank).
     """
     if result.is_replay:
         return ("↻", "(replay)")
     if result.action == "skip":
-        reason = result.skip_reason or "skipped"
-        # Map internal enum values to user-facing labels.
-        label = {
-            "duplicate": "duplicate",
-            "skip_rule": "skip-rule",
-            "cross_source_match": "cross-source match",
-        }.get(reason, reason)
-        return ("…", label)
+        reason = result.skip_reason
+        # Three different internal mechanisms; one user-facing concept.
+        if reason in ("duplicate", "cross_source_match"):
+            suffix = "matched"
+            if reason == "cross_source_match":
+                suffix = "matched (other bank)"
+            return ("…", suffix)
+        # Suppression paths — the row would have been actionable but
+        # something explicit told the pipeline to leave it alone.
+        if reason == "skip_rule":
+            return ("…", "skipped (rule)")
+        if reason == "user_skipped":
+            return ("…", "skipped (you)")
+        if reason == "user_blocked":
+            return ("…", "blocked (rule installed)")
+        return ("…", reason or "skipped")
     if result.action == "update":
         if not result.proposed_changes:
-            # Silent shortcut — the entry was already correct, no diff.
-            return ("…", "already matched")
+            # Silent shortcut — either the seed matched the entry verbatim
+            # or the user confirmed via Screen 3's [k] keep.
+            if result.skip_reason == "user_kept":
+                return ("…", "matched (you confirmed)")
+            return ("…", "matched")
         return ("✎", "(updated)")
     if result.action == "new":
         if result.rule_matched is not None:

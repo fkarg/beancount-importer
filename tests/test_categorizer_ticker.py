@@ -81,7 +81,10 @@ class TestClassification:
         assert line.startswith("↻")
         assert "(replay)" in line
 
-    def test_skip_duplicate_shows_skip_glyph_with_reason(self):
+    def test_dedup_skip_renders_as_matched(self):
+        # `skip_reason="duplicate"` is the cheap-dedup mechanism, but
+        # from the user's view it's the same outcome as the other
+        # "already in your ledger" paths — surface a single word.
         result = ImportResult(
             source_txn=_txn(),
             action="skip",
@@ -89,23 +92,53 @@ class TestClassification:
         )
         line = _rendered(result)
         assert line.startswith("…")
-        assert "duplicate" in line
+        assert "matched" in line
+        assert "duplicate" not in line  # internal label not leaked
 
     def test_skip_rule_label(self):
+        # Suppression via a `skip_update_patterns` rule — distinct
+        # from "matched" because nothing was actually paired.
         result = ImportResult(
             source_txn=_txn(),
             action="skip",
             skip_reason="skip_rule",
         )
-        assert "skip-rule" in _rendered(result)
+        assert "skipped (rule)" in _rendered(result)
 
     def test_cross_source_match_label(self):
+        # Worth surfacing the mechanism here — the row's counterpart
+        # lives on another bank, which is useful debugging context.
         result = ImportResult(
             source_txn=_txn(),
             action="skip",
             skip_reason="cross_source_match",
         )
-        assert "cross-source match" in _rendered(result)
+        assert "matched (other bank)" in _rendered(result)
+
+    def test_user_skipped_label(self):
+        result = ImportResult(
+            source_txn=_txn(),
+            action="skip",
+            skip_reason="user_skipped",
+        )
+        assert "skipped (you)" in _rendered(result)
+
+    def test_user_blocked_label(self):
+        result = ImportResult(
+            source_txn=_txn(),
+            action="skip",
+            skip_reason="user_blocked",
+        )
+        assert "blocked" in _rendered(result)
+
+    def test_skip_without_reason_falls_back_to_skipped(self):
+        # Defensive: a `skip` action with no `skip_reason` set still
+        # renders a ticker line rather than crashing — the fallback
+        # surfaces the bare word "skipped" so the row stays visible.
+        result = ImportResult(source_txn=_txn(), action="skip")
+        line = _rendered(result)
+        assert line.startswith("…")
+        assert "skipped" in line
 
     def test_update_with_changes_shows_pencil(self):
         existing = LedgerEntry(
@@ -143,7 +176,29 @@ class TestClassification:
         )
         line = _rendered(result)
         assert line.startswith("…")
-        assert "already matched" in line
+        assert "matched" in line
+
+    def test_user_kept_renders_with_confirmation_note(self):
+        # Screen 3's `[k] keep` path: the user explicitly confirmed
+        # the match — surface that so the scrollback doesn't look
+        # identical to the silent-skip case.
+        existing = LedgerEntry(
+            date=date(2024, 3, 9),
+            narration="x",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Subscriptions",
+            amount=Decimal("-15.00"),
+        )
+        result = ImportResult(
+            source_txn=_txn(),
+            action="update",
+            matched_entry=existing,
+            proposed_changes=[],
+            proposal=_proposal(target="Expenses:Subscriptions"),
+            skip_reason="user_kept",
+        )
+        line = _rendered(result)
+        assert "matched (you confirmed)" in line
 
 
 class TestRendering:
