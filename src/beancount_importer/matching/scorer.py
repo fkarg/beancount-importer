@@ -1,10 +1,41 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein
 
 from beancount_importer.matching.normalize import normalize_text
 from beancount_importer.models import LedgerEntry, SourceTransaction
+
+
+# FX-drift tolerance for foreign-currency purchases the bank re-converts
+# to the home currency between exports. A USD purchase will sometimes
+# arrive as 9.49 EUR on one export and 9.52 EUR on another — same
+# transaction, drifted EUR amount because the FX rate moved. Tolerance
+# is the *smaller* of an absolute (5 cents) or relative (1%) bound;
+# the original-currency amount must match exactly for this to apply.
+_FX_DRIFT_ABS = Decimal("0.05")
+_FX_DRIFT_REL = Decimal("0.01")
+
+
+def _fx_drift_tolerable(txn: SourceTransaction, entry: LedgerEntry) -> bool:
+    """Treat amounts as matching when the EUR side has drifted by ≤5
+    cents (or ≤1% of |amount|) AND the source-currency amount matches
+    exactly. Without an `original_amount` on the txn, this never fires
+    — single-currency rows fall back to strict equality.
+    """
+    # The caller (`score_candidate`) already guarantees same currency
+    # via its hard filter; we only need the original-currency anchor.
+    if txn.original_amount is None or txn.original_currency is None:
+        return False
+    drift = abs(entry.amount - txn.amount)
+    if drift > _FX_DRIFT_ABS:
+        if entry.amount == 0:
+            return False
+        if drift / abs(entry.amount) > _FX_DRIFT_REL:
+            return False
+    return True
 
 
 # Tunable fallback for direct callers; the pipeline overrides this via
@@ -100,7 +131,12 @@ def score_candidate(
         if abs(txn.amount) != abs(entry.amount):
             return 0.0
     elif txn.amount != entry.amount:
-        return 0.0
+        # FX-drift: a foreign-currency purchase whose EUR re-conversion
+        # moved a few cents between exports still represents the same
+        # transaction. Same-sign comparison, source-currency amount
+        # must match exactly.
+        if not _fx_drift_tolerable(txn, entry):
+            return 0.0
 
     days_apart = min(
         abs((txn.booking_date - d).days) for d in _candidate_dates(entry)

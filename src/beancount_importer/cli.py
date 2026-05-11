@@ -772,6 +772,8 @@ def _print_summary(
     prefix = "[yellow]dry-run[/] " if dry_run else ""
     console.print(f"\n{prefix}done: {rendered or 'no transactions'}")
 
+    _print_touched_entries(results, config, dry_run=dry_run)
+
     # One hint per section with unmatched ledger entries. Same data the
     # preview surfaces, kept short for the interactive summary so users see
     # at a glance how much of the ledger has no CSV provenance.
@@ -797,6 +799,86 @@ def _print_summary(
             console.print(
                 f"  [magenta]→ {n} {label} transaction(s) have no CSV source[/]"
             )
+
+
+def _print_touched_entries(
+    results: list[ImportResult],
+    config: Config,
+    *,
+    dry_run: bool,
+) -> None:
+    """List the entries touched by this run, grouped by action.
+
+    Updates show the source-bean location plus the field(s) that changed
+    so the user has a paper trail without diffing the file. New entries
+    show the destination file and the proposal's target account. Skip
+    counts are aggregated by source (silent vs user) since per-row
+    detail isn't useful there.
+
+    Under `--dry-run` the section header marks the lines as a
+    would-have-written preview.
+    """
+    updated = [
+        r for r in results
+        if r.action == "update" and r.proposed_changes and r.matched_entry
+    ]
+    new_entries = [r for r in results if r.action == "new" and r.new_entry_text]
+    silent_skips = sum(
+        1
+        for r in results
+        if (r.action == "skip" and r.skip_reason in (
+            "duplicate", "skip_rule", "cross_source_match"
+        ))
+        or (r.action == "update" and not r.proposed_changes)
+    )
+    user_skips = sum(
+        1
+        for r in results
+        if r.skip_reason in ("user_skipped", "user_kept", "user_blocked")
+    )
+
+    if not (updated or new_entries or silent_skips or user_skips):
+        return
+
+    if updated:
+        header = "[yellow]Would update[/]" if dry_run else "[green]Updated[/]"
+        console.print(f"\n{header}:")
+        for r in updated:
+            entry = r.matched_entry
+            assert entry is not None
+            path = Path(entry.file_path).name if entry.file_path else "<in-session>"
+            fields = ", ".join(c.field for c in r.proposed_changes)
+            payee = r.proposal.payee if r.proposal and r.proposal.payee else (entry.payee or "")
+            amount = f"{entry.amount} {entry.currency}"
+            console.print(
+                f"  {path}:{entry.line_start}  {payee}  {amount}  [dim]({fields})[/]"
+            )
+
+    if new_entries:
+        header = "[yellow]Would create[/]" if dry_run else "[green]New[/]"
+        console.print(f"\n{header}:")
+        for r in new_entries:
+            try:
+                bank_cfg = config.bank(r.source_txn.bank_key)
+                out_path = _resolve(
+                    Path("."), bank_cfg.output_file, r.source_txn.booking_date.year
+                ).name
+            except KeyError:
+                out_path = "<unknown>"
+            target = r.proposal.target_account if r.proposal else ""
+            amount = f"{r.source_txn.amount} {r.source_txn.currency}"
+            payee = r.proposal.payee if r.proposal and r.proposal.payee else (r.source_txn.payee or "")
+            console.print(
+                f"  {out_path}  {payee}  {amount}  [dim]→ {target}[/]"
+            )
+
+    if silent_skips or user_skips:
+        parts = []
+        if silent_skips:
+            parts.append(f"silent: {silent_skips}")
+        if user_skips:
+            parts.append(f"user: {user_skips}")
+        console.print(f"\n[dim]Skipped — {', '.join(parts)}[/]")
 
 
 _STARTER_CONFIG = """\

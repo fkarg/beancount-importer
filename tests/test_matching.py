@@ -516,6 +516,67 @@ class TestScoreCandidateHardFilters:
         assert score_candidate(txn, entry, include_reversed_sign=True) > 0.0
 
 
+class TestScoreCandidateFxDrift:
+    """B11: A foreign-currency purchase that the bank re-converted to
+    home currency differently between exports should still match its
+    own existing entry. Tolerance is ≤5 cents OR ≤1% AND
+    source-currency amount must match exactly.
+    """
+
+    def test_eur_drift_within_5_cents_matches(self):
+        txn = make_txn(
+            amount=Decimal("-9.50"),
+            currency="EUR",
+            original_amount=Decimal("-10.00"),
+            original_currency="USD",
+        )
+        entry = make_entry(amount=Decimal("-9.53"), currency="EUR")
+        # 3 cent drift, within the absolute tolerance.
+        assert score_candidate(txn, entry) > 0.0
+
+    def test_eur_drift_within_1_percent_matches(self):
+        txn = make_txn(
+            amount=Decimal("-100.00"),
+            currency="EUR",
+            original_amount=Decimal("-110.00"),
+            original_currency="USD",
+        )
+        entry = make_entry(amount=Decimal("-100.80"), currency="EUR")
+        # 80 cent drift > 5 cents abs, but 0.8% < 1% rel → still matches.
+        assert score_candidate(txn, entry) > 0.0
+
+    def test_eur_drift_beyond_both_tolerances_rejected(self):
+        txn = make_txn(
+            amount=Decimal("-10.00"),
+            currency="EUR",
+            original_amount=Decimal("-10.00"),
+            original_currency="USD",
+        )
+        entry = make_entry(amount=Decimal("-9.00"), currency="EUR")
+        # 1 EUR drift, 10% — outside both abs and rel tolerances.
+        assert score_candidate(txn, entry) == 0.0
+
+    def test_drift_only_fires_when_original_currency_set(self):
+        # Without original_amount/currency the row is treated as a
+        # single-currency row — strict amount equality applies.
+        txn = make_txn(amount=Decimal("-9.50"), currency="EUR")
+        entry = make_entry(amount=Decimal("-9.53"), currency="EUR")
+        assert score_candidate(txn, entry) == 0.0
+
+    def test_drift_with_zero_entry_amount_rejected(self):
+        # Degenerate edge: entry.amount=0, absolute drift exceeds the
+        # 5-cent bound — the relative branch can't anchor on a zero
+        # divisor, so the tolerance falls through to reject.
+        txn = make_txn(
+            amount=Decimal("-0.10"),
+            currency="EUR",
+            original_amount=Decimal("-10.00"),
+            original_currency="USD",
+        )
+        entry = make_entry(amount=Decimal("0.00"), currency="EUR")
+        assert score_candidate(txn, entry) == 0.0
+
+
 class TestScoreCandidateBonuses:
     def test_sepa_match_boosts_score(self):
         """An exact SEPA reference match adds a big bonus, capped at 1.0.

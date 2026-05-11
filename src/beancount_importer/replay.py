@@ -163,27 +163,31 @@ class DecisionLog:
         Skips:
         - results without a proposal (e.g. dedup-skipped, transfer-linked)
         - replayed decisions (no circular recording)
-        - skip/quit actions
+        - non-user-driven skip/quit actions (`duplicate`, `skip_rule`,
+          `cross_source_match` — all deterministic from current state
+          and don't need replay support). The user-driven skip variants
+          (`user_skipped`, `user_blocked`) flow through `_apply_merge_decision`
+          which already clears `proposal`, so they're caught by the
+          `proposal is None` guard above.
         - rule-driven decisions where the user didn't ask to save as a rule
           (the rule itself is the persistent record; replaying would shadow it)
-        - silent-match updates (`update` action with no proposed_changes):
-          the host's silent-skip fast-path catches these at runtime, so
-          there's nothing the user actually decided — recording would
-          clutter the log with "decisions I didn't make".
+
+        Silent-match updates (`update` action with no proposed_changes)
+        ARE recorded — the seed-silent-skip path produced a proposal
+        the user effectively consented to (Screen 3 'keep') or that
+        followed from the seed-equals-entry case; recording lets the
+        next run replay the same outcome without re-running the
+        scorer or prompting again.
 
         The in-memory `_index` is updated immediately so subsequent
-        `lookup()` calls within the same run see the new decision (e.g.
-        a duplicate row processed later in the same session replays
-        cleanly rather than re-prompting). Only the disk write is
-        deferred until `flush()`.
+        `lookup()` calls within the same run see the new decision.
+        Only the disk write is deferred until `flush()`.
         """
         if self.path is None or result.proposal is None:
             return
         if result.is_replay or result.action in ("skip", "quit"):
             return
         if result.rule_matched is not None and result.new_rule is None:
-            return
-        if result.action == "update" and not result.proposed_changes:
             return
 
         sig = make_decision_signature(txn)
