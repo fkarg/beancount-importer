@@ -28,6 +28,11 @@ class CsvConfig(BaseModel):
     field_payee: str | None = None
     # Can be a single column name or a list (values joined with space)
     field_description: str | list[str] = []
+    # Description parts equal to any string here (case-insensitive, after
+    # trimming) are dropped before joining. Handles bank-specific noise
+    # values like N26's `Type: Presentment` without bank-specific parser
+    # code.
+    field_description_blacklist: list[str] = []
     field_sepa_reference: str | None = None
     field_original_amount: str | None = None
     field_original_currency: str | None = None
@@ -107,6 +112,14 @@ class MatchingConfig(BaseModel):
 
     min_score: float = 0.35
     min_delta: float = 0.15
+    # Maximum date gap for the scorer to admit a candidate. Phase 1 keeps the
+    # reference's wide 14-day window so behaviour matches the pre-rewrite
+    # importer; Phase 4 tightens to 7 once the dedup-side suppressions land.
+    max_date_days: int = 14
+    # Tighter window for `find_definitive_duplicate` (Phase 2). The strict
+    # dedup path stays narrower than the scoring window so accidental
+    # silent-skips across week-plus distances can't happen.
+    dedup_max_date_days: int = 5
     transfer_tolerance_days: int = 5
     transit_account: str = "Assets:Extern:Transit"
     internal_transfer_account_prefixes: list[str] = ["Assets:B:", "Liabilities:CreditCard:"]
@@ -155,6 +168,15 @@ class Config(BaseModel):
     # the file does not exist or `bean-query` is not on PATH.
     main_bean: str | None = None
     skip_update_patterns: list[SkipUpdatePattern] = []
+    # Max characters retained when writing the narration of new/updated
+    # entries. Matches the reference's silent-truncation behaviour (no
+    # ellipsis suffix); raise or lower per-project taste.
+    narration_max_length: int = 70
+    # Account name of the user's PayPal intermediary, if any. When a
+    # cross-bank transfer's target equals this account the date-difference
+    # metadata key becomes `paypal:` rather than `actual:` to match the
+    # `plugins/settle_inv` convention.
+    paypal_account: str | None = None
     transforms: TransformsConfig = TransformsConfig()
     matching: MatchingConfig = MatchingConfig()
 

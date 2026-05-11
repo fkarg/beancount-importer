@@ -100,6 +100,35 @@ class TestReadLedgerInferredAmount:
         assert entries[0].amount_inferred is True
 
 
+class TestReadLedgerMultiPosting:
+    """Salary entries (and similar) carry deduction legs that mean the parent
+    transaction has >2 postings. The reader surfaces this via
+    `has_multiple_postings` so the diff layer can refuse category clobbering.
+    """
+
+    def test_two_posting_entry_not_marked(self, tmp_path: Path):
+        bean = tmp_path / "spk.bean"
+        bean.write_text(
+            '2024-01-15 * "Netflix" "Abo"\n'
+            '  Assets:B:SPK  -15.99 EUR\n'
+            '  Expenses:Entertainment  15.99 EUR\n',
+        )
+        entries = read_ledger(bean, "Assets:B:SPK")
+        assert entries[0].has_multiple_postings is False
+
+    def test_multi_posting_salary_marked(self, tmp_path: Path):
+        bean = tmp_path / "spk.bean"
+        bean.write_text(
+            '2024-01-31 * "Employer" "Salary"\n'
+            '  Assets:B:SPK  2000.00 EUR\n'
+            '  Income:Salary  -3000.00 EUR\n'
+            '  Expenses:Tax  500.00 EUR\n'
+            '  Expenses:Insurance  500.00 EUR\n',
+        )
+        entries = read_ledger(bean, "Assets:B:SPK")
+        assert entries[0].has_multiple_postings is True
+
+
 class TestReadLedgerMetadataDates:
     def _write(self, path: Path, content: str) -> None:
         path.write_text(content)
@@ -494,6 +523,49 @@ class TestFormatTransaction:
             postings=[("Assets:B:SPK", "-1 EUR"), ("Expenses:Other", "1 EUR")],
         )
         assert text.endswith("\n")
+
+    def test_posting_level_metadata_rendered(self):
+        text = format_transaction(
+            date_str="2024-03-15",
+            flag="*",
+            payee="Acme",
+            narration="x-bank",
+            postings=[
+                ("Assets:B:SPK", "-100 EUR", {}),
+                ("Assets:B:N26", "100 EUR", {"settle": "2024-03-17"}),
+            ],
+        )
+        # Posting line plus a metadata line indented two more spaces.
+        assert "  Assets:B:N26" in text
+        assert '    settle: "2024-03-17"' in text
+        # The metadata line follows its posting line.
+        lines = text.splitlines()
+        n26_idx = next(i for i, line in enumerate(lines) if "Assets:B:N26" in line)
+        assert lines[n26_idx + 1].strip().startswith("settle:")
+
+    def test_narration_truncated_when_max_length_set(self):
+        long = "x" * 200
+        text = format_transaction(
+            date_str="2024-01-15",
+            flag="*",
+            payee=None,
+            narration=long,
+            postings=[("Assets:B:SPK", "-1 EUR"), ("Expenses:Other", "1 EUR")],
+            narration_max_length=70,
+        )
+        assert '"' + "x" * 70 + '"' in text
+        assert "x" * 71 not in text
+
+    def test_narration_not_truncated_below_threshold(self):
+        text = format_transaction(
+            date_str="2024-01-15",
+            flag="*",
+            payee=None,
+            narration="short",
+            postings=[("Assets:B:SPK", "-1 EUR"), ("Expenses:Other", "1 EUR")],
+            narration_max_length=70,
+        )
+        assert '"short"' in text
 
 
 # ── writer: append_entry ─────────────────────────────────────────────────────

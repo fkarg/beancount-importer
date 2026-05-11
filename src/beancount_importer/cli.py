@@ -422,7 +422,11 @@ def _persist_results(
             and r.proposed_changes
         ):
             apply_update(
-                r.matched_entry, r.proposal, bank_cfg.account, dry_run=dry_run
+                r.matched_entry,
+                r.proposal,
+                bank_cfg.account,
+                dry_run=dry_run,
+                narration_max_length=config.narration_max_length,
             )
 
 

@@ -1260,22 +1260,23 @@ def _format_new_entry(
     bank: BankConfig,
     txn: SourceTransaction,
     proposal: CategoryProposal,
+    narration_max_length: int | None = None,
 ) -> str:
     """Render a new beancount transaction text from the proposal."""
     payee = proposal.payee or txn.payee
     narration = proposal.narration or txn.description or ""
 
-    postings: list[tuple[str, str | None]] = []
+    postings: list[tuple[str, str | None, dict[str, str]]] = []
     # Source-account leg always carries the explicit amount + currency.
     postings.append(
-        (bank.account, f"{txn.amount} {txn.currency}")
+        (bank.account, f"{txn.amount} {txn.currency}", {})
     )
     for p in proposal.postings:
         amount_str: str | None = None
         if p.amount is not None:
             currency = p.currency or txn.currency
             amount_str = f"{p.amount} {currency}"
-        postings.append((p.account, amount_str))
+        postings.append((p.account, amount_str, dict(p.metadata)))
 
     metadata = dict(proposal.metadata)
     if proposal.tag:
@@ -1288,4 +1289,5 @@ def _format_new_entry(
         narration=narration,
         postings=postings,
         metadata=metadata,
+        narration_max_length=narration_max_length,
     )

@@ -53,6 +53,11 @@ class LedgerEntry(BaseModel):
     # `paypal:`, `settle:`, …). The user's plugins move postings to these
     # dates; matching against the original CSV row should consider both.
     metadata_dates: tuple[date, ...] = ()
+    # True when the parent transaction has more than two postings — e.g.,
+    # a salary entry with deduction legs. Diff logic suppresses category
+    # changes against such entries because rewriting the merchant-side
+    # account would corrupt a multi-posting structure the user authored.
+    has_multiple_postings: bool = False
 
 
 class ProposedChange(NamedTuple):

@@ -67,6 +67,7 @@ def apply_update(
     bank_account: str,
     *,
     dry_run: bool = False,
+    narration_max_length: int | None = None,
 ) -> None:
     """Splice `entry` in place with a transaction reflecting `proposal`.
 
@@ -78,13 +79,13 @@ def apply_update(
     """
     payee = proposal.payee or entry.payee
     narration = proposal.narration or entry.narration
-    postings: list[tuple[str, str | None]] = [
-        (bank_account, f"{entry.amount} {entry.currency}")
+    postings: list[tuple[str, str | None, dict[str, str]]] = [
+        (bank_account, f"{entry.amount} {entry.currency}", {})
     ]
     for p in proposal.postings:
         currency = p.currency or entry.currency
         amount_str = f"{p.amount} {currency}" if p.amount is not None else None
-        postings.append((p.account, amount_str))
+        postings.append((p.account, amount_str, dict(p.metadata)))
     metadata = {**entry.metadata, **proposal.metadata}
     if proposal.tag:
         metadata["tag"] = proposal.tag
@@ -96,6 +97,7 @@ def apply_update(
         narration=narration,
         postings=postings,
         metadata=metadata,
+        narration_max_length=narration_max_length,
     )
     target = Path(entry.file_path)
     line_end = entry.line_end or _detect_entry_end(target, entry.line_start)
@@ -127,19 +129,35 @@ def format_transaction(
     flag: str,
     payee: str | None,
     narration: str,
-    postings: list[tuple[str, str | None]],
+    postings: list[tuple[str, str | None]] | list[tuple[str, str | None, dict[str, str]]],
     metadata: dict[str, str] | None = None,
+    narration_max_length: int | None = None,
 ) -> str:
-    """Format a beancount transaction as a string."""
+    """Format a beancount transaction as a string.
+
+    `postings` accepts either the legacy 2-tuple `(account, amount)` shape
+    or a 3-tuple `(account, amount, metadata)` where `metadata` is a per-
+    posting key/value dict rendered indented under the posting line. This
+    is the mechanism by which `actual:`/`settle:`/`paypal:` get attached
+    to the correct leg per plugin convention. `narration_max_length`, when
+    set, truncates the narration to that many characters (no ellipsis) to
+    keep ledger lines readable.
+    """
     payee_part = f'"{payee}" ' if payee else ""
+    if narration_max_length is not None and len(narration) > narration_max_length:
+        narration = narration[:narration_max_length]
     header = f'{date_str} {flag} {payee_part}"{narration}"'
     lines = [header]
     if metadata:
         for k, v in metadata.items():
             lines.append(f'  {k}: "{v}"')
-    for account, amount in postings:
+    for posting in postings:
+        account, amount, *rest = posting
+        posting_meta: dict[str, str] = rest[0] if rest else {}
         if amount:
             lines.append(f"  {account:<40} {amount}")
         else:
             lines.append(f"  {account}")
+        for mk, mv in posting_meta.items():
+            lines.append(f'    {mk}: "{mv}"')
     return "\n".join(lines) + "\n"
