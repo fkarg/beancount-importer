@@ -237,6 +237,11 @@ def _full_list(console: Console, accounts: Iterable[str]) -> str | None:
         return items[idx - 1]
 
 
+# Beyond ~5 columns the eye loses the column rhythm and short account
+# names produce gappy rows; cap regardless of terminal width.
+MAX_GRID_COLS = 5
+
+
 def _render_column_grid(console: Console, items: list[str]) -> None:
     """Lay `items` out column-major so reading top-to-bottom is alphabetical.
 
@@ -247,10 +252,14 @@ def _render_column_grid(console: Console, items: list[str]) -> None:
     """
     n_digits = len(str(len(items)))
     max_acc_len = max(len(a) for a in items)
-    # `[NN] ◆ ` = n_digits + 6 chars overhead; trailing pad keeps cells
-    # from running into each other.
-    cell_width = n_digits + 6 + max_acc_len + 2
-    n_cols = max(1, (console.width - 2) // cell_width)
+    # Visible per cell: `[NN]` (n_digits + 2) + ` ` (1) + `◆ account`
+    # (2 + max_acc_len). Cells are joined by 2 spaces.
+    cell_width = n_digits + 5 + max_acc_len
+    join_width = 2
+    n_cols = max(
+        1,
+        min(MAX_GRID_COLS, (console.width - 2 + join_width) // (cell_width + join_width)),
+    )
     n_rows = (len(items) + n_cols - 1) // n_cols
     for row in range(n_rows):
         cells = []
@@ -259,9 +268,11 @@ def _render_column_grid(console: Console, items: list[str]) -> None:
             if idx >= len(items):
                 continue
             label = f"[cyan]\\[{idx + 1:>{n_digits}}][/]"
-            cells.append(
-                f"{label} {styled_account(items[idx]):<{max_acc_len}}"
-            )
+            acc = items[idx]
+            # Pad on visible width; Rich markup in `styled_account`
+            # makes `f"{...:<N}"` count escape chars and under-space.
+            pad = " " * (max_acc_len - len(acc))
+            cells.append(f"{label} {styled_account(acc)}{pad}")
         console.print("  " + "  ".join(cells))
     console.print()
 
