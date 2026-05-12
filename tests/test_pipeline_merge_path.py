@@ -302,7 +302,7 @@ class TestBlockRuleEdges:
         # Synthesize a SourceTransaction with no payee but a description.
         # The block branch should still install a rule, keyed off the
         # description pattern.
-        from beancount_importer.pipeline import _block_update_rule
+        from beancount_importer.pipeline._merge import _block_update_rule
         from beancount_importer.models import LedgerEntry
 
         txn = SourceTransaction(
@@ -333,7 +333,7 @@ class TestBlockRuleEdges:
     def test_block_returns_none_when_no_payee_or_description(self, tmp_path: Path):
         # If neither field is available, the block can't synthesize a
         # safe rule — caller downgrades to a plain skip with no new_rule.
-        from beancount_importer.pipeline import _block_update_rule
+        from beancount_importer.pipeline._merge import _block_update_rule
         from beancount_importer.models import LedgerEntry
 
         txn = SourceTransaction(
