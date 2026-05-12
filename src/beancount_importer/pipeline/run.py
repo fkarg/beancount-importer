@@ -15,7 +15,6 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from beancount_importer.beancount_io.writer import format_transaction
 from beancount_importer.config import BankConfig
 from beancount_importer.matching.dedup import find_definitive_duplicate
 from beancount_importer.matching.registry import (
@@ -30,10 +29,15 @@ from beancount_importer.models import (
     ImportResult,
     LedgerEntry,
     Posting,
-    ProposedChange,
     SourceTransaction,
 )
 from beancount_importer.pipeline._clean import clean_paypal_noise
+from beancount_importer.pipeline._result import (
+    _build_result,
+    _diff_changes,
+    _format_new_entry,
+    _synthesize_counter_leg,
+)
 from beancount_importer.pipeline._shared import (
     _load_all_outputs,
     _parse_all_inputs,
@@ -841,82 +845,6 @@ def _block_update_rule(
     return None
 
 
-def _build_result(
-    *,
-    txn: SourceTransaction,
-    bank: BankConfig,
-    proposal: CategoryProposal,
-    existing: list[LedgerEntry],
-    matched_rule: CategorizationRule | None,
-    is_replay: bool,
-    new_rule: CategorizationRule | None,
-    tag_state_delta: TagStateDelta | None,
-    min_score: float,
-    max_date_days: int,
-    match_txn: SourceTransaction | None = None,
-    narration_max_length: int | None = None,
-    paypal_account: str | None = None,
-) -> ImportResult:
-    """Assemble the per-row result.
-
-    `match_txn` carries any rule-driven payee/narration overrides used during
-    candidate scoring; if omitted (e.g. on the replay path that doesn't
-    pre-rewrite), we fall back to the raw `txn`. The split lets the call site
-    own the rule semantics without duplicating overrides logic here.
-    """
-    if proposal.action == "skip":
-        return ImportResult(
-            source_txn=txn,
-            action="skip",
-            proposal=proposal,
-            rule_matched=matched_rule,
-            is_replay=is_replay,
-        )
-    if proposal.action == "quit":
-        return ImportResult(
-            source_txn=txn,
-            action="quit",
-            proposal=proposal,
-            rule_matched=matched_rule,
-            is_replay=is_replay,
-        )
-
-    # categorize action: decide new vs. update by inspecting top candidate.
-    score_txn = match_txn if match_txn is not None else txn
-    candidates = find_candidates(
-        score_txn, existing, min_score=min_score, max_date_days=max_date_days
-    )
-    best: LedgerEntry | None = candidates[0][0] if candidates else None
-    action = "update" if best is not None else "new"
-
-    proposed_changes: list[ProposedChange] = []
-    new_entry_text = ""
-    if best is not None:
-        if best.amount_inferred:
-            proposed_changes, proposal = _propose_date_metadata(
-                txn, best, proposal, paypal_account=paypal_account
-            )
-        else:
-            proposed_changes = _diff_changes(best, proposal, matched_rule)
-    else:
-        new_entry_text = _format_new_entry(
-            bank, txn, proposal, narration_max_length=narration_max_length
-        )
-
-    return ImportResult(
-        source_txn=txn,
-        action=action,  # type: ignore[arg-type]
-        matched_entry=best,
-        proposed_changes=proposed_changes,
-        new_entry_text=new_entry_text,
-        proposal=proposal,
-        rule_matched=matched_rule,
-        is_replay=is_replay,
-        new_rule=new_rule,
-        tag_state_delta=tag_state_delta,
-    )
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -1177,216 +1105,3 @@ def _escape_for_regex(s: str) -> str:
     return re.escape(s.strip())
 
 
-def _synthesize_counter_leg(
-    result: ImportResult,
-    txn: SourceTransaction,
-    *,
-    internal_prefixes: tuple[str, ...],
-    bank_accounts: set[str],
-) -> LedgerEntry | None:
-    """Create an inferred-amount LedgerEntry mirroring a cross-bank transfer.
-
-    Fires when `_process_transaction` returns `action="new"` and the
-    proposal's target account looks like another configured bank (or
-    matches any `internal_transfer_account_prefixes`). The synthesized
-    entry sits in the *target* bank's bucket so subsequent CSV rows
-    from that bank match it via the scorer's `amount_inferred` path
-    (rather than the user being prompted again for the same flow).
-
-    `amount_inferred=True` is the contract that makes
-    `_propose_date_metadata` fire when the second bank's CSV date
-    disagrees with the first leg's booking date.
-    """
-    if result.action != "new" or result.proposal is None:
-        return None
-    target = result.proposal.target_account
-    if not target:
-        return None
-    if target not in bank_accounts and not target.startswith(internal_prefixes):
-        return None
-    return LedgerEntry(
-        date=txn.value_date or txn.booking_date,
-        narration=result.proposal.narration or txn.description or "",
-        payee=result.proposal.payee or txn.payee,
-        source_account=target,
-        target_account="",
-        amount=-txn.amount,
-        currency=txn.currency,
-        amount_inferred=True,
-        metadata={"_pending_in_session": "true"},
-        file_path="",
-        line_start=0,
-    )
-
-
-def _propose_date_metadata(
-    txn: SourceTransaction,
-    entry: LedgerEntry,
-    proposal: CategoryProposal,
-    *,
-    paypal_account: str | None,
-) -> tuple[list[ProposedChange], CategoryProposal]:
-    """For amount_inferred (cross-bank transit) matches, propose date
-    metadata on the matched leg's posting when the CSV and ledger
-    dates disagree. Returns the (possibly empty) ProposedChange list
-    plus a (possibly mutated) proposal carrying the new metadata.
-
-    Routing:
-
-    | CSV date vs entry.date | Matched account is `paypal_account`? | Key      |
-    |  Earlier               | Yes                                  | `paypal` |
-    |  Earlier               | No                                   | `actual` |
-    |  Later                 | (n/a)                                | `settle` |
-    |  Equal                 | (n/a)                                | (none)   |
-
-    The metadata sits on the matched-entry's posting — the inferred
-    leg, which is the one that needs the alternate-date hint so the
-    user's plugin moves the posting back to the CSV's recorded date.
-    The writer renders posting-level metadata indented under the
-    posting line per Phase 1.
-    """
-    csv_date = txn.value_date or txn.booking_date
-    if csv_date == entry.date:
-        return [], proposal
-
-    if csv_date > entry.date:
-        key = "settle"
-    elif paypal_account is not None and entry.source_account == paypal_account:
-        key = "paypal"
-    else:
-        key = "actual"
-
-    new_value = csv_date.isoformat()
-
-    # The proposal's first posting is the target_account (the inferred
-    # leg's account). Attach the metadata there. If the key already
-    # carries the same value, no change is proposed.
-    existing_value = ""
-    if proposal.postings and key in proposal.postings[0].metadata:
-        existing_value = proposal.postings[0].metadata[key]
-    if existing_value == new_value:
-        return [], proposal
-
-    updated_postings: list[Posting] = []
-    for i, p in enumerate(proposal.postings):
-        if i == 0:
-            updated_postings.append(
-                p.model_copy(update={"metadata": {**p.metadata, key: new_value}})
-            )
-        else:
-            updated_postings.append(p)
-    updated = proposal.model_copy(update={"postings": tuple(updated_postings)})
-    return (
-        [ProposedChange(field=f"posting:{key}", old_val=existing_value, new_val=new_value)],
-        updated,
-    )
-
-
-_TIMESTAMP_NARRATION_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?"
-    r"\s*(Debit|Credit|Lastschrift|Gutschrift)?\s*$"
-)
-
-
-def _is_truncation_equivalent(proposal: str, existing: str) -> bool:
-    """True when one string is a prefix of the other (after rstrip).
-
-    The writer silently truncates narrations to `narration_max_length`;
-    re-importing the same row with the original (longer) narration must
-    not register as a field change. Symmetric: the existing entry might
-    be the longer one if the user lowered the truncation length.
-    """
-    p = proposal.rstrip()
-    e = existing.rstrip()
-    if not p or not e:
-        return False
-    return p.startswith(e) or e.startswith(p)
-
-
-def _diff_changes(
-    entry: LedgerEntry,
-    proposal: CategoryProposal,
-    rule: CategorizationRule | None,
-) -> list[ProposedChange]:
-    """Compute the field-level delta between an existing entry and a new proposal,
-    honoring per-rule suppression flags."""
-
-    changes: list[ProposedChange] = []
-    suppress_all = rule.suppress_updates if rule else False
-    if suppress_all:
-        return []
-
-    if proposal.payee and proposal.payee != (entry.payee or ""):
-        if not (rule and rule.suppress_payee_updates):
-            changes.append(ProposedChange("payee", entry.payee or "", proposal.payee))
-
-    if proposal.narration and proposal.narration != entry.narration:
-        # A1/A8: a re-imported CSV row whose narration was previously
-        # truncated at write time differs by suffix only. Don't propose
-        # rewinding the truncation as a field change.
-        if not _is_truncation_equivalent(proposal.narration, entry.narration):
-            # A2: bare CSV `Type`-shaped values (timestamp + Debit/Credit)
-            # are pure transport metadata, not anything the user typed.
-            # Suppress the overwrite when the existing entry already has
-            # a real narration ("Burger King") and no rule forces it.
-            timestamp_proposal = bool(
-                _TIMESTAMP_NARRATION_RE.match(proposal.narration)
-            )
-            real_existing = bool(
-                entry.narration and not _TIMESTAMP_NARRATION_RE.match(entry.narration)
-            )
-            if not (timestamp_proposal and real_existing and rule is None):
-                if not (rule and rule.suppress_narration_updates):
-                    changes.append(
-                        ProposedChange("narration", entry.narration, proposal.narration)
-                    )
-
-    if proposal.target_account and proposal.target_account != entry.target_account:
-        # A4: salary / multi-leg entries are user-authored structures; a
-        # single CSV row should not rewrite the merchant-side account
-        # away from whatever the user spread across the deduction legs.
-        if entry.has_multiple_postings:
-            return changes
-        if not (rule and rule.suppress_account_updates):
-            changes.append(
-                ProposedChange("account", entry.target_account, proposal.target_account)
-            )
-
-    return changes
-
-
-def _format_new_entry(
-    bank: BankConfig,
-    txn: SourceTransaction,
-    proposal: CategoryProposal,
-    narration_max_length: int | None = None,
-) -> str:
-    """Render a new beancount transaction text from the proposal."""
-    payee = proposal.payee or txn.payee
-    narration = proposal.narration or txn.description or ""
-
-    postings: list[tuple[str, str | None, dict[str, str]]] = []
-    # Source-account leg always carries the explicit amount + currency.
-    postings.append(
-        (bank.account, f"{txn.amount} {txn.currency}", {})
-    )
-    for p in proposal.postings:
-        amount_str: str | None = None
-        if p.amount is not None:
-            currency = p.currency or txn.currency
-            amount_str = f"{p.amount} {currency}"
-        postings.append((p.account, amount_str, dict(p.metadata)))
-
-    metadata = dict(proposal.metadata)
-    if proposal.tag:
-        metadata["tag"] = proposal.tag
-
-    return format_transaction(
-        date_str=txn.booking_date.isoformat(),
-        flag="*",
-        payee=payee,
-        narration=narration,
-        postings=postings,
-        metadata=metadata,
-        narration_max_length=narration_max_length,
-    )

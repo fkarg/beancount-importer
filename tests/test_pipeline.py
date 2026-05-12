@@ -2730,7 +2730,7 @@ class TestDateMetadataProposal:
         )
 
     def test_csv_later_proposes_settle(self):
-        from beancount_importer.pipeline.run import _propose_date_metadata
+        from beancount_importer.pipeline._result import _propose_date_metadata
         txn = self._txn(date(2024, 3, 17))
         entry = self._inferred_entry(entry_date=date(2024, 3, 15))
         changes, updated = _propose_date_metadata(
@@ -2740,7 +2740,7 @@ class TestDateMetadataProposal:
         assert updated.postings[0].metadata["settle"] == "2024-03-17"
 
     def test_csv_earlier_non_paypal_proposes_actual(self):
-        from beancount_importer.pipeline.run import _propose_date_metadata
+        from beancount_importer.pipeline._result import _propose_date_metadata
         txn = self._txn(date(2024, 3, 13))
         entry = self._inferred_entry(entry_date=date(2024, 3, 15))
         changes, updated = _propose_date_metadata(
@@ -2750,7 +2750,7 @@ class TestDateMetadataProposal:
         assert updated.postings[0].metadata["actual"] == "2024-03-13"
 
     def test_csv_earlier_paypal_target_proposes_paypal(self):
-        from beancount_importer.pipeline.run import _propose_date_metadata
+        from beancount_importer.pipeline._result import _propose_date_metadata
         txn = self._txn(date(2024, 3, 13))
         entry = self._inferred_entry(
             entry_date=date(2024, 3, 15), source_account="Assets:B:PayPal"
@@ -2765,7 +2765,7 @@ class TestDateMetadataProposal:
         assert updated.postings[0].metadata["paypal"] == "2024-03-13"
 
     def test_csv_same_date_no_proposal(self):
-        from beancount_importer.pipeline.run import _propose_date_metadata
+        from beancount_importer.pipeline._result import _propose_date_metadata
         txn = self._txn(date(2024, 3, 15))
         entry = self._inferred_entry(entry_date=date(2024, 3, 15))
         changes, updated = _propose_date_metadata(
@@ -2775,7 +2775,7 @@ class TestDateMetadataProposal:
         assert updated.postings[0].metadata == {}
 
     def test_existing_metadata_with_same_value_no_proposal(self):
-        from beancount_importer.pipeline.run import _propose_date_metadata
+        from beancount_importer.pipeline._result import _propose_date_metadata
         txn = self._txn(date(2024, 3, 17))
         entry = self._inferred_entry(entry_date=date(2024, 3, 15))
         proposal = CategoryProposal(
@@ -2791,7 +2791,7 @@ class TestDateMetadataProposal:
         assert updated is proposal
 
     def test_proposal_with_no_postings_returns_unchanged(self):
-        from beancount_importer.pipeline.run import _propose_date_metadata
+        from beancount_importer.pipeline._result import _propose_date_metadata
         txn = self._txn(date(2024, 3, 17))
         entry = self._inferred_entry(entry_date=date(2024, 3, 15))
         empty = CategoryProposal(action="categorize", postings=())
@@ -2807,7 +2807,7 @@ class TestDateMetadataProposal:
         # Multi-posting proposal: only the first leg gets the metadata
         # attached; subsequent legs (e.g. fee or transit split) pass
         # through verbatim.
-        from beancount_importer.pipeline.run import _propose_date_metadata
+        from beancount_importer.pipeline._result import _propose_date_metadata
         txn = self._txn(date(2024, 3, 17))
         entry = self._inferred_entry(entry_date=date(2024, 3, 15))
         proposal = CategoryProposal(
@@ -2917,21 +2917,21 @@ class TestDiffChangesDirect:
         return CategoryProposal(**(defaults | kw))
 
     def test_truncation_equivalent_suppresses_narration_change(self):
-        from beancount_importer.pipeline.run import _diff_changes
+        from beancount_importer.pipeline._result import _diff_changes
         entry = self._entry(narration="Acme Inc")
         proposal = self._proposal(narration="Acme Inc — Subscription Plan A")
         changes = _diff_changes(entry, proposal, None)
         assert all(c.field != "narration" for c in changes)
 
     def test_timestamp_proposal_does_not_overwrite_real_narration(self):
-        from beancount_importer.pipeline.run import _diff_changes
+        from beancount_importer.pipeline._result import _diff_changes
         entry = self._entry(narration="Burger King")
         proposal = self._proposal(narration="2024-01-23T12:00 Debit")
         changes = _diff_changes(entry, proposal, None)
         assert all(c.field != "narration" for c in changes)
 
     def test_non_timestamp_proposal_overwrites_narration(self):
-        from beancount_importer.pipeline.run import _diff_changes
+        from beancount_importer.pipeline._result import _diff_changes
         entry = self._entry(narration="Burger King")
         proposal = self._proposal(narration="New narration text")
         changes = _diff_changes(entry, proposal, None)
@@ -2941,14 +2941,14 @@ class TestDiffChangesDirect:
         # `_is_truncation_equivalent` returns False when one side is
         # empty — that path lets the timestamp/regular suppressions
         # downstream do their work without crashing on the empty string.
-        from beancount_importer.pipeline.run import _diff_changes
+        from beancount_importer.pipeline._result import _diff_changes
         entry = self._entry(narration="")
         proposal = self._proposal(narration="Something new")
         changes = _diff_changes(entry, proposal, None)
         assert any(c.field == "narration" for c in changes)
 
     def test_multi_posting_entry_suppresses_account_change(self):
-        from beancount_importer.pipeline.run import _diff_changes
+        from beancount_importer.pipeline._result import _diff_changes
         entry = self._entry(target_account="Income:Salary", has_multiple_postings=True)
         proposal = self._proposal(
             postings=(Posting(account="Income:OtherSalary"),),
