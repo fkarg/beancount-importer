@@ -325,6 +325,29 @@ def _diff_changes(
     return changes
 
 
+def _foreign_price_str(txn: SourceTransaction) -> str | None:
+    """`@@`-priced counter-leg amount for a collapsed foreign purchase, or None.
+
+    The home leg is `txn.amount` (e.g. ``-25.03 EUR``); the counter-leg is the
+    original foreign amount priced at the home total: ``25.95 USD @@ 25.03 EUR``.
+    The counter-leg's sign is the opposite of the home leg (a purchase debits
+    the bank and credits — positive — the expense).
+
+    Gated on a *positive* `original_amount`: the PayPal collapse stores the
+    foreign amount as a positive magnitude, whereas the generic/N26 parser
+    stores a signed raw value (negative for debits). This keeps `@@` rendering
+    PayPal-only for now — N26 multi-currency stays as-is until we opt it in.
+    """
+    if (
+        txn.original_amount is None
+        or txn.original_currency is None
+        or txn.original_amount <= 0
+    ):
+        return None
+    foreign = txn.original_amount if txn.amount < 0 else -txn.original_amount
+    return f"{foreign} {txn.original_currency} @@ {abs(txn.amount)} {txn.currency}"
+
+
 def _format_new_entry(
     bank: BankConfig,
     txn: SourceTransaction,
@@ -340,9 +363,20 @@ def _format_new_entry(
     postings.append(
         (bank.account, f"{txn.amount} {txn.currency}", {})
     )
+    # A collapsed foreign-currency purchase (e.g. PayPal's General Currency
+    # Conversion bundle) books the home amount on the source leg and prices
+    # the single counter-leg in the original currency with a `@@` total cost.
+    foreign = _foreign_price_str(txn)
+    price_single_leg = (
+        foreign is not None
+        and len(proposal.postings) == 1
+        and proposal.postings[0].amount is None
+    )
     for p in proposal.postings:
         amount_str: str | None = None
-        if p.amount is not None:
+        if price_single_leg:
+            amount_str = foreign
+        elif p.amount is not None:
             currency = p.currency or txn.currency
             amount_str = f"{p.amount} {currency}"
         postings.append((p.account, amount_str, dict(p.metadata)))
