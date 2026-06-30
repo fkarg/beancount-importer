@@ -40,6 +40,12 @@ _IMPACT_KEYS = ("Balance Impact",)
 # English description only for now; German exports add their own label.
 _GCC_DESC = "General Currency Conversion"
 
+# An authorization hold and its reversal are an exact ±X mirror pair linked by
+# `Reference Txn ID` (the reversal references the hold). They net to zero and
+# the real charge posts as its own row, so both legs are pure noise we drop.
+_HOLD_DESC = "Account Hold for Open Authorization"
+_REVERSAL_DESC = "Reversal of General Account Hold"
+
 
 def _first(row: dict[str, str], keys: tuple[str, ...]) -> str:
     for k in keys:
@@ -77,7 +83,9 @@ class PayPalParser:
         General Currency Conversion legs — which appear as separate rows —
         have been folded in.
         """
-        suppress, collapse = self._plan_currency_conversions(rows)
+        by_id = {tid: r for r in rows if (tid := _first(r, _REF_KEYS))}
+        suppress, collapse = self._plan_currency_conversions(rows, by_id)
+        suppress |= self._plan_hold_reversals(rows, by_id)
         for row in rows:
             tid = _first(row, _REF_KEYS)
             if tid and tid in suppress:
@@ -90,7 +98,7 @@ class PayPalParser:
             yield txn
 
     def _plan_currency_conversions(
-        self, rows: list[dict[str, str]]
+        self, rows: list[dict[str, str]], by_id: dict[str, dict[str, str]]
     ) -> tuple[set[str], dict[str, dict[str, object]]]:
         """Return (GCC-leg ids to drop, payment-id → collapsed-field overrides).
 
@@ -98,7 +106,6 @@ class PayPalParser:
         and one same-currency GCC leg; anything else is left untouched so no
         data is silently lost.
         """
-        by_id = {tid: r for r in rows if (tid := _first(r, _REF_KEYS))}
         legs_by_parent: dict[str, list[dict[str, str]]] = {}
         for r in rows:
             if _first(r, _DESC_KEYS) == _GCC_DESC:
@@ -128,6 +135,30 @@ class PayPalParser:
             }
             suppress.update(_first(leg, _REF_KEYS) for leg in legs)
         return suppress, collapse
+
+    def _plan_hold_reversals(
+        self, rows: list[dict[str, str]], by_id: dict[str, dict[str, str]]
+    ) -> set[str]:
+        """Return ids of hold↔reversal mirror pairs to drop.
+
+        Only an exact match is dropped: the reversal must reference an
+        `Account Hold for Open Authorization` row whose `Net` is the exact
+        negation of the reversal's. An unpaired hold (no matching reversal)
+        is kept — a hold that became a real charge must not vanish.
+        """
+        suppress: set[str] = set()
+        for r in rows:
+            if _first(r, _DESC_KEYS) != _REVERSAL_DESC:
+                continue
+            hold = by_id.get(_first(r, _REFTXN_KEYS))
+            if hold is None or _first(hold, _DESC_KEYS) != _HOLD_DESC:
+                continue
+            r_net = parse_amount(_first(r, _NET_KEYS), self._csv.amount_locale)
+            h_net = parse_amount(_first(hold, _NET_KEYS), self._csv.amount_locale)
+            if r_net != -h_net:
+                continue
+            suppress.update({_first(r, _REF_KEYS), _first(hold, _REF_KEYS)})
+        return suppress
 
     def _parse_row(self, row: dict[str, str]) -> SourceTransaction | None:
         if _first(row, _IMPACT_KEYS) == "Memo":

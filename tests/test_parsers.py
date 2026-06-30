@@ -888,6 +888,61 @@ class TestPayPalCurrencyConversion:
         assert txns[0].original_amount is None
 
 
+class TestPayPalHoldReversal:
+    def _parse(self, tmp_path: Path, csv_text: str):
+        f = tmp_path / "pp_hold.csv"
+        f.write_text(csv_text)
+        return list(PayPalParser(_make_paypal_config(tmp_path)).parse(str(f)))
+
+    def test_matched_pair_is_dropped(self, tmp_path: Path):
+        csv_text = textwrap.dedent("""\
+            Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+            2024-01-25,10:00:00,Account Hold for Open Authorization,EUR,-15.99,,HOLD1,EXT
+            2024-01-25,10:00:00,Reversal of General Account Hold,EUR,15.99,,REV1,HOLD1
+            2024-01-25,10:00:00,Mobile Payment,EUR,-15.99,Spotify,PAY1,EXT
+        """)
+        txns = self._parse(tmp_path, csv_text)
+        # Only the real payment survives.
+        assert [t.sepa_reference for t in txns] == ["PAY1"]
+
+    def test_unpaired_hold_is_kept(self, tmp_path: Path):
+        # A hold with no reversal might be a real charge — must not vanish.
+        csv_text = textwrap.dedent("""\
+            Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+            2024-01-25,10:00:00,Account Hold for Open Authorization,EUR,-15.99,,HOLD1,EXT
+        """)
+        txns = self._parse(tmp_path, csv_text)
+        assert [t.sepa_reference for t in txns] == ["HOLD1"]
+
+    def test_non_mirror_amounts_are_kept(self, tmp_path: Path):
+        # Reversal amount doesn't exactly negate the hold → not a clean pair.
+        csv_text = textwrap.dedent("""\
+            Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+            2024-01-25,10:00:00,Account Hold for Open Authorization,EUR,-15.99,,HOLD1,EXT
+            2024-01-25,10:00:00,Reversal of General Account Hold,EUR,10.00,,REV1,HOLD1
+        """)
+        txns = self._parse(tmp_path, csv_text)
+        assert {t.sepa_reference for t in txns} == {"HOLD1", "REV1"}
+
+    def test_reversal_referencing_non_hold_is_kept(self, tmp_path: Path):
+        # The reversal's parent exists but isn't a hold → leave both alone.
+        csv_text = textwrap.dedent("""\
+            Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+            2024-01-25,10:00:00,Mobile Payment,EUR,-15.99,Shop,PAY1,EXT
+            2024-01-25,10:00:00,Reversal of General Account Hold,EUR,15.99,,REV1,PAY1
+        """)
+        txns = self._parse(tmp_path, csv_text)
+        assert {t.sepa_reference for t in txns} == {"PAY1", "REV1"}
+
+    def test_reversal_with_missing_parent_is_kept(self, tmp_path: Path):
+        csv_text = textwrap.dedent("""\
+            Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+            2024-01-25,10:00:00,Reversal of General Account Hold,EUR,15.99,,REV1,GONE
+        """)
+        txns = self._parse(tmp_path, csv_text)
+        assert [t.sepa_reference for t in txns] == ["REV1"]
+
+
 # ── Cash parser ──────────────────────────────────────────────────────────────
 
 CASH_CSV = textwrap.dedent("""\
