@@ -99,6 +99,12 @@ def apply_update(
         metadata=metadata,
         narration_max_length=narration_max_length,
     )
+    if not entry.file_path:
+        # An in-session synthesized entry (e.g. a cross-bank counter-leg
+        # placeholder) has no on-disk location to rewrite — `Path("")` would
+        # resolve to the cwd. The pipeline must redirect such matches before
+        # persistence; reaching here is a contract violation, not user error.
+        raise ValueError("apply_update: entry has no file_path to splice into")
     target = Path(entry.file_path)
     line_end = entry.line_end or _detect_entry_end(target, entry.line_start)
     splice_entries([(entry.line_start, line_end, text)], target, dry_run=dry_run)

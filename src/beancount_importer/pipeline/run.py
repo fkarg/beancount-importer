@@ -42,6 +42,7 @@ from beancount_importer.pipeline._proposal import (
 from beancount_importer.pipeline._result import (
     _build_result,
     _synthesize_counter_leg,
+    _fold_inflight_date_hint,
 )
 from beancount_importer.pipeline._shared import (
     _load_all_outputs,
@@ -131,6 +132,11 @@ def run(
     results: list[ImportResult] = (
         results_accumulator if results_accumulator is not None else []
     )
+    # Maps an in-session counter-leg placeholder (by identity) to the index of
+    # the leg-1 result it mirrors, so a later counter-party row's date hint can
+    # be folded back onto leg 1 instead of spliced into the (location-less)
+    # placeholder. See `_synthesize_counter_leg` / `_fold_inflight_date_hint`.
+    counter_origin: dict[int, int] = {}
 
     for progress, txn in enumerate(inputs, start=1):
         reporter.on_progress(progress, total, txn.bank_key)
@@ -160,6 +166,28 @@ def run(
             progress=(progress, total),
         )
 
+        # Leg 2 of a same-session transfer: it matched an in-session placeholder
+        # that has no file to splice into. Redirect its date hint onto leg 1's
+        # pending entry and drop the placeholder splice so persistence skips it.
+        matched = result.matched_entry
+        if (
+            result.action == "update"
+            and matched is not None
+            and matched.metadata.get("_pending_in_session") == "true"
+            and id(matched) in counter_origin
+            and result.proposed_changes
+        ):
+            leg1_idx = counter_origin[id(matched)]
+            leg1 = results[leg1_idx]
+            results[leg1_idx] = _fold_inflight_date_hint(
+                leg1,
+                matched.source_account,
+                list(result.proposed_changes),
+                bank_by_key[leg1.source_txn.bank_key],
+                narration_max_length=config.narration_max_length,
+            )
+            result = result.model_copy(update={"proposed_changes": []})
+
         counter = _synthesize_counter_leg(
             result,
             txn,
@@ -169,6 +197,8 @@ def run(
         if counter is not None:
             existing_by_account.setdefault(counter.source_account, []).append(counter)
             existing.append(counter)
+            # leg 1 (`result`) is appended below at index len(results).
+            counter_origin[id(counter)] = len(results)
 
         decisions.record(txn, result)
         reporter.on_result(result)

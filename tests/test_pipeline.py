@@ -2650,18 +2650,22 @@ class TestInSessionCounterLeg:
         )
         session = ImportSession(config=cfg, options=ImportOptions())
         results = run(session, tmp_path, categ, NoopReporter())
-        # Two CSV rows → two results. The SPK row creates the entry;
-        # the N26 row matches the in-session synthesized counter-leg
-        # and proposes a `settle:` metadata addition (date differs).
+        # Two CSV rows → two results. The SPK row creates the entry; the N26
+        # row matches the in-session synthesized counter-leg. Because the dates
+        # differ (N26 CSV is *later* → `settle:`) and the placeholder has no
+        # on-disk location, the hint folds onto leg 1's (SPK) pending entry —
+        # on its N26 posting — rather than being spliced into the placeholder.
         spk = next(r for r in results if r.source_txn.bank_key == "spk")
         n26 = next(r for r in results if r.source_txn.bank_key == "n26")
         assert spk.action == "new"
+        assert 'settle: "2024-03-17"' in spk.new_entry_text
+        # Leg 2 matched the placeholder (inferred amount, no file) but proposes
+        # no splice of its own — the hint went to leg 1.
         assert n26.action == "update"
         assert n26.matched_entry is not None
         assert n26.matched_entry.amount_inferred is True
-        # Date diff metadata: N26-side CSV is *later*, so propose `settle:`.
-        meta_fields = {c.field for c in n26.proposed_changes}
-        assert "posting:settle" in meta_fields
+        assert n26.matched_entry.file_path == ""
+        assert n26.proposed_changes == []
 
     def test_synthesis_skipped_when_target_is_not_a_configured_bank(
         self, tmp_path: Path
@@ -3081,3 +3085,104 @@ class TestDiffSuppressions:
         results = run(session, tmp_path, categ, NoopReporter())
         fields = {c.field for c in results[0].proposed_changes}
         assert "account" not in fields
+
+
+class TestPipelineSameSessionCounterLeg:
+    """Both legs of a cross-bank transfer imported in one run.
+
+    When the SPK row is categorized directly as a transfer to a configured
+    bank account, `_synthesize_counter_leg` seeds an in-session placeholder
+    in that bank's bucket (no on-disk location). A later CSV row from the
+    counter-party bank matches the placeholder via the scorer. If the two
+    legs' dates disagree, leg 2 wants a `settle`/`actual`/`paypal` date hint
+    — which must land on leg 1's not-yet-written entry, never on the
+    placeholder (splicing the placeholder hit `Path("") -> '.'`).
+    """
+
+    def _spk_csv(self, path: Path, row: str) -> None:
+        path.write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            f"{row}\n"
+        )
+
+    def _paypal_csv(self, path: Path, row: str) -> None:
+        path.write_text("Date,Description,Currency,Gross\n" + f"{row}\n")
+
+    def _make_paypal_bank(self) -> BankConfig:
+        return BankConfig(
+            key="paypal",
+            display_name="PayPal",
+            account="Assets:B:PayPal",
+            file_glob="PayPal_*.csv",
+            output_file="paypal.bean",
+            csv=CsvConfig(
+                delimiter=",",
+                date_format=["%Y-%m-%d"],
+                amount_locale="en",
+                field_date="Date",
+                field_amount="Gross",
+                field_currency="Currency",
+                field_description="Description",
+            ),
+        )
+
+    def _run(self, tmp_path: Path):
+        # SPK leg on 04-13, PayPal leg on 04-15 → settle (csv date later).
+        self._spk_csv(
+            tmp_path / "SPK_2024.csv",
+            "13.04.24;Google Payment;Google Payment;-3,39;EUR;",
+        )
+        self._paypal_csv(
+            tmp_path / "PayPal_2024.csv",
+            "2024-04-15,Google Payment,EUR,-3.39",
+        )
+        cfg = Config(
+            banks=[
+                make_spk_bank(year_template_output=False),
+                self._make_paypal_bank(),
+            ],
+            transactions_dir="transactions",
+            # Disable cross-source matchers so the row reaches the scorer and
+            # matches the in-session placeholder (the path that crashed).
+            matching=MatchingConfig(min_score=0.35, enabled_matchers=()),
+        )
+
+        def categ(ctx):
+            account = (
+                "Assets:B:PayPal" if ctx.txn.bank_key == "spk" else "Expenses:Apps"
+            )
+            return CategoryProposal(
+                action="categorize", postings=(Posting(account=account),)
+            )
+
+        session = ImportSession(config=cfg, options=ImportOptions())
+        return cfg, run(session, tmp_path, categ, NoopReporter())
+
+    def test_hint_folds_into_leg_one_entry(self, tmp_path: Path):
+        _cfg, results = self._run(tmp_path)
+        spk = next(r for r in results if r.source_txn.bank_key == "spk")
+        paypal = next(r for r in results if r.source_txn.bank_key == "paypal")
+
+        # Leg 1's freshly-formatted entry carries the date hint on its PayPal leg.
+        assert spk.action == "new"
+        assert 'settle: "2024-04-15"' in spk.new_entry_text
+
+        # Leg 2 matched the in-session placeholder but proposes no splice.
+        assert paypal.action == "update"
+        assert paypal.matched_entry is not None
+        assert paypal.matched_entry.file_path == ""
+        assert paypal.proposed_changes == []
+
+    def test_persist_does_not_crash_and_writes_hint(self, tmp_path: Path):
+        from beancount_importer.cli import _persist_results
+
+        cfg, results = self._run(tmp_path)
+        # Pre-fix both raised IsADirectoryError: '.' — `apply_update` read the
+        # placeholder's `Path("")` even under dry_run (`--preview`), which is
+        # exactly how this surfaced in the field.
+        _persist_results(results, cfg, tmp_path, dry_run=True)  # preview path
+        _persist_results(results, cfg, tmp_path, dry_run=False)
+        written = (tmp_path / "spk.bean").read_text()
+        assert 'settle: "2024-04-15"' in written
+        # Leg 2 produced no second entry / no paypal.bean write.
+        assert not (tmp_path / "paypal.bean").exists()

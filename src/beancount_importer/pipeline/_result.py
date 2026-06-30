@@ -146,6 +146,49 @@ def _synthesize_counter_leg(
     )
 
 
+def _fold_inflight_date_hint(
+    origin: ImportResult,
+    hint_account: str,
+    changes: list[ProposedChange],
+    bank: BankConfig,
+    *,
+    narration_max_length: int | None = None,
+) -> ImportResult:
+    """Fold leg-2's proposed date metadata onto leg-1's not-yet-written entry.
+
+    When both legs of a cross-bank transfer are imported in one run, leg 2
+    matches the in-session placeholder seeded by `_synthesize_counter_leg`.
+    That placeholder has no on-disk location, so the `settle`/`actual`/`paypal`
+    date hint it proposes can't be spliced — it belongs on leg 1's freshly
+    formatted entry instead. We add the hint to the posting whose account is
+    `hint_account` (the counter-party bank leg) and re-render `new_entry_text`.
+
+    `changes` carries leg 2's `posting:<key>` proposed changes (the only kind
+    `_propose_date_metadata` emits); any non-`posting:` change is ignored. The
+    caller only invokes this for a leg-1 "new" result, which always carries a
+    proposal.
+    """
+    assert origin.proposal is not None  # leg-1 "new" result always has one
+    hints = {
+        change.field.split(":", 1)[1]: change.new_val
+        for change in changes
+        if change.field.startswith("posting:")
+    }
+    updated_postings = [
+        p.model_copy(update={"metadata": {**p.metadata, **hints}})
+        if p.account == hint_account
+        else p
+        for p in origin.proposal.postings
+    ]
+    amended = origin.proposal.model_copy(update={"postings": tuple(updated_postings)})
+    new_text = _format_new_entry(
+        bank, origin.source_txn, amended, narration_max_length=narration_max_length
+    )
+    return origin.model_copy(
+        update={"proposal": amended, "new_entry_text": new_text}
+    )
+
+
 def _propose_date_metadata(
     txn: SourceTransaction,
     entry: LedgerEntry,
