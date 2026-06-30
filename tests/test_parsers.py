@@ -809,6 +809,85 @@ class TestPayPalParser:
         assert txns[0].amount == Decimal("-25.50")
 
 
+# A foreign purchase bundle: payment (USD) + funding deposit (EUR) + two
+# General Currency Conversion legs (one EUR home, one USD swap), all linked
+# to the payment's Transaction ID via Reference Txn ID.
+PAYPAL_FX_CSV = textwrap.dedent("""\
+    Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+    2024-03-25,10:00:00,PreApproved Payment Bill User Payment,USD,-25.95,Uber Technologies Inc,PAY1,EXT0
+    2024-03-25,10:00:00,Bank Deposit to PP Account,EUR,25.03,,DEP1,PAY1
+    2024-03-25,10:00:00,General Currency Conversion,EUR,-25.03,,GCC_EUR,PAY1
+    2024-03-25,10:00:00,General Currency Conversion,USD,25.95,,GCC_USD,PAY1
+""")
+
+
+class TestPayPalCurrencyConversion:
+    def _parse(self, tmp_path: Path, csv_text: str):
+        f = tmp_path / "pp_fx.csv"
+        f.write_text(csv_text)
+        return list(PayPalParser(_make_paypal_config(tmp_path)).parse(str(f)))
+
+    def test_collapses_bundle_into_one_priced_txn(self, tmp_path: Path):
+        txns = self._parse(tmp_path, PAYPAL_FX_CSV)
+        # Payment (collapsed) + funding deposit; both GCC legs suppressed.
+        assert len(txns) == 2
+        pay = next(t for t in txns if t.payee == "Uber Technologies Inc")
+        assert pay.amount == Decimal("-25.03")  # home leg
+        assert pay.currency == "EUR"
+        assert pay.original_amount == Decimal("25.95")  # foreign magnitude
+        assert pay.original_currency == "USD"
+
+    def test_funding_deposit_survives_untouched(self, tmp_path: Path):
+        txns = self._parse(tmp_path, PAYPAL_FX_CSV)
+        dep = next(t for t in txns if t.sepa_reference == "DEP1")
+        assert dep.amount == Decimal("25.03")
+        assert dep.currency == "EUR"
+        assert dep.original_amount is None
+
+    def test_gcc_legs_are_dropped(self, tmp_path: Path):
+        txns = self._parse(tmp_path, PAYPAL_FX_CSV)
+        refs = {t.sepa_reference for t in txns}
+        assert "GCC_EUR" not in refs
+        assert "GCC_USD" not in refs
+
+    def test_incomplete_bundle_is_left_untouched(self, tmp_path: Path):
+        # Only the home GCC leg present (no same-currency swap leg) → we can't
+        # safely collapse, so every row passes through unchanged.
+        partial = textwrap.dedent("""\
+            Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+            2024-03-25,10:00:00,PreApproved Payment Bill User Payment,USD,-25.95,Uber,PAY1,EXT0
+            2024-03-25,10:00:00,General Currency Conversion,EUR,-25.03,,GCC_EUR,PAY1
+        """)
+        txns = self._parse(tmp_path, partial)
+        assert len(txns) == 2
+        pay = next(t for t in txns if t.payee == "Uber")
+        assert pay.amount == Decimal("-25.95")  # not collapsed
+        assert pay.original_amount is None
+
+    def test_orphan_gcc_leg_without_parent_passes_through(self, tmp_path: Path):
+        # A General Currency Conversion row with no Transaction ID and no
+        # Reference Txn ID can't be tied to a payment — it's left alone
+        # rather than dropped, so no balance silently disappears.
+        orphan = textwrap.dedent("""\
+            Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+            2024-03-25,10:00:00,General Currency Conversion,EUR,-1.00,,,
+        """)
+        txns = self._parse(tmp_path, orphan)
+        assert len(txns) == 1
+        assert txns[0].amount == Decimal("-1.00")
+        assert txns[0].original_amount is None
+
+    def test_domestic_payment_unaffected(self, tmp_path: Path):
+        domestic = textwrap.dedent("""\
+            Date,Time,Description,Currency,Net,Name,Transaction ID,Reference Txn ID
+            2024-03-25,10:00:00,Mobile Payment,EUR,-12.50,Bakery,PAY9,EXT9
+        """)
+        txns = self._parse(tmp_path, domestic)
+        assert len(txns) == 1
+        assert txns[0].amount == Decimal("-12.50")
+        assert txns[0].original_amount is None
+
+
 # ── Cash parser ──────────────────────────────────────────────────────────────
 
 CASH_CSV = textwrap.dedent("""\
