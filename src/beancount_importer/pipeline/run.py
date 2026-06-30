@@ -29,7 +29,7 @@ from beancount_importer.models import (
     LedgerEntry,
     SourceTransaction,
 )
-from beancount_importer.pipeline._clean import clean_paypal_noise
+from beancount_importer.pipeline._clean import clean_acquirer_prefix, clean_paypal_noise
 from beancount_importer.pipeline._merge import _apply_merge_decision
 from beancount_importer.pipeline._proposal import (
     _derive_rule,
@@ -145,6 +145,9 @@ def run(
         # clean payee + description instead of bank transport noise.
         # Other rows pass through unchanged.
         txn = clean_paypal_noise(txn)
+        # Strip card-acquirer descriptors ("SumUp  *Merchant", "SQ *Merchant")
+        # so the written payee and matching see the real merchant, not the PSP.
+        txn = clean_acquirer_prefix(txn)
 
         bank_cfg = bank_by_key[txn.bank_key]
         bucket = existing_by_account.get(bank_account_by_key[txn.bank_key], [])

@@ -2894,6 +2894,66 @@ class TestPaypalNoiseCleaner:
         assert cleaned.payee in ("Spotify", "PayPal")
 
 
+class TestAcquirerPrefixCleaner:
+    """`clean_acquirer_prefix` strips card-acquirer / PSP descriptors
+    ("SumUp  *Merchant", "SQ *Merchant", "UZR*Merchant") from the payee,
+    surfacing the real merchant for both the written ledger and matching.
+    """
+
+    def _txn(self, *, payee: str | None) -> SourceTransaction:
+        return SourceTransaction(
+            booking_date=date(2024, 4, 18),
+            amount=Decimal("-12.99"),
+            currency="EUR",
+            bank_key="n26",
+            payee=payee,
+            description="card payment",
+        )
+
+    def test_strips_sumup_prefix_with_double_space(self):
+        from beancount_importer.pipeline._clean import clean_acquirer_prefix
+        cleaned = clean_acquirer_prefix(self._txn(payee="SumUp  *Donaladn Frank"))
+        assert cleaned.payee == "Donaladn Frank"
+
+    def test_strips_no_space_prefix(self):
+        from beancount_importer.pipeline._clean import clean_acquirer_prefix
+        cleaned = clean_acquirer_prefix(self._txn(payee="UZR*TRITON Tauchsports"))
+        assert cleaned.payee == "TRITON Tauchsports"
+
+    def test_match_is_case_insensitive(self):
+        from beancount_importer.pipeline._clean import clean_acquirer_prefix
+        cleaned = clean_acquirer_prefix(self._txn(payee="sq *Arch Cafe"))
+        assert cleaned.payee == "Arch Cafe"
+
+    def test_original_payee_preserved_in_raw_data(self):
+        from beancount_importer.pipeline._clean import clean_acquirer_prefix
+        cleaned = clean_acquirer_prefix(self._txn(payee="SPC*Boulderwelt GmbH"))
+        assert cleaned.raw_data["_original_payee"] == "SPC*Boulderwelt GmbH"
+
+    def test_unknown_prefix_returns_unchanged(self):
+        from beancount_importer.pipeline._clean import clean_acquirer_prefix
+        # "FRAMEWORK" is deliberately not in the list: the prefix IS the brand.
+        txn = self._txn(payee="FRAMEWORK*Laptop")
+        assert clean_acquirer_prefix(txn) is txn
+
+    def test_letter_run_without_asterisk_untouched(self):
+        from beancount_importer.pipeline._clean import clean_acquirer_prefix
+        # "Square Enix" begins with "sq" but has no `*` — must not be stripped.
+        txn = self._txn(payee="Square Enix")
+        assert clean_acquirer_prefix(txn) is txn
+
+    def test_prefix_only_payee_untouched(self):
+        from beancount_importer.pipeline._clean import clean_acquirer_prefix
+        # Nothing left after the prefix — leave it rather than emit an empty payee.
+        txn = self._txn(payee="SumUp  *")
+        assert clean_acquirer_prefix(txn) is txn
+
+    def test_none_payee_returns_unchanged(self):
+        from beancount_importer.pipeline._clean import clean_acquirer_prefix
+        txn = self._txn(payee=None)
+        assert clean_acquirer_prefix(txn) is txn
+
+
 class TestDiffChangesDirect:
     """Unit tests for `_diff_changes` itself. The end-to-end tests in
     TestDiffSuppressions exercise the suppressions through the pipeline,

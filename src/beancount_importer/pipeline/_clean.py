@@ -44,6 +44,52 @@ _MERCHANT_RE = re.compile(r"Ihr Einkauf bei\s+(.*)", re.IGNORECASE)
 _MERCHANT_TAIL = re.compile(r",\s*Ihr Einkauf bei.*$", re.IGNORECASE)
 
 
+# Card-acquirer / payment-facilitator descriptor prefixes. These PSPs
+# prepend "<NAME> *" (whitespace and digit-runs vary) to the real merchant
+# in the payee field — e.g. "SumUp  *Donaladn Frank", "SQ *ARCH CAFE",
+# "UZR*TRITON Tauchsports". The prefix carries no information worth keeping,
+# so we strip it and surface the merchant. PayPal is handled separately by
+# `clean_paypal_noise`.
+#
+# Deliberately EXCLUDED: brand-owned prefixes where the leading token *is*
+# the merchant identity and stripping makes the payee worse —
+# "UBER *EATS" → "EATS", "FRAMEWORK*..." (Framework laptops), "SNACK* TACOS".
+_ACQUIRER_PREFIXES = (
+    "sumup", "sq", "uzr", "nya", "spc", "com", "lsp", "fawry",
+    "iz", "zettle", "tst", "stripe", "wpy",
+)
+
+_ACQUIRER_PREFIX_RE = re.compile(
+    r"^(?:" + "|".join(_ACQUIRER_PREFIXES) + r")\s*\*+\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_acquirer_prefix(txn: SourceTransaction) -> SourceTransaction:
+    """Strip a leading payment-facilitator descriptor from the payee.
+
+    Fires only when the payee starts with a known facilitator prefix
+    (`SumUp *`, `SQ *`, `UZR*`, ...) AND a non-empty merchant remains after
+    stripping — a payee that is *only* the prefix is left untouched. The
+    original payee is preserved in `raw_data['_original_payee']`.
+
+    The required `*` anchors the match, so merchants that merely begin with
+    one of these letter-runs ("Commerzbank", "Square Enix") are unaffected.
+    """
+    payee = txn.payee
+    if not payee:
+        return txn
+    stripped = _ACQUIRER_PREFIX_RE.sub("", payee).strip()
+    if stripped == payee or not stripped:
+        return txn
+    return txn.model_copy(
+        update={
+            "payee": stripped,
+            "raw_data": {**txn.raw_data, "_original_payee": payee},
+        }
+    )
+
+
 def _looks_like_paypal(payee: str | None) -> bool:
     return bool(payee) and "paypal" in payee.lower()
 
