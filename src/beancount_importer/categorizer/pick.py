@@ -5,7 +5,7 @@ accept; the user must positively choose. The header glyph is `?` to
 match the principle ("color and shape both carry meaning").
 
 Hotkey set:
-- `[1-5]` pick from the top-5 suggestions
+- `[1-8]` pick from the top-8 suggestions
 - `[l]` list all accounts (paged 10/page)
 - `[w]` write a custom account name
 - `[o]` transfer to own account (filtered to Assets/Liabilities)
@@ -41,10 +41,11 @@ if TYPE_CHECKING:
     from beancount_importer.pipeline import NearMiss
 
 
-# How many suggestions land on the top screen. The design doc settles on 5
-# (vs. an earlier draft's 10) because a five-row block keeps the screen
-# compact and `[l]` paging covers the long tail.
-SUGGESTIONS_TOP_N = 5
+# How many suggestions land on the top screen. Eight is the cap that still
+# keeps every numeric hotkey a single digit (`1-8`); `[l]` covers the long
+# tail. (An earlier draft used 5 for a more compact block, but the extra
+# rows are worth it to surface more of the ranked candidates up front.)
+SUGGESTIONS_TOP_N = 8
 
 
 @dataclass(frozen=True)
@@ -130,9 +131,9 @@ def _render_suggestions(console: Console, ctx: PickContext) -> None:
 
 
 def _render_hotkeys(console: Console) -> None:
-    """Hotkey row. Step 4 ships `[1-5]`, `[l]`, `[w]`, `[o]`, `[s]`, `[q]`."""
+    """Hotkey row. Step 4 ships `[1-8]`, `[l]`, `[w]`, `[o]`, `[s]`, `[q]`."""
     console.print(
-        f"  {hotkey('1-5')} pick   "
+        f"  {hotkey('1-8')} pick   "
         f"{hotkey('l')} list all accounts   "
         f"{hotkey('w')} write custom account"
     )

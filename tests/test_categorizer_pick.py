@@ -100,13 +100,13 @@ class TestRender:
         # Anything not in the count map renders `—` so the column lines up.
         assert "—" in out
 
-    def test_top_n_caps_at_five(self):
+    def test_top_n_caps_at_eight(self):
         con = _console()
         render(con, _ctx(suggestions=tuple(f"Expenses:Cat{i}" for i in range(20))))
         out = con.export_text()
-        # 5th visible, 6th not.
-        assert "Expenses:Cat4" in out
-        assert "Expenses:Cat5" not in out
+        # 8th visible, 9th not.
+        assert "Expenses:Cat7" in out
+        assert "Expenses:Cat8" not in out
 
     def test_no_suggestions_shows_fallback_hint(self):
         con = _console()
@@ -120,7 +120,7 @@ class TestRender:
         render(con, _ctx())
         out = con.export_text()
         for hotkey in (
-            "[1-5] pick",
+            "[1-8] pick",
             "[l] list all accounts",
             "[w] write custom account",
             "[o] transfer to own account",
