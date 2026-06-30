@@ -182,7 +182,11 @@ def run(console: Console, ctx: AmbiguousContext) -> AmbiguousDecision:
     user picks whichever feels natural.
     """
     render(console, ctx)
-    key = ask_hotkey(_build_hotkeys(ctx))
+    key = ask_hotkey(
+        _build_hotkeys(ctx),
+        console=console,
+        redraw=lambda: render(console, ctx),
+    )
     if key == "" or key == "1":
         return AmbiguousDecision(action="pick", entry=ctx.candidates[0][0])
     if key.isdigit():

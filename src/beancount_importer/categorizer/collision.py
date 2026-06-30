@@ -156,7 +156,11 @@ def run(console: Console, ctx: CollisionContext) -> CollisionDecision:
     this screen; the diff itself is the decision aid.
     """
     render(console, ctx)
-    key = ask_hotkey(_HOTKEYS)
+    key = ask_hotkey(
+        _HOTKEYS,
+        console=console,
+        redraw=lambda: render(console, ctx),
+    )
     if key == "":
         return CollisionDecision(action="update")
     if key == "k":

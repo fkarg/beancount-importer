@@ -356,8 +356,13 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
     proposal = ctx.proposal
     keys = _HOTKEYS_DEBIT if ctx.txn.amount < 0 else _HOTKEYS_CREDIT
     while True:
-        render(console, replace(ctx, proposal=proposal))
-        key = ask_hotkey(keys)
+        display = replace(ctx, proposal=proposal)
+        render(console, display)
+        key = ask_hotkey(
+            keys,
+            console=console,
+            redraw=lambda display=display: render(console, display),
+        )
         if key == "":
             return ConfirmDecision(action="confirm", proposal=proposal)
         if key == "s":

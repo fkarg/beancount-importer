@@ -167,7 +167,11 @@ def run(console: Console, ctx: PickContext) -> PickDecision:
     """
     while True:
         render(console, ctx)
-        key = ask_hotkey(_build_hotkeys(ctx))
+        key = ask_hotkey(
+            _build_hotkeys(ctx),
+            console=console,
+            redraw=lambda: render(console, ctx),
+        )
         if key == "s":
             return PickDecision(action="skip")
         if key == "q":

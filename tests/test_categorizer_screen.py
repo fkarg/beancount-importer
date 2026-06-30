@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import os
+import pty
+import sys
+import termios
+import tty
+from contextlib import contextmanager
 from datetime import date
 from io import StringIO
 
+import pytest
 from rich.console import Console
 
 from beancount_importer.categorizer.screen import (
     RULE,
     RULE_WIDTH,
+    _classify_key,
+    ask_hotkey,
     bottom_rule,
     hotkey,
     styled_account,
@@ -65,6 +74,99 @@ class TestBottomRule:
         assert RULE in out
         assert len(RULE) == RULE_WIDTH
 
+
+class TestClassifyKey:
+    VALID = frozenset({"", "1", "s"})
+
+    def test_ctrl_l_is_redraw(self):
+        assert _classify_key(b"\x0c", self.VALID) == ("redraw", "")
+
+    def test_enter_maps_to_empty_key(self):
+        # CR and LF both mean "Enter", which the design treats as a hotkey.
+        assert _classify_key(b"\r", self.VALID) == ("key", "")
+        assert _classify_key(b"\n", self.VALID) == ("key", "")
+
+    def test_valid_char_returns_key(self):
+        assert _classify_key(b"1", self.VALID) == ("key", "1")
+
+    def test_unknown_char_is_ignored(self):
+        # A key not in `choices` is swallowed, mirroring `Prompt.ask`'s
+        # choice-list rejection.
+        assert _classify_key(b"z", self.VALID) == ("ignore", "")
+
+    def test_eof_and_ctrl_d_raise(self):
+        for byte in (b"", b"\x04"):
+            with pytest.raises(EOFError):
+                _classify_key(byte, self.VALID)
+
+
+@contextmanager
+def _stdin_feeding(keystrokes: bytes):
+    """Stand `sys.stdin` up as a pty slave preloaded with `keystrokes`.
+
+    The slave is put in cbreak (non-canonical, no echo) *before* the bytes
+    are written, so `_read_hotkey`'s `os.read` sees them immediately —
+    bytes queued in canonical mode wouldn't be readable without a newline,
+    and echo on the slave would back up `TCSADRAIN` on restore.
+    """
+    master, slave = pty.openpty()
+    tty.setcbreak(slave, termios.TCSANOW)
+    os.write(master, keystrokes)
+    stdin = os.fdopen(slave, "rb", buffering=0)
+    saved = sys.stdin
+    sys.stdin = stdin
+    try:
+        yield
+    finally:
+        sys.stdin = saved
+        stdin.close()
+        os.close(master)
+
+
+class TestAskHotkeyRawTty:
+    """The interactive single-key path: only taken on a real terminal,
+    so the stream is a pty slave whose `isatty()` is True.
+    """
+
+    def test_ctrl_l_clears_redraws_then_returns_next_key(self):
+        console = Console(file=StringIO(), force_terminal=True)
+        redraws: list[bool] = []
+        # Ctrl-L → redraw; 'z' → not a choice, ignored; '1' → accepted.
+        with _stdin_feeding(b"\x0cz1"):
+            result = ask_hotkey(
+                ("", "1", "s"),
+                console=console,
+                redraw=lambda: redraws.append(True),
+            )
+        assert result == "1"
+        assert redraws == [True]
+
+    def test_enter_returns_empty_key(self):
+        console = Console(file=StringIO(), force_terminal=True)
+        with _stdin_feeding(b"\r"):
+            result = ask_hotkey(
+                ("", "1"), console=console, redraw=lambda: None
+            )
+        assert result == ""
+
+
+class TestAskHotkeyFallback:
+    def test_uses_prompt_ask_without_console(self, monkeypatch):
+        # No console/redraw → line-buffered path, regardless of tty state.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", lambda *a, **k: "  s  "
+        )
+        assert ask_hotkey(("", "s")) == "s"
+
+    def test_uses_prompt_ask_when_not_a_tty(self, monkeypatch):
+        # console+redraw supplied, but under pytest stdin isn't a terminal
+        # (`isatty()` is False) → still the line-buffered path.
+        assert not sys.stdin.isatty()
+        monkeypatch.setattr("rich.prompt.Prompt.ask", lambda *a, **k: "q")
+        console = Console(file=StringIO())
+        assert (
+            ask_hotkey(("", "q"), console=console, redraw=lambda: None) == "q"
+        )
 
 
 class TestTagRemainingDays:
