@@ -302,6 +302,35 @@ class TestKeyboardInterruptSemantics:
         assert "kept" not in result.output
 
 
+class TestFlagThreading:
+    def test_time_flag_threads_into_chronological_option(
+        self, project_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        captured: dict[str, bool] = {}
+
+        def fake_run(
+            session, base_dir, categorize, reporter,
+            *, decisions, merge_fn, results_accumulator,
+        ):
+            del base_dir, categorize, reporter, decisions, merge_fn
+            captured["chronological"] = session.options.chronological
+            del results_accumulator
+
+        monkeypatch.setattr("beancount_importer.cli.run_pipeline", fake_run)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "--preview",
+                "--time",
+                "--config",
+                str(project_dir / "import_config.toml"),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert captured["chronological"] is True
+
+
 class TestRichReporter:
     """Direct unit tests for the per-row reporter behaviour. The
     end-to-end test above asserts the wiring; these isolate the flag.
@@ -356,6 +385,35 @@ class TestRichReporter:
         out = capsys.readouterr().out
         # `new` action with no rule renders the `(you)` suffix.
         assert "(you)" in out
+
+    def test_default_progress_logs_bank_header_on_bank_change(self, capsys):
+        from datetime import date
+
+        from beancount_importer.cli import RichReporter
+
+        reporter = RichReporter()
+        capsys.readouterr()
+        reporter.on_progress(1, 2, "spk", date(2024, 3, 8))
+        reporter.on_progress(2, 2, "spk", date(2024, 3, 9))
+        out = capsys.readouterr().out
+        assert out.count("spk") == 1  # header only on first sighting of the bank
+        assert "2024-03" not in out  # no date header in default mode
+
+    def test_chronological_progress_logs_date_header_on_day_change(self, capsys):
+        from datetime import date
+
+        from beancount_importer.cli import RichReporter
+
+        reporter = RichReporter(chronological=True)
+        capsys.readouterr()
+        reporter.on_progress(1, 4, "spk", date(2024, 3, 8))
+        reporter.on_progress(2, 4, "n26", date(2024, 3, 8))  # same day → no header
+        reporter.on_progress(3, 4, "spk", date(2024, 3, 9))  # new day → header
+        out = capsys.readouterr().out
+        assert out.count("2024-03-08") == 1
+        assert "2024-03-09" in out
+        # bank headers are suppressed in chronological mode
+        assert "processing transactions" not in out
 
 
 class TestInit:

@@ -15,6 +15,7 @@ lines of implementation.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import date
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
@@ -131,7 +132,9 @@ class Reporter(Protocol):
     """Receives all user-visible output from the pipeline."""
 
     def on_result(self, result: ImportResult) -> None: ...
-    def on_progress(self, current: int, total: int, bank: str) -> None: ...
+    def on_progress(
+        self, current: int, total: int, bank: str, booking_date: date
+    ) -> None: ...
     def on_error(self, message: str) -> None: ...
 
 
@@ -141,8 +144,10 @@ class NoopReporter:
     def on_result(self, result: ImportResult) -> None:
         del result
 
-    def on_progress(self, current: int, total: int, bank: str) -> None:
-        del current, total, bank
+    def on_progress(
+        self, current: int, total: int, bank: str, booking_date: date
+    ) -> None:
+        del current, total, bank, booking_date
 
     def on_error(self, message: str) -> None:
         del message

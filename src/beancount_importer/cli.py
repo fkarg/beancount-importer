@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Annotated
 
@@ -119,9 +120,11 @@ class RichReporter:
     the user sees the run isn't hung.
     """
 
-    def __init__(self, *, quiet: bool = False) -> None:
+    def __init__(self, *, quiet: bool = False, chronological: bool = False) -> None:
         self._last_bank: str = ""
+        self._last_date: date | None = None
         self._quiet = quiet
+        self._chronological = chronological
 
     def on_result(self, result: ImportResult) -> None:
         if self._quiet:
@@ -130,8 +133,17 @@ class RichReporter:
 
         console.print(format_line(result))
 
-    def on_progress(self, current: int, total: int, bank: str) -> None:
-        if bank != self._last_bank:
+    def on_progress(
+        self, current: int, total: int, bank: str, booking_date: date
+    ) -> None:
+        # In `--time` mode the stream is interleaved across banks, so a
+        # per-bank header would fire almost every row. Chunk by day instead;
+        # the per-row ticker already carries each row's bank.
+        if self._chronological:
+            if booking_date != self._last_date:
+                console.log(f"[bold]─── {booking_date.isoformat()} ───[/]")
+                self._last_date = booking_date
+        elif bank != self._last_bank:
             console.log(f"[bold]{bank}[/]: processing transactions…")
             self._last_bank = bank
         del current, total
@@ -282,6 +294,13 @@ def main(
             help="Score threshold above which matches auto-apply without prompt",
         ),
     ] = None,
+    time: Annotated[
+        bool,
+        typer.Option(
+            "--time",
+            help="Review transactions interleaved across banks in date order (chunked by day) instead of bank-by-bank",
+        ),
+    ] = False,
     init: Annotated[
         bool,
         typer.Option(
@@ -355,6 +374,7 @@ def main(
         preview=preview,
         interactive=not preview,
         auto_threshold=auto_threshold,
+        chronological=time,
         year_filter=effective_year_filter,
     )
     session = ImportSession(
@@ -364,7 +384,7 @@ def main(
         options=options,
     )
 
-    reporter = RichReporter(quiet=preview)
+    reporter = RichReporter(quiet=preview, chronological=options.chronological)
     categorize: CategorizeFn = (
         make_preview_categorizer()
         if preview

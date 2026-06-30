@@ -96,6 +96,12 @@ def run(
 
     banks = _select_banks(session)
     inputs = _parse_all_inputs(banks, base_dir, year_filter, reporter)
+    if session.options.chronological:
+        # Stable sort: within a day, the existing bank/CSV order is the
+        # tiebreak. Reordering shifts which leg of a same-session transfer
+        # is processed first (toward the earlier-dated leg) but does not
+        # break the leg-1→leg-2 placeholder pairing below.
+        inputs = sorted(inputs, key=lambda t: t.booking_date)
 
     # Single global sweep of every .bean under transactions_dir. The result is
     # one entry per bank-shaped posting; matching looks up the per-account
@@ -139,7 +145,7 @@ def run(
     counter_origin: dict[int, int] = {}
 
     for progress, txn in enumerate(inputs, start=1):
-        reporter.on_progress(progress, total, txn.bank_key)
+        reporter.on_progress(progress, total, txn.bank_key, txn.booking_date)
         # Pre-match cleaner: tidies SPK-style PayPal rows so the
         # merge-prompt display and text-similarity scoring see a
         # clean payee + description instead of bank transport noise.

@@ -433,6 +433,78 @@ class TestPipelineBankFilter:
         assert all(r.source_txn.bank_key == "spk" for r in results)
 
 
+# ── Chronological (--time) ordering ──────────────────────────────────────────
+
+
+class TestPipelineChronological:
+    """`ImportOptions.chronological` interleaves all banks by booking_date
+    instead of presenting them grouped bank-by-bank."""
+
+    def _two_bank_session(self, base_dir: Path, *, chronological: bool) -> ImportSession:
+        (base_dir / "SPK_jan.csv").write_text(textwrap.dedent("""\
+            Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz
+            15.01.24;Netflix;Abo;-15,99;EUR;
+            17.01.24;Rewe;Filiale;-42,50;EUR;
+        """))
+        (base_dir / "N26_jan.csv").write_text(textwrap.dedent("""\
+            Date,Amount,Payee
+            2024-01-16,-10.00,Aldi
+            2024-01-18,-20.00,Dm
+        """))
+        cfg = Config(
+            banks=[
+                make_spk_bank(year_template_output=False),
+                BankConfig(
+                    key="n26",
+                    display_name="N26",
+                    account="Assets:B:N26",
+                    file_glob="N26_*.csv",
+                    output_file="n26.bean",
+                    csv=CsvConfig(
+                        field_date="Date", field_amount="Amount", field_payee="Payee"
+                    ),
+                ),
+            ],
+            matching=MatchingConfig(min_score=0.35),
+        )
+        return ImportSession(
+            config=cfg, options=ImportOptions(chronological=chronological)
+        )
+
+    def _recording_categorize(self, seen: list[date]):
+        def _fn(ctx: CategorizeContext) -> CategoryProposal:
+            seen.append(ctx.txn.booking_date)
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Unknown"),),
+            )
+
+        return _fn
+
+    def test_chronological_interleaves_banks_by_date(self, tmp_path: Path):
+        seen: list[date] = []
+        session = self._two_bank_session(tmp_path, chronological=True)
+        run(session, tmp_path, self._recording_categorize(seen), NoopReporter())
+        assert seen == [
+            date(2024, 1, 15),
+            date(2024, 1, 16),
+            date(2024, 1, 17),
+            date(2024, 1, 18),
+        ]
+
+    def test_default_presents_grouped_by_bank(self, tmp_path: Path):
+        seen: list[date] = []
+        session = self._two_bank_session(tmp_path, chronological=False)
+        run(session, tmp_path, self._recording_categorize(seen), NoopReporter())
+        # spk's two rows first (config order), then n26's two rows.
+        assert seen == [
+            date(2024, 1, 15),
+            date(2024, 1, 17),
+            date(2024, 1, 16),
+            date(2024, 1, 18),
+        ]
+
+
 # ── Cross-bank matching: PayPal CSV against an SPK→PayPal entry ─────────────
 
 
@@ -1310,7 +1382,7 @@ class TestPipelineParseError:
             def on_result(self, result):
                 pass
 
-            def on_progress(self, current, total, bank):
+            def on_progress(self, current, total, bank, booking_date):
                 pass
 
             def on_error(self, message):

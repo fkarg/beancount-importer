@@ -26,6 +26,10 @@ class ImportOptions(BaseModel):
     preview: bool = False
     dry_run: bool = False
     bank_filter: str | None = None
+    # Present transactions interleaved across banks in booking_date order
+    # (stable within a day) instead of grouped bank-by-bank. Pure review-
+    # ordering control — output placement is unaffected. See cli `--time`.
+    chronological: bool = False
     # When set, only transactions whose booking_date.year is in this tuple are
     # processed. None means "no filter" — all parsed transactions are passed
     # through. Output paths are always resolved against each transaction's

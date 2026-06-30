@@ -107,6 +107,7 @@ This will:
 | `--preview`, `-P` | Non-interactive dry run. Shows a per-bank breakdown of what would be imported, applying only existing rules; never writes files or touches the decision log. |
 | `--dry-run` | Run interactively (with prompts) but skip all file writes. |
 | `--auto-threshold 0.85` | When matching against existing entries, auto-apply matches scoring above this threshold instead of prompting. |
+| `--time` | Review transactions interleaved across all banks in booking-date order (chunked by day) instead of grouped bank-by-bank. Pure review-ordering — output placement is unchanged. Handy with a calendar open next to you. |
 
 Examples:
 
