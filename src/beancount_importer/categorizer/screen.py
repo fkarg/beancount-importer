@@ -10,10 +10,13 @@ extra wrapper would only add indirection.
 
 from __future__ import annotations
 
+from datetime import date
+
 from rich.console import Console
 from rich.prompt import Prompt
 
 from beancount_importer.matching.account_suggest import account_glyph
+from beancount_importer.rules.tags import ActiveTag
 
 
 # Rule width matches the design doc's screen examples (73 columns). All
@@ -63,3 +66,16 @@ def ask_hotkey(choices: tuple[str, ...]) -> str:
         show_choices=False,
         show_default=False,
     ).strip()
+
+
+def tag_remaining_days(tag: ActiveTag | None, booking_date: date) -> int | None:
+    """Days left for a `duration`-mode active tag; None for other modes.
+
+    A UI concern (the header's `(N left)` suffix), kept off `ActiveTag`
+    which is shared across persistence/serialisation. Clamps at 0 so an
+    expired tag never renders a negative count. Shared by the header
+    helpers in `host` and the `[t]` re-render in `confirm`.
+    """
+    if tag is None or tag.mode != "duration" or tag.until_date is None:
+        return None
+    return max(0, (tag.until_date - booking_date).days)

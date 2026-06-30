@@ -20,6 +20,7 @@ from beancount_importer.models import (
     SourceTransaction,
 )
 from beancount_importer.rules.models import CategorizationRule
+from beancount_importer.rules.tags import ActiveTag
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -258,6 +259,26 @@ class TestRender:
         render(con2, _ctx())
         assert "#" not in con2.export_text()
 
+    def test_will_write_previews_unstamped_active_tag_in_window(self):
+        # The pipeline stamps `proposal.tag` only after this screen returns;
+        # the preview must still show the active tag that *will* be written.
+        con = _console()
+        active = ActiveTag(
+            tag="usa-2024", mode="duration", until_date=date(2024, 4, 11)
+        )
+        render(con, _ctx(current_active_tag=active, active_tag="usa-2024"))
+        assert "#usa-2024" in con.export_text()
+
+    def test_will_write_hides_active_tag_outside_window(self):
+        # A duration tag whose window ends before the txn date will not be
+        # stamped — the preview must not claim otherwise.
+        con = _console()
+        active = ActiveTag(
+            tag="usa-2024", mode="duration", until_date=date(2024, 1, 1)
+        )
+        render(con, _ctx(current_active_tag=active, active_tag="usa-2024"))
+        assert "#usa-2024" not in con.export_text()
+
     def test_hotkey_row_shows_step2_choices(self):
         con = _console()
         render(con, _ctx())
@@ -375,6 +396,52 @@ class TestRun:
         assert decision.action == "confirm"
         assert decision.proposal is not None
         assert decision.proposal.tag_state_delta is None
+
+    def test_t_set_until_rerenders_with_pending_tag(self, monkeypatch):
+        # `t` → set until (`3`) → name "usa-2024" → date inside window → enter.
+        # The re-render after the menu must show the pending tag in both the
+        # header and the "Will write" block — the preview reflecting state.
+        con = _console()
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask",
+            _scripted("t", "3", "usa-2024", "2024-04-11", ""),
+        )
+        decision = run(con, _ctx())
+        out = con.export_text()
+        assert decision.action == "confirm"
+        assert "tag: usa-2024" in out  # header
+        assert "#usa-2024" in out  # Will-write block
+
+    def test_t_set_until_past_date_shows_no_tag_in_preview(self, monkeypatch):
+        # A window ending before the txn date won't stamp; the re-render must
+        # not show a tag the pipeline will never write.
+        con = _console()
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask",
+            _scripted("t", "3", "usa-2024", "2024-01-01", ""),
+        )
+        decision = run(con, _ctx())
+        assert decision.action == "confirm"
+        assert "#usa-2024" not in con.export_text()
+
+    def test_t_clear_removes_tag_from_preview(self, monkeypatch):
+        # Start with an active tag, then `[t]` → clear (`4`). The preview's
+        # tag line must disappear on the re-render.
+        active = ActiveTag(tag="usa-2024", mode="always")
+        con = _console()
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("t", "4", ""))
+        decision = run(
+            con, _ctx(current_active_tag=active, active_tag="usa-2024")
+        )
+        out = con.export_text()
+        assert decision.action == "confirm"
+        # Cleared: the post-clear render shows no tag line. (The pre-clear
+        # render did, so we check the final state via the delta + that the
+        # header's "no tag" appears after the menu.)
+        assert decision.proposal is not None
+        assert decision.proposal.tag_state_delta is not None
+        assert decision.proposal.tag_state_delta.op == "clear"
+        assert "no tag" in out
 
     def test_edit_then_skip_discards_edit(self, monkeypatch):
         # Skip after editing should not write — caller honours `action` only.

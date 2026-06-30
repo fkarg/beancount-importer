@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from io import StringIO
 
 from rich.console import Console
@@ -12,7 +13,9 @@ from beancount_importer.categorizer.screen import (
     bottom_rule,
     hotkey,
     styled_account,
+    tag_remaining_days,
 )
+from beancount_importer.rules.tags import ActiveTag
 
 
 def _console() -> Console:
@@ -61,3 +64,25 @@ class TestBottomRule:
         out = con.export_text()
         assert RULE in out
         assert len(RULE) == RULE_WIDTH
+
+
+
+class TestTagRemainingDays:
+    def test_none_for_no_tag(self):
+        assert tag_remaining_days(None, date(2024, 3, 4)) is None
+
+    def test_none_for_non_duration_mode(self):
+        tag = ActiveTag(tag="trip", mode="always")
+        assert tag_remaining_days(tag, date(2024, 3, 4)) is None
+
+    def test_none_for_duration_without_until(self):
+        tag = ActiveTag(tag="trip", mode="duration")
+        assert tag_remaining_days(tag, date(2024, 3, 4)) is None
+
+    def test_counts_inclusive_days_to_until_date(self):
+        tag = ActiveTag(tag="trip", mode="duration", until_date=date(2024, 3, 8))
+        assert tag_remaining_days(tag, date(2024, 3, 4)) == 4
+
+    def test_clamps_expired_tag_to_zero(self):
+        tag = ActiveTag(tag="trip", mode="duration", until_date=date(2024, 3, 1))
+        assert tag_remaining_days(tag, date(2024, 3, 4)) == 0

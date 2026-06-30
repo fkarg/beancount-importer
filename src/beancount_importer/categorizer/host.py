@@ -45,6 +45,7 @@ from beancount_importer.categorizer.pick import (
     PickDecision,
     run as run_pick,
 )
+from beancount_importer.categorizer.screen import tag_remaining_days
 from beancount_importer.matching.account_suggest import rank_accounts
 from beancount_importer.models import CategoryProposal, Posting
 from beancount_importer.pipeline import (
@@ -112,7 +113,7 @@ def make_screen_merge_fn(
 
 
 def _merge_tag_remaining(ctx: MergeContext) -> int | None:
-    return _remaining_days(ctx.active_tag, ctx.txn.booking_date)
+    return tag_remaining_days(ctx.active_tag, ctx.txn.booking_date)
 
 
 # ── Path A0: ambiguous → Screen 4 → Screen 1 / Screen 2 ──────────────────────
@@ -274,22 +275,8 @@ def _ask_pick(console: Console, ctx: CategorizeContext) -> PickDecision:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _remaining_days(tag, booking_date) -> int | None:
-    """Days remaining for a `duration`-mode active tag; None otherwise.
-
-    Computed at the UI layer rather than as a method on `ActiveTag`
-    because the tag model is shared across persistence/serialisation
-    paths and "days until expiry" is a UI concern. The screens render
-    the `(N left)` suffix iff this returns non-None.
-    """
-    if tag is None or tag.mode != "duration" or tag.until_date is None:
-        return None
-    delta = (tag.until_date - booking_date).days
-    return max(0, delta)
-
-
 def _tag_remaining(ctx: CategorizeContext) -> int | None:
-    return _remaining_days(ctx.active_tag, ctx.txn.booking_date)
+    return tag_remaining_days(ctx.active_tag, ctx.txn.booking_date)
 
 
 def _short_circuit_proposal(action: str) -> CategoryProposal | None:

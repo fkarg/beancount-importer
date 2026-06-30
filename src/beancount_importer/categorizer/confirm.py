@@ -28,6 +28,7 @@ from beancount_importer.categorizer.screen import (
     bottom_rule,
     hotkey,
     styled_account,
+    tag_remaining_days,
 )
 from beancount_importer.categorizer.modes.amortize import run as run_amortize
 from beancount_importer.categorizer.tag_menu import run as run_tag_menu
@@ -169,6 +170,23 @@ def _render_raw_block(console: Console, ctx: ConfirmContext) -> None:
     console.print()
 
 
+def _effective_tag(ctx: ConfirmContext) -> str | None:
+    """The tag this txn will actually be written with — what the preview shows.
+
+    Mirrors the pipeline's `_stamp_active_tag`: an already-stamped
+    `proposal.tag` wins; otherwise the active tag applies iff its window
+    includes the txn's booking date. Without this the `tag:` line lagged
+    the real state — the pipeline stamps `proposal.tag` only *after* this
+    screen returns, so an active duration/always tag was invisible here.
+    """
+    if ctx.proposal.tag:
+        return ctx.proposal.tag
+    tag = ctx.current_active_tag
+    if tag is not None and tag.applies_to(ctx.txn.booking_date):
+        return tag.tag
+    return None
+
+
 def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
     """Render the "Will write" block with per-field diff highlighting.
 
@@ -205,8 +223,8 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
         old_value=old_target,
         old_rendered=old_target_styled,
     )
-    if p.tag:
-        console.print(f"    tag:          [magenta]#{p.tag}[/]")
+    if (tag := _effective_tag(ctx)) is not None:
+        console.print(f"    tag:          [magenta]#{tag}[/]")
     if p.save_as_rule:
         # Show *which* field would seed the synthesized rule's pattern,
         # so the user knows what they're locking in. Mirrors the
@@ -371,5 +389,18 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             delta = run_tag_menu(console, ctx.current_active_tag)
             if delta is not None:
                 proposal = proposal.model_copy(update={"tag_state_delta": delta})
+                # Reflect the pending delta in the next render: the header
+                # and "Will write" tag line read off `ctx`, and re-opening
+                # the menu should show the now-active tag. The pipeline still
+                # owns the real stamp; this only keeps the preview honest.
+                new_active = delta.new_state if delta.op == "set" else None
+                ctx = replace(
+                    ctx,
+                    current_active_tag=new_active,
+                    active_tag=new_active.tag if new_active else None,
+                    tag_remaining=tag_remaining_days(
+                        new_active, ctx.txn.booking_date
+                    ),
+                )
         else:  # key == "m" — amortize mode (debits only)
             proposal = run_amortize(console, proposal)
