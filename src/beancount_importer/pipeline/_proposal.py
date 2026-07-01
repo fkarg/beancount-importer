@@ -23,22 +23,29 @@ from beancount_importer.models import (
     Posting,
     SourceTransaction,
 )
-from beancount_importer.pipeline._result import _diff_changes
+from beancount_importer.pipeline._result import _collapse_applicable, _diff_changes
 from beancount_importer.rules.models import CategorizationRule
 
 
 def _proposal_from_outcome(outcome: MatchOutcome) -> CategoryProposal:
     """Build a categorize proposal from a `rewrite_target` matcher outcome.
 
-    The target account comes from the matcher; metadata is folded in verbatim.
-    Payee/narration are left to the existing source transaction defaults so a
-    later rule or user override can still tweak them.
+    The target account comes from the matcher; metadata is folded in at
+    *posting* level — the plugins (`settle_inv`) and the reader's
+    synthesis/`metadata_dates` only ever look at posting metadata, so a
+    txn-level `paypal:` would be invisible to both. Payee/narration are left
+    to the existing source transaction defaults so a later rule or user
+    override can still tweak them.
     """
     assert outcome.target_account is not None
     return CategoryProposal(
         action="categorize",
-        postings=(Posting(account=outcome.target_account),),
-        metadata=dict(outcome.metadata),
+        postings=(
+            Posting(
+                account=outcome.target_account,
+                metadata=dict(outcome.metadata),
+            ),
+        ),
     )
 
 
@@ -92,6 +99,9 @@ def _silent_skip_proposal(
     rule: CategorizationRule | None,
     candidates: tuple[tuple[LedgerEntry, float], ...],
     min_delta: float,
+    *,
+    txn: SourceTransaction,
+    paypal_account: str | None,
 ) -> CategoryProposal | None:
     """Return the seed proposal iff invoking categorize_fn would be a no-op.
 
@@ -101,12 +111,18 @@ def _silent_skip_proposal(
     pipeline silent-skips the row.
 
     Returns None when there's a real choice: either no candidate to diff
-    against (a fresh entry the user must confirm), or at least one
-    candidate where the proposal would actually change a field.
+    against (a fresh entry the user must confirm), at least one candidate
+    where the proposal would actually change a field, or a collapsible
+    PayPal pass-through — the seed there is the transfer's own funding
+    account, and silently accepting it would bury the purchase's expense
+    categorization forever.
     """
     if not candidates:
         # No entry to diff against — even a rule-driven new entry needs
         # user consent (Enter on Screen 1).
+        return None
+
+    if _collapse_applicable(txn, candidates[0][0], paypal_account):
         return None
 
     seed = _seed_proposal(rule, candidates)

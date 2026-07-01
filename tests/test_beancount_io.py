@@ -1126,3 +1126,82 @@ class TestLinksRoundTrip:
         out = f.read_text()
         assert "^xfer-1" in out.splitlines()[0]
         assert "Expenses:Games" in out
+
+
+# ── writer: collapse mode ────────────────────────────────────────────────────
+
+class TestApplyUpdateCollapse:
+    """`collapse=True` renders the transaction purely from the proposal's
+    postings (the pipeline encodes the funding leg explicitly, with
+    posting-level `paypal:` metadata) instead of prepending the implicit
+    bank leg — that implicit leg is what sign-inverted cross-bank rewrites.
+    `amount_inferred` entries are refused outside collapse mode.
+    """
+
+    def _xfer(self, tmp_path: Path) -> Path:
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-05-15 * "Steam" "PayPal" #games ^xfer-spk-paypal-1\n'
+            "  Assets:B:SPK    -33.82 EUR\n"
+            "    sepa_ref: \"REF-1\"\n"
+            "  Assets:B:PayPal\n"
+        )
+        return f
+
+    def _entry(self, f: Path) -> LedgerEntry:
+        # The PayPal-side view of the transfer, as the reader produces it.
+        entries = read_ledger(f, "Assets:B:PayPal")
+        assert entries[0].amount_inferred is True
+        return entries[0]
+
+    def test_collapse_renders_proposal_postings_only(self, tmp_path: Path):
+        f = self._xfer(tmp_path)
+        proposal = CategoryProposal(
+            action="categorize",
+            postings=(
+                Posting(
+                    account="Assets:B:SPK",
+                    amount=Decimal("-33.82"),
+                    currency="EUR",
+                    metadata={"paypal": "2024-05-13"},
+                ),
+                Posting(account="Expenses:Games"),
+            ),
+        )
+        apply_update(
+            self._entry(f), proposal, "Assets:B:PayPal", collapse=True
+        )
+        out = f.read_text()
+        lines = out.splitlines()
+        # Funding leg kept with the PayPal date at posting level; the
+        # PayPal posting is gone; tags/links survive on the header.
+        assert "Assets:B:PayPal" not in out
+        assert any(
+            line.startswith("  Assets:B:SPK") and "-33.82 EUR" in line
+            for line in lines
+        )
+        assert "    paypal: 2024-05-13" in lines
+        assert "#games" in lines[0]
+        assert "^xfer-spk-paypal-1" in lines[0]
+        assert "Expenses:Games" in out
+        assert 'sepa_ref: "REF-1"' in out
+
+    def test_inferred_entry_refused_without_collapse(self, tmp_path: Path):
+        f = self._xfer(tmp_path)
+        original = f.read_text()
+        proposal = CategoryProposal(
+            action="categorize", postings=(Posting(account="Expenses:Games"),)
+        )
+        with pytest.raises(ValueError, match="amount_inferred"):
+            apply_update(self._entry(f), proposal, "Assets:B:PayPal")
+        assert f.read_text() == original
+
+    def test_collapse_requires_proposal_postings(self, tmp_path: Path):
+        f = self._xfer(tmp_path)
+        original = f.read_text()
+        proposal = CategoryProposal(action="categorize")
+        with pytest.raises(ValueError, match="postings"):
+            apply_update(
+                self._entry(f), proposal, "Assets:B:PayPal", collapse=True
+            )
+        assert f.read_text() == original

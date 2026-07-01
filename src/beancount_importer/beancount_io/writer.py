@@ -85,6 +85,7 @@ def apply_update(
     proposal: CategoryProposal,
     bank_account: str,
     *,
+    collapse: bool = False,
     dry_run: bool = False,
     narration_max_length: int | None = None,
 ) -> None:
@@ -99,16 +100,33 @@ def apply_update(
     original amount; any additional postings come from the proposal. Metadata
     merges entry-side metadata with proposal metadata (proposal wins) and
     includes `tag` when set; header `#tags` and `^links` are preserved.
+
+    `collapse=True` renders the postings *purely* from the proposal (which
+    then carries the complete list, funding leg first — see
+    `_propose_collapse`) instead of prepending the implicit bank leg. This is
+    the only mode allowed for `amount_inferred` entries: their amount belongs
+    to the other bank's transaction, and re-rendering around
+    `(bank_account, entry.amount)` would destroy the counter leg.
     """
     payee = proposal.payee or entry.payee
     narration = proposal.narration or entry.narration
-    postings: list[tuple[str, str | None, dict[str, str]]] = [
-        (bank_account, f"{entry.amount} {entry.currency}", {})
-    ]
+    postings: list[tuple[str, str | None, dict[str, str]]] = []
     for p in proposal.postings:
         currency = p.currency or entry.currency
         amount_str = f"{p.amount} {currency}" if p.amount is not None else None
         postings.append((p.account, amount_str, dict(p.metadata)))
+    if collapse:
+        if not postings:
+            raise ValueError(
+                "apply_update: collapse requires explicit proposal postings"
+            )
+    else:
+        if entry.amount_inferred:
+            raise ValueError(
+                "apply_update: refusing standard update of an amount_inferred "
+                "entry — only the collapse path may rewrite transit legs"
+            )
+        postings.insert(0, (bank_account, f"{entry.amount} {entry.currency}", {}))
     metadata = {**entry.metadata, **proposal.metadata}
     # Migrate the legacy `tag:` metadata written by older versions into a real
     # #tag, so touching an old entry repairs it rather than re-emitting bad data.

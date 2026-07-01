@@ -667,7 +667,11 @@ def _resolve_proposal(
         return state.evolve(proposal=_proposal_from_rule(state.rule))
 
     silent = _silent_skip_proposal(
-        state.rule, state.candidates, config.matching.min_delta
+        state.rule,
+        state.candidates,
+        config.matching.min_delta,
+        txn=state.txn,
+        paypal_account=config.paypal_account,
     )
     if silent is not None:
         return state.evolve(proposal=silent)

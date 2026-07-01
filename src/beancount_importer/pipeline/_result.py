@@ -80,12 +80,25 @@ def _build_result(
     proposed_changes: list[ProposedChange] = []
     new_entry_text = ""
     if best is not None:
-        if best.amount_inferred:
+        if not best.amount_inferred:
+            proposed_changes = _diff_changes(best, proposal, matched_rule)
+        elif best.metadata.get("_pending_in_session"):
+            # Same-session placeholder: run.py folds the date hint onto leg
+            # 1's pending entry and clears the changes; the placeholder
+            # itself is never spliced.
             proposed_changes, proposal = _propose_date_metadata(
                 txn, best, proposal, paypal_account=paypal_account
             )
+        elif _collapse_applicable(txn, best, paypal_account):
+            proposed_changes, proposal = _propose_collapse(txn, best, proposal)
         else:
-            proposed_changes = _diff_changes(best, proposal, matched_rule)
+            # Deposit/transit legs, synthesized entries, multi-posting
+            # transfers: the row is settled by the match, nothing to write.
+            # A standard re-render of an inferred entry would rebuild the
+            # transaction around the wrong side's amount and destroy the
+            # counter leg (sign-inversion corruption) — no other update
+            # shape is permitted here.
+            proposed_changes = []
     else:
         new_entry_text = _format_new_entry(
             bank, txn, proposal, narration_max_length=narration_max_length
@@ -188,6 +201,85 @@ def _fold_inflight_date_hint(
     )
     return origin.model_copy(
         update={"proposal": amended, "new_entry_text": new_text}
+    )
+
+
+def _collapse_applicable(
+    txn: SourceTransaction,
+    entry: LedgerEntry,
+    paypal_account: str | None,
+) -> bool:
+    """True when `txn` is the PayPal-side *purchase* of an on-disk cross-bank
+    transfer leg — the only shape `_propose_collapse` rewrites.
+
+    Reversed sign is the purchase signature: the CSV row spends what the
+    transfer's inferred leg received. Same-sign matches are the deposit/
+    transit side and stay silent. Synthesized and in-session entries have no
+    on-disk transaction of their own to collapse; multi-posting transfers
+    carry user-authored structure a rewrite would destroy.
+    """
+    return (
+        paypal_account is not None
+        and entry.amount_inferred
+        and entry.source_account == paypal_account
+        and bool(entry.file_path)
+        and not entry.has_multiple_postings
+        and "synthesized_from" not in entry.metadata
+        and "_pending_in_session" not in entry.metadata
+        and txn.amount == -entry.amount
+    )
+
+
+def _propose_collapse(
+    txn: SourceTransaction,
+    entry: LedgerEntry,
+    proposal: CategoryProposal,
+) -> tuple[list[ProposedChange], CategoryProposal]:
+    """Rewrite a PayPal pass-through into the collapsed via-paypal form.
+
+    The matched entry is the transfer's inferred PayPal-side leg. The
+    rewritten transaction keeps the funding leg verbatim — `target_account`
+    with the negated inferred amount — stamped with posting-level
+    `paypal: <CSV date>` so the user's `settle_inv` plugin splits it at load
+    time and re-imports recognise the row as settled (settled matcher /
+    reader synthesis both read posting metadata only). The returned
+    proposal's postings are the *complete* posting list; persistence renders
+    them via `apply_update(collapse=True)` without the implicit bank leg.
+
+    A proposal that targets the funding account itself means the user (or
+    the silent seed) categorized the row as the transfer — nothing to
+    collapse — unless it already carries `paypal:` metadata, which marks a
+    replayed collapse decision whose funding leg must not be duplicated.
+    """
+    if not proposal.postings:
+        return [], proposal
+    first = proposal.postings[0]
+    pp_date = (txn.value_date or txn.booking_date).isoformat()
+    if first.account == entry.target_account:
+        if "paypal" not in first.metadata:
+            return [], proposal
+        updated = proposal
+        pp_date = first.metadata["paypal"]
+    else:
+        funding = Posting(
+            account=entry.target_account,
+            amount=-entry.amount,
+            currency=entry.currency,
+            metadata={"paypal": pp_date},
+        )
+        updated = proposal.model_copy(
+            update={"postings": (funding, *proposal.postings)}
+        )
+    expense = next(
+        (p.account for p in updated.postings if p.account != entry.target_account),
+        "",
+    )
+    return (
+        [
+            ProposedChange("target_account", entry.source_account, expense),
+            ProposedChange("posting:paypal", "", pp_date),
+        ],
+        updated,
     )
 
 

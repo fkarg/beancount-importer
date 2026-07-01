@@ -765,8 +765,12 @@ class TestPipelineMatchers:
         assert spk.action == "new"
         assert spk.proposal is not None
         assert spk.proposal.target_account == "Assets:B:PayPal"
-        assert spk.proposal.metadata.get("paypal") == "2024-04-13"
+        # Posting-level, not txn-level: the plugins (`settle_inv`) and the
+        # reader's synthesis/metadata_dates only ever look at posting meta.
+        assert spk.proposal.postings[0].metadata.get("paypal") == "2024-04-13"
+        assert spk.proposal.metadata == {}
         assert "Assets:B:PayPal" in spk.new_entry_text
+        assert "    paypal: 2024-04-13" in spk.new_entry_text.splitlines()
 
     def test_settled_matcher_claims_same_bank_entry_from_bucket(
         self, tmp_path: Path
@@ -3449,3 +3453,239 @@ class TestPipelineSameSessionCounterLeg:
         assert "settle: 2024-04-15" in written
         # Leg 2 produced no second entry / no paypal.bean write.
         assert not (tmp_path / "paypal.bean").exists()
+
+
+# ── Via-paypal collapse: purchase row vs existing cross-bank transfer ────────
+
+
+class TestPipelineCollapse:
+    """A PayPal CSV *purchase* row that matches the inferred leg of an
+    on-disk SPK→PayPal transfer must propose collapsing the transfer into
+    the single-transaction via-paypal form: funding leg kept verbatim with
+    posting-level `paypal: <PayPal date>` metadata, PayPal leg replaced by
+    the categorized expense. Everything that is NOT that exact shape
+    (deposits, synthesized entries, multi-posting transfers, transfers
+    re-categorized as transfers) must stay a silent update — never a
+    standard re-render, which is the sign-inversion corruption vector.
+    """
+
+    XFER = (
+        '2024-04-13 * "Google Payment" "PayPal Einkauf"\n'
+        "  Assets:B:SPK  -3.39 EUR\n"
+        "  Assets:B:PayPal\n"
+    )
+
+    def _make_paypal_bank(self) -> BankConfig:
+        return BankConfig(
+            key="paypal",
+            display_name="PayPal",
+            account="Assets:B:PayPal",
+            file_glob="PayPal_*.csv",
+            output_file="transactions/PAYPAL.bean",
+            csv=CsvConfig(
+                delimiter=",",
+                date_format=["%Y-%m-%d"],
+                amount_locale="en",
+                field_date="Date",
+                field_amount="Gross",
+                field_currency="Currency",
+                field_description="Description",
+            ),
+        )
+
+    def _config(self) -> Config:
+        return Config(
+            banks=[self._make_paypal_bank()],
+            transactions_dir="transactions",
+            paypal_account="Assets:B:PayPal",
+            matching=MatchingConfig(
+                min_score=0.35,
+                synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
+            ),
+        )
+
+    def _run(
+        self, tmp_path: Path, csv_row: str, categorize, ledger: str | None = None,
+        decisions: DecisionLog | None = None,
+    ):
+        (tmp_path / "transactions").mkdir(exist_ok=True)
+        (tmp_path / "transactions" / "SPK.bean").write_text(
+            self.XFER if ledger is None else ledger
+        )
+        (tmp_path / "PayPal_2024.csv").write_text(
+            "Date,Description,Currency,Gross\n" f"{csv_row}\n"
+        )
+        session = ImportSession(config=self._config(), options=ImportOptions())
+        return run(
+            session, tmp_path, categorize, NoopReporter(), decisions=decisions
+        )
+
+    def _err_categorize(self):
+        def _fn(ctx: CategorizeContext) -> CategoryProposal:
+            raise AssertionError(
+                f"categorize_fn invoked for {ctx.txn.payee!r} — should not happen"
+            )
+        return _fn
+
+    def test_purchase_row_proposes_collapse(self, tmp_path: Path):
+        results = self._run(
+            tmp_path,
+            "2024-04-11,Google Payment,EUR,-3.39",
+            fixed_categorize("Expenses:Apps"),
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.action == "update"
+        assert r.matched_entry is not None
+        assert r.matched_entry.amount_inferred is True
+        assert r.proposal is not None
+        # Funding leg first, verbatim, carrying the PayPal date; expense after.
+        assert r.proposal.postings == (
+            Posting(
+                account="Assets:B:SPK",
+                amount=Decimal("-3.39"),
+                currency="EUR",
+                metadata={"paypal": "2024-04-11"},
+            ),
+            Posting(account="Expenses:Apps"),
+        )
+        fields = {c.field: (c.old_val, c.new_val) for c in r.proposed_changes}
+        assert fields["target_account"] == ("Assets:B:PayPal", "Expenses:Apps")
+        assert fields["posting:paypal"] == ("", "2024-04-11")
+
+    def test_same_date_purchase_still_collapses_with_metadata(self, tmp_path: Path):
+        # `paypal:` metadata is kept even when dates coincide — it is what
+        # makes the collapsed entry discoverable (settled matcher /
+        # synthesis) on re-import; dropping it would re-import the row as
+        # a duplicate purchase.
+        results = self._run(
+            tmp_path,
+            "2024-04-13,Google Payment,EUR,-3.39",
+            fixed_categorize("Expenses:Apps"),
+        )
+        r = results[0]
+        assert r.action == "update"
+        assert r.proposal is not None
+        assert r.proposal.postings[0].metadata == {"paypal": "2024-04-13"}
+        assert r.proposed_changes
+
+    def test_deposit_row_stays_silent(self, tmp_path: Path):
+        # Same-sign match (+3.39 vs inferred +3.39) is the transit/deposit
+        # side of the transfer — already represented; nothing to collapse,
+        # nothing to ask the user.
+        results = self._run(
+            tmp_path,
+            "2024-04-13,Erstattung 123,EUR,3.39",
+            self._err_categorize(),
+        )
+        r = results[0]
+        assert r.action == "update"
+        assert r.proposed_changes == []
+
+    def test_synthesized_entry_stays_silent(self, tmp_path: Path):
+        # Already-collapsed transaction: the reader synthesizes the virtual
+        # PayPal leg from `paypal:` metadata. A nearby-date CSV row matching
+        # it is settled — no rewrite may target a synthesized entry.
+        ledger = (
+            '2024-04-13 * "Google Payment" ""\n'
+            "  Assets:B:SPK  -3.39 EUR\n"
+            "    paypal: 2024-04-11\n"
+            "  Expenses:Apps  3.39 EUR\n"
+        )
+        results = self._run(
+            tmp_path,
+            "2024-04-12,Google Payment,EUR,-3.39",
+            fixed_categorize("Expenses:Apps"),
+            ledger=ledger,
+        )
+        r = results[0]
+        assert r.action in ("update", "skip")
+        assert r.proposed_changes == []
+
+    def test_multi_posting_transfer_stays_silent(self, tmp_path: Path):
+        ledger = (
+            '2024-04-13 * "Mixed" "topup with fee"\n'
+            "  Assets:B:SPK   -5.00 EUR\n"
+            "  Expenses:Fees   1.61 EUR\n"
+            "  Assets:B:PayPal\n"
+        )
+        results = self._run(
+            tmp_path,
+            "2024-04-13,Mixed,EUR,-3.39",
+            fixed_categorize("Expenses:Apps"),
+            ledger=ledger,
+        )
+        r = results[0]
+        assert r.action == "update"
+        assert r.proposed_changes == []
+
+    def test_transfer_categorization_stays_silent(self, tmp_path: Path):
+        # The user (or a rule) categorized the purchase row as the transfer
+        # itself — there is no expense to collapse onto; leave the xfer be.
+        results = self._run(
+            tmp_path,
+            "2024-04-11,Google Payment,EUR,-3.39",
+            fixed_categorize("Assets:B:SPK"),
+        )
+        r = results[0]
+        assert r.action == "update"
+        assert r.proposed_changes == []
+
+    def test_replayed_collapse_does_not_double_funding_leg(self, tmp_path: Path):
+        # Run 1 records the collapse decision; the ledger is NOT persisted
+        # (e.g. the write failed). Run 2 replays the decision whose proposal
+        # already carries the funding leg — collapsing again must not
+        # prepend a second one.
+        log_path = tmp_path / "decisions.jsonl"
+        decisions = DecisionLog(log_path)
+        self._run(
+            tmp_path,
+            "2024-04-11,Google Payment,EUR,-3.39",
+            fixed_categorize("Expenses:Apps"),
+            decisions=decisions,
+        )
+        decisions.flush()
+
+        results = self._run(
+            tmp_path,
+            "2024-04-11,Google Payment,EUR,-3.39",
+            self._err_categorize(),
+            decisions=DecisionLog(log_path),
+        )
+        r = results[0]
+        assert r.is_replay is True
+        assert r.action == "update"
+        assert r.proposal is not None
+        assert [p.account for p in r.proposal.postings] == [
+            "Assets:B:SPK",
+            "Expenses:Apps",
+        ]
+        assert r.proposal.postings[0].metadata == {"paypal": "2024-04-11"}
+        assert r.proposed_changes
+
+
+class TestProposeCollapseUnit:
+    def test_empty_proposal_postings_is_a_noop(self):
+        # A categorize proposal without postings (possible from custom
+        # CategorizeFn stubs) has no expense to collapse onto — pass through
+        # unchanged so the row degrades to a silent update.
+        from beancount_importer.pipeline._result import _propose_collapse
+        txn = SourceTransaction(
+            booking_date=date(2024, 4, 11),
+            amount=Decimal("-3.39"),
+            bank_key="paypal",
+        )
+        entry = LedgerEntry(
+            date=date(2024, 4, 13),
+            narration="PayPal Einkauf",
+            source_account="Assets:B:PayPal",
+            target_account="Assets:B:SPK",
+            amount=Decimal("3.39"),
+            amount_inferred=True,
+            file_path="SPK.bean",
+            line_start=1,
+        )
+        proposal = CategoryProposal(action="categorize")
+        changes, updated = _propose_collapse(txn, entry, proposal)
+        assert changes == []
+        assert updated is proposal

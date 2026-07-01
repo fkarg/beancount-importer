@@ -351,3 +351,87 @@ class TestPersistUpdateOrdering:
             "  Assets:B:SPK   -3.00 EUR\n"
             "  Expenses:OldC   3.00 EUR\n"
         ) in out
+
+
+class TestCollapseRoundTrip:
+    """End-to-end via-paypal collapse: a PayPal purchase row matching an
+    on-disk SPK→PayPal transfer rewrites the transfer into the collapsed
+    single-transaction form; a second run over the same CSV recognizes the
+    `paypal:` metadata as settlement evidence and touches nothing.
+    """
+
+    XFER = (
+        '2024-05-15 * "Steam" "PayPal" ^xfer-spk-paypal-1\n'
+        "  Assets:B:SPK  -33.82 EUR\n"
+        "  Assets:B:PayPal\n"
+    )
+
+    def _paypal_bank(self) -> BankConfig:
+        return BankConfig(
+            key="paypal",
+            display_name="PayPal",
+            account="Assets:B:PayPal",
+            file_glob="PayPal_*.csv",
+            output_file="transactions/PAYPAL.bean",
+            csv=CsvConfig(
+                delimiter=",",
+                date_format=["%Y-%m-%d"],
+                amount_locale="en",
+                field_date="Date",
+                field_amount="Gross",
+                field_currency="Currency",
+                field_description="Description",
+            ),
+        )
+
+    def _config(self) -> Config:
+        return Config(
+            banks=[self._paypal_bank()],
+            transactions_dir="transactions",
+            paypal_account="Assets:B:PayPal",
+            matching=MatchingConfig(
+                min_score=0.35,
+                synthesize_from_metadata={"paypal": "Assets:B:PayPal"},
+            ),
+        )
+
+    def test_collapse_persists_and_second_run_settles(self, tmp_path: Path):
+        (tmp_path / "transactions").mkdir()
+        spk = tmp_path / "transactions" / "SPK.bean"
+        spk.write_text(self.XFER)
+        (tmp_path / "PayPal_2024.csv").write_text(
+            "Date,Description,Currency,Gross\n"
+            "2024-05-13,Steam,EUR,-33.82\n"
+        )
+        config = self._config()
+        session = ImportSession(config=config, options=ImportOptions())
+        results = run(
+            session, tmp_path, _categorize_to("Expenses:Games"), NoopReporter()
+        )
+        assert [r.action for r in results] == ["update"]
+        failures = _persist_results(results, config, tmp_path, dry_run=False)
+        assert failures == []
+
+        out = spk.read_text()
+        assert "Assets:B:PayPal" not in out
+        assert "Expenses:Games" in out
+        assert "    paypal: 2024-05-13" in out.splitlines()
+        assert "^xfer-spk-paypal-1" in out.splitlines()[0]
+        # The purchase was consumed into SPK.bean — no PayPal-side entry.
+        assert not (tmp_path / "transactions" / "PAYPAL.bean").exists()
+
+        # Second run over the same CSV: the collapsed entry's `paypal:`
+        # metadata marks the row as settled before the scorer runs.
+        def err_categ(ctx: CategorizeContext) -> CategoryProposal:
+            raise AssertionError("second run re-prompted a collapsed row")
+
+        results2 = run(
+            ImportSession(config=self._config(), options=ImportOptions()),
+            tmp_path,
+            err_categ,
+            NoopReporter(),
+        )
+        assert len(results2) == 1
+        assert results2[0].action in ("skip", "update")
+        assert not results2[0].proposed_changes
+        assert spk.read_text() == out
