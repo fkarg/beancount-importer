@@ -254,7 +254,11 @@ def _ask_pick(console: Console, ctx: CategorizeContext) -> PickDecision:
         if entry.target_account:
             counts[entry.target_account] += 1
     suggestions, all_accounts = rank_accounts(
-        ctx.txn, ctx.candidates, ctx.existing_entries, known_accounts=ctx.known_accounts
+        ctx.txn,
+        ctx.candidates,
+        ctx.existing_entries,
+        known_accounts=ctx.known_accounts,
+        boost_prefixes=ctx.own_account_prefixes,
     )
     pick_ctx = PickContext(
         txn=ctx.txn,

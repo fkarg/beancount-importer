@@ -374,10 +374,10 @@ class TestRun:
         assert decision.proposal.payee == "New payee"
 
     def test_t_opens_tag_menu_and_stamps_delta(self, monkeypatch):
-        # `t` → tag menu mode `2` (always) → tag name "italy-trip" → enter.
+        # `t` → new tag (`n`) → name "italy-trip" → mode `2` (always) → enter.
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask",
-            _scripted("t", "2", "italy-trip", ""),
+            _scripted("t", "n", "italy-trip", "2", ""),
         )
         decision = run(_console(), _ctx())
         assert decision.action == "confirm"
@@ -389,9 +389,9 @@ class TestRun:
         assert delta.new_state.tag == "italy-trip"
 
     def test_t_then_cancel_leaves_proposal_untouched(self, monkeypatch):
-        # `t` → cancel (`5`) → enter. tag_state_delta stays None.
+        # `t` → cancel (`.`) → enter. tag_state_delta stays None.
         monkeypatch.setattr(
-            "rich.prompt.Prompt.ask", _scripted("t", "5", "")
+            "rich.prompt.Prompt.ask", _scripted("t", ".", "")
         )
         decision = run(_console(), _ctx())
         assert decision.action == "confirm"
@@ -399,13 +399,13 @@ class TestRun:
         assert decision.proposal.tag_state_delta is None
 
     def test_t_set_until_rerenders_with_pending_tag(self, monkeypatch):
-        # `t` → set until (`3`) → name "usa-2024" → date inside window → enter.
-        # The re-render after the menu must show the pending tag in both the
-        # header and the "Will write" block — the preview reflecting state.
+        # `t` → new tag (`n`) → name "usa-2024" → until (`3`) → date inside
+        # window → enter. The re-render after the menu must show the pending
+        # tag in both the header and the "Will write" block.
         con = _console()
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask",
-            _scripted("t", "3", "usa-2024", "2024-04-11", ""),
+            _scripted("t", "n", "usa-2024", "3", "2024-04-11", ""),
         )
         decision = run(con, _ctx())
         out = con.export_text()
@@ -419,18 +419,18 @@ class TestRun:
         con = _console()
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask",
-            _scripted("t", "3", "usa-2024", "2024-01-01", ""),
+            _scripted("t", "n", "usa-2024", "3", "2024-01-01", ""),
         )
         decision = run(con, _ctx())
         assert decision.action == "confirm"
         assert "#usa-2024" not in con.export_text()
 
     def test_t_clear_removes_tag_from_preview(self, monkeypatch):
-        # Start with an active tag, then `[t]` → clear (`4`). The preview's
+        # Start with an active tag, then `[t]` → clear (`c`). The preview's
         # tag line must disappear on the re-render.
         active = ActiveTag(tag="usa-2024", mode="always")
         con = _console()
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("t", "4", ""))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("t", "c", ""))
         decision = run(
             con, _ctx(current_active_tag=active, active_tag="usa-2024")
         )

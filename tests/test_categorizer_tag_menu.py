@@ -40,10 +40,10 @@ _KNOWN = (
 
 
 class TestRender:
-    def test_no_active_tag_message(self):
+    def test_no_active_tag_shows_pick_prompt(self):
         con = _console()
         render(con, current=None)
-        assert "no active tag" in con.export_text()
+        assert "pick a tag" in con.export_text()
 
     def test_active_tag_message_includes_mode(self):
         con = _console()
@@ -52,19 +52,14 @@ class TestRender:
         assert "active: trip" in out
         assert "mode=always" in out
 
-    def test_lists_all_five_options(self):
+    def test_lists_step1_controls(self):
         con = _console()
         render(con, current=None)
         out = con.export_text()
-        # Numbered hotkeys for each mode.
-        for token in (
-            "[1] set once",
-            "[2] set always",
-            "[3] set until",
-            "[4] clear",
-            "[5] cancel",
-        ):
+        # Step 1 is name-selection: new / clear / cancel, no mode numbers.
+        for token in ("[n] new tag", "[c] clear", "[.] cancel"):
             assert token in out
+        assert "set once" not in out
 
 
 # ── Run-loop branches ─────────────────────────────────────────────────────────
@@ -72,20 +67,20 @@ class TestRender:
 
 class TestRunBranches:
     def test_cancel_returns_none(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("5"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("."))
         assert run(_console(), current=None) is None
 
     def test_clear_returns_clear_delta(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("4"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("c"))
         delta = run(_console(), current=ActiveTag(tag="x", mode="always"))
         assert delta is not None
         assert delta.op == "clear"
         assert delta.new_state is None
 
     def test_once_sets_active_with_mode_once(self, monkeypatch):
-        # Mode hotkey, then tag name.
+        # New tag: [n] → name → mode.
         monkeypatch.setattr(
-            "rich.prompt.Prompt.ask", _scripted("1", "trip")
+            "rich.prompt.Prompt.ask", _scripted("n", "trip", "1")
         )
         delta = run(_console(), current=None)
         assert delta is not None
@@ -96,7 +91,7 @@ class TestRunBranches:
 
     def test_always_sets_active_with_mode_always(self, monkeypatch):
         monkeypatch.setattr(
-            "rich.prompt.Prompt.ask", _scripted("2", "trip")
+            "rich.prompt.Prompt.ask", _scripted("n", "trip", "2")
         )
         delta = run(_console(), current=None)
         assert delta is not None
@@ -106,7 +101,7 @@ class TestRunBranches:
     def test_until_sets_duration_with_until_date(self, monkeypatch):
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask",
-            _scripted("3", "trip", "2024-09-15"),
+            _scripted("n", "trip", "3", "2024-09-15"),
         )
         delta = run(_console(), current=None)
         assert delta is not None
@@ -115,16 +110,16 @@ class TestRunBranches:
         assert delta.new_state.until_date == date(2024, 9, 15)
 
     def test_empty_tag_name_cancels(self, monkeypatch):
-        # Picked "always" then submitted an empty tag name → no change.
+        # [n] new tag, then an empty name → no change (mode never asked).
         monkeypatch.setattr(
-            "rich.prompt.Prompt.ask", _scripted("2", "")
+            "rich.prompt.Prompt.ask", _scripted("n", "")
         )
         assert run(_console(), current=None) is None
 
     def test_invalid_until_date_cancels_with_warning(self, monkeypatch):
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask",
-            _scripted("3", "trip", "not-a-date"),
+            _scripted("n", "trip", "3", "not-a-date"),
         )
         console = _console()
         assert run(console, current=None) is None
@@ -133,7 +128,7 @@ class TestRunBranches:
     def test_empty_until_date_cancels(self, monkeypatch):
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask",
-            _scripted("3", "trip", ""),
+            _scripted("n", "trip", "3", ""),
         )
         assert run(_console(), current=None) is None
 
@@ -146,14 +141,14 @@ class TestPicker:
         con = _console()
         render(con, None, _KNOWN)
         out = con.export_text()
-        assert "known:" in out
         assert "[a] usa-2024" in out
         assert "[b] italy" in out
 
     def test_render_omits_picker_when_empty(self):
         con = _console()
         render(con, None)
-        assert "known:" not in con.export_text()
+        # No known-tag chips when the picker is empty.
+        assert "[a]" not in con.export_text()
 
     def test_pick_known_then_always(self, monkeypatch):
         monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("a", "2"))

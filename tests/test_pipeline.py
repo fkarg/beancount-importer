@@ -78,11 +78,13 @@ def make_session(
     tag_state: TagState = TagState(),
     options: ImportOptions = ImportOptions(),
     skip_patterns: tuple[SkipUpdatePattern, ...] = (),
+    owner_names: tuple[str, ...] = (),
 ) -> ImportSession:
     cfg = Config(
         banks=[make_spk_bank(year_template_output=False)],
         skip_update_patterns=list(skip_patterns),
         matching=MatchingConfig(min_score=0.35),
+        owner_names=list(owner_names),
     )
     return ImportSession(
         config=cfg,
@@ -163,6 +165,45 @@ class TestPipelineAccountChart:
         session = make_session(base_dir)
         run(session, base_dir, categ, NoopReporter())
         assert "Liabilities:Familie:Anna" in captured["chart"]
+
+
+# ── Self-transfer detection ──────────────────────────────────────────────────
+
+
+class TestPipelineSelfTransfer:
+    """A payee matching a configured owner name marks the row a self-transfer,
+    so the categorize context carries the own-account prefixes for the picker
+    to surface first."""
+
+    def _csv_with_payee(self, base_dir: Path, payee: str) -> None:
+        (base_dir / "SPK_jan.csv").write_text(textwrap.dedent(f"""\
+            Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz
+            15.01.24;{payee};;-387,68;EUR;
+        """))
+
+    def _capture(self, base_dir: Path, *, owner_names: tuple[str, ...]):
+        captured: dict[str, tuple[str, ...]] = {}
+
+        def categ(ctx: CategorizeContext) -> CategoryProposal:
+            captured["own"] = ctx.own_account_prefixes
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Unknown"),),
+            )
+
+        session = make_session(base_dir, owner_names=owner_names)
+        run(session, base_dir, categ, NoopReporter())
+        return captured["own"]
+
+    def test_owner_payee_sets_own_account_prefixes(self, base_dir: Path):
+        self._csv_with_payee(base_dir, "Felix Karg")
+        own = self._capture(base_dir, owner_names=("Felix Karg",))
+        assert own == ("Assets:B:", "Liabilities:CreditCard:")
+
+    def test_non_owner_payee_leaves_prefixes_empty(self, base_dir: Path):
+        self._csv_with_payee(base_dir, "Netflix")
+        own = self._capture(base_dir, owner_names=("Felix Karg",))
+        assert own == ()
 
 
 # ── Skip / quit ──────────────────────────────────────────────────────────────

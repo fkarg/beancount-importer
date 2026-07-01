@@ -3,15 +3,16 @@
 Lets the user set, change, or clear the run's active tag mid-flight.
 The result lands on `CategoryProposal.tag_state_delta`; the pipeline
 applies it before stamping the proposal's `tag` field, so picking
-"set always" on this menu tags the current txn AND every subsequent
+"always" on this menu tags the current txn AND every subsequent
 in-scope one.
 
-Two ways to name the tag:
-- Pick a **known tag** by letter (recent + ledger tags, see
-  `CategorizeContext.known_tags`). The name is filled in; you still choose
-  the mode. For a `duration` tag, the remembered window pre-fills the date
-  prompt — beancount can't store it, so we carry it ourselves.
-- Or choose a mode first (`1`/`2`/`3`) and type a fresh name.
+Two-step flow, one axis per screen:
+1. **Pick a tag** — a known tag by letter (recent + ledger tags, see
+   `CategorizeContext.known_tags`), or `[n]` to type a fresh name, or
+   `[c]` clear / `[.]` cancel.
+2. **Pick a mode** — `once` / `always` / `until` for the chosen name. A
+   `duration` (`until`) tag then prompts for a date; a remembered window
+   pre-fills it (beancount can't store it, so we carry it ourselves).
 
 Design doc rules: tag-menu hotkeys live behind the `[t]` boundary, so
 their letters don't have to obey the top-level global reservations.
@@ -24,18 +25,26 @@ from datetime import date as _date, datetime as _datetime
 from rich.console import Console
 from rich.prompt import Prompt
 
-from beancount_importer.categorizer.screen import bottom_rule, hotkey
+from beancount_importer.categorizer.screen import ask_hotkey, bottom_rule, hotkey
 from beancount_importer.rules.tags import ActiveTag, RememberedTag, TagStateDelta
 
 
-# Mode hotkeys for the menu. Numbered for muscle-memory consistency
-# with other positional lists (Screen 2/4).
-_MODE_HOTKEYS: tuple[str, ...] = ("1", "2", "3", "4", "5")
+# Mode hotkeys for step 2. Numbered for muscle-memory consistency with the
+# other positional lists (Screen 2/4); here they unambiguously mean "mode".
+_MODE_HOTKEYS: tuple[str, ...] = ("1", "2", "3")
 
-# Letters key the known-tag picker — the full alphabet, so up to 26 tags are
-# directly pickable. They never collide with the numeric mode hotkeys.
-_LETTERS = "abcdefghijklmnopqrstuvwxyz"
-_MAX_PICKER = len(_LETTERS)
+# Step-1 control keys.
+_NEW_KEY = "n"
+_CLEAR_KEY = "c"
+_CANCEL_KEY = "."
+
+# Letters key the known-tag picker. The control keys are excluded so a known
+# tag can never shadow `[n]`/`[c]` on the menu — with `c`/`n` reserved, the
+# 3rd/14th tag simply skips to the next free letter.
+_PICKER_LETTERS = "".join(
+    c for c in "abcdefghijklmnopqrstuvwxyz" if c not in (_NEW_KEY, _CLEAR_KEY)
+)
+_MAX_PICKER = len(_PICKER_LETTERS)
 
 
 def render(
@@ -43,26 +52,23 @@ def render(
     current: ActiveTag | None,
     picker: tuple[RememberedTag, ...] = (),
 ) -> None:
-    """Render the tag-menu options. Pure I/O."""
+    """Render step 1 (pick a tag). Pure I/O."""
     console.print()
-    if current is None:
-        console.print("  [bold]Tag menu[/]  [dim](no active tag)[/]")
-    else:
-        console.print(
-            f"  [bold]Tag menu[/]  active: [magenta]{current.tag}[/] "
-            f"[dim](mode={current.mode})[/]"
-        )
+    line = "  [bold]Tag menu[/] — [dim]pick a tag[/]"
+    if current is not None:
+        line += f"   active: [magenta]{current.tag}[/] [dim](mode={current.mode})[/]"
+    console.print(line)
     if picker:
         chips = "   ".join(
             f"{hotkey(letter)} {rt.tag}"
-            for letter, rt in zip(_LETTERS, picker, strict=False)
+            for letter, rt in zip(_PICKER_LETTERS, picker, strict=False)
         )
-        console.print(f"    [dim]known:[/] {chips}")
-    console.print(f"    {hotkey('1')} set once     (tag this txn only)")
-    console.print(f"    {hotkey('2')} set always   (tag every subsequent txn)")
-    console.print(f"    {hotkey('3')} set until    (tag through a date)")
-    console.print(f"    {hotkey('4')} clear        (no tag from now on)")
-    console.print(f"    {hotkey('5')} cancel       (no change)")
+        console.print(f"    {chips}")
+    console.print(
+        f"    {hotkey(_NEW_KEY)} new tag    "
+        f"{hotkey(_CLEAR_KEY)} clear    "
+        f"{hotkey(_CANCEL_KEY)} cancel"
+    )
     bottom_rule(console)
 
 
@@ -76,34 +82,50 @@ def run(
     `None` is distinct from `TagStateDelta(op="noop")`: returning None
     signals "the user backed out, do not record any change".
 
-    No Enter default — the menu has no "obvious" choice (the user came here
-    to *do* something), and silently cancelling on Enter would mirror the
-    pager bug we fixed.
+    Single keypress on a real terminal (Ctrl-L redraws); piped input / tests
+    fall back to `Prompt.ask` inside `ask_hotkey`. Enter is not a choice — the
+    menu has no obvious default, so a stray Enter is swallowed.
     """
     picker = tuple(known)[:_MAX_PICKER]
     render(console, current, picker)
-    letters = _LETTERS[: len(picker)]
-    key = Prompt.ask(
-        ">",
-        choices=[*letters, *_MODE_HOTKEYS],
-        show_choices=False,
-        show_default=False,
-    ).strip()
-    if key == "5":
+    letters = _PICKER_LETTERS[: len(picker)]
+    key = ask_hotkey(
+        (*letters, _NEW_KEY, _CLEAR_KEY, _CANCEL_KEY),
+        console=console,
+        redraw=lambda: render(console, current, picker),
+    )
+    if key == _CANCEL_KEY:
         return None
-    if key == "4":
+    if key == _CLEAR_KEY:
         return TagStateDelta(op="clear")
-    if key in letters:
-        # Known-tag pick: name is set; the user still chooses the mode, and a
-        # remembered window pre-fills the `until` prompt.
-        chosen = picker[letters.index(key)]
-        mode_key = _prompt_mode(chosen.tag)
-        return _build(console, chosen.tag, mode_key, chosen.until_date)
-    # Modes 1/2/3 with a fresh, typed name.
-    name = _prompt_tag_name()
-    if not name:
-        return None
-    return _build(console, name, key, default_until=None)
+    if key == _NEW_KEY:
+        name = _prompt_tag_name()
+        if not name:
+            return None
+        return _build(console, name, _prompt_mode(console, name), default_until=None)
+    # Known-tag pick: name is set; carry any remembered window into the date step.
+    chosen = picker[letters.index(key)]
+    return _build(console, chosen.tag, _prompt_mode(console, chosen.tag), chosen.until_date)
+
+
+def _render_mode(console: Console, name: str) -> None:
+    """Render step 2 (pick a mode) for the chosen tag name. Pure I/O."""
+    console.print()
+    console.print(f"  [bold]Apply[/]  [magenta]{name}[/]")
+    console.print(
+        f"    {hotkey('1')} once   {hotkey('2')} always   {hotkey('3')} until"
+    )
+    bottom_rule(console)
+
+
+def _prompt_mode(console: Console, name: str) -> str:
+    """Step 2: single-key mode pick for an already-chosen tag name."""
+    _render_mode(console, name)
+    return ask_hotkey(
+        _MODE_HOTKEYS,
+        console=console,
+        redraw=lambda: _render_mode(console, name),
+    )
 
 
 def _build(
@@ -126,16 +148,6 @@ def _build(
     )
 
 
-def _prompt_mode(name: str) -> str:
-    """Mode pick for an already-chosen tag name."""
-    return Prompt.ask(
-        f"mode for [magenta]{name}[/] [dim](1 once / 2 always / 3 until)[/]",
-        choices=["1", "2", "3"],
-        show_choices=False,
-        show_default=False,
-    ).strip()
-
-
 def _prompt_tag_name() -> str:
     """Free-text tag name. Empty input cancels."""
     return Prompt.ask("tag name [dim](empty cancels)[/]", default="").strip()
@@ -148,7 +160,7 @@ def _prompt_until_date(console: Console, default: _date | None) -> _date | None:
     returns None so the user can back out without committing a bad date.
     """
     raw = Prompt.ask(
-        "until date [dim](YYYY-MM-DD; empty cancels)[/]",
+        "Until date [dim](YYYY-MM-DD, empty cancels)[/]",
         default=default.isoformat() if default else "",
     ).strip()
     if not raw:

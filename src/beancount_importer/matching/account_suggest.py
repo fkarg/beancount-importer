@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable
 
+from beancount_importer.matching.normalize import normalize_text
 from beancount_importer.models import LedgerEntry, SourceTransaction
 
 
@@ -52,6 +53,23 @@ def account_glyph(account: str) -> tuple[str, str]:
     return _DEFAULT_GLYPH
 
 
+def is_self_transfer(payee: str | None, owner_names: Iterable[str]) -> bool:
+    """True when `payee` contains one of the account holder's own names.
+
+    A bank-to-bank transfer names the holder (e.g. N26's "Partner Name") on
+    the counter-leg, which is otherwise indistinguishable from a merchant
+    payee. Matching is on normalized text (accent/case-folded) and is a
+    substring test, so "Felix Karg" fires on "FELIX KARG" and longer forms.
+    Empty owner names are ignored so a stray "" can't match everything.
+    """
+    if not payee:
+        return False
+    hay = normalize_text(payee)
+    return any(
+        (name_n := normalize_text(name)) and name_n in hay for name in owner_names
+    )
+
+
 def rank_accounts(
     txn: SourceTransaction,
     candidates: Iterable[tuple[LedgerEntry, float]],
@@ -60,6 +78,7 @@ def rank_accounts(
     top_n: int = 10,
     suggested_target: str | None = None,
     known_accounts: Iterable[str] = (),
+    boost_prefixes: tuple[str, ...] = (),
 ) -> tuple[list[str], list[str]]:
     """Return `(top_n_suggestions, all_known_accounts)`.
 
@@ -70,6 +89,11 @@ def rank_accounts(
     `accounts.bean`). It widens `all_known_accounts` — so the `[l]` picker
     lists opened-but-unused accounts — without entering the ranked
     suggestions, which stay driven purely by ledger usage.
+
+    `boost_prefixes` accounts sort ahead of everything else (below any pinned
+    `suggested_target`). The self-transfer path passes the user's own-account
+    prefixes here so a detected transfer surfaces own accounts, not the usual
+    frequency/sign-ranked Expenses defaults.
     """
     is_debit = txn.amount < 0
     candidate_accounts = {entry.target_account for entry, _ in candidates if entry.target_account}
@@ -95,10 +119,12 @@ def rank_accounts(
                 return 0
         return 1
 
-    def _score(account: str) -> tuple[int, int, int]:
-        # Higher scores rank first. Tuple sorts lexicographically.
+    def _score(account: str) -> tuple[int, int, int, int]:
+        # Higher scores rank first. Tuple sorts lexicographically, so the
+        # own-account boost dominates, then candidate, sign, and frequency.
+        boost = 1 if account.startswith(boost_prefixes) else 0
         candidate_bonus = 5 if account in candidate_accounts else 0
-        return (candidate_bonus, _sign_score(account), counter[account])
+        return (boost, candidate_bonus, _sign_score(account), counter[account])
 
     ranked = sorted(used_accounts, key=lambda a: _score(a), reverse=True)
     top: list[str] = []

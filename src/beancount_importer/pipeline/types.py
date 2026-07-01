@@ -80,6 +80,10 @@ class CategorizeContext(BaseModel):
     # this includes opened-but-unused accounts, so the `[l]`/`[o]` pickers can
     # list the full chart. Usage counts still derive from `existing_entries`.
     known_accounts: tuple[str, ...] = ()
+    # Non-empty when the pipeline detected a self-transfer (the payee matches a
+    # configured owner name): the account-class prefixes to surface first in
+    # the picker (the user's own accounts). Empty for ordinary rows.
+    own_account_prefixes: tuple[str, ...] = ()
     # Source-side account (e.g. `Assets:B:SPK`) and run progress; needed by
     # the screen-driven categorizer to render the headline + state header.
     source_account: str = ""

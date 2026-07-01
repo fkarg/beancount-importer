@@ -697,7 +697,10 @@ def _resolve_proposal(
     if silent is not None:
         return state.evolve(proposal=silent)
 
-    from beancount_importer.matching.account_suggest import rank_accounts
+    from beancount_importer.matching.account_suggest import (
+        is_self_transfer,
+        rank_accounts,
+    )
 
     suggested = state.rule.target_account if state.rule is not None else None
     hints, _ = rank_accounts(
@@ -730,6 +733,11 @@ def _resolve_proposal(
         known_tags=state.working_known,
         existing_entries=tuple(existing_all),
         known_accounts=account_chart,
+        own_account_prefixes=(
+            tuple(config.matching.internal_transfer_account_prefixes)
+            if is_self_transfer(state.txn.payee, config.owner_names)
+            else ()
+        ),
         source_account=bank.account,
         progress=state.progress,
         near_misses=near_misses,

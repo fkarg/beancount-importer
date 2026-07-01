@@ -192,6 +192,12 @@ class Config(BaseModel):
     # entries. Matches the reference's silent-truncation behaviour (no
     # ellipsis suffix); raise or lower per-project taste.
     narration_max_length: int = 70
+    # Names of the account holder as they appear in a bank's payee / "Partner
+    # Name" column. When a transaction's payee contains one of these, the row
+    # is treated as a transfer between the user's own accounts and the picker
+    # surfaces own accounts (per `matching.internal_transfer_account_prefixes`)
+    # ahead of the usual Expenses/Income suggestions. Empty disables the bias.
+    owner_names: list[str] = []
     # Account name of the user's PayPal intermediary, if any. When a
     # cross-bank transfer's target equals this account the date-difference
     # metadata key becomes `paypal:` rather than `actual:` to match the

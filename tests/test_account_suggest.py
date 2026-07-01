@@ -7,7 +7,11 @@ from decimal import Decimal
 
 from hypothesis import given, strategies as st
 
-from beancount_importer.matching.account_suggest import account_glyph, rank_accounts
+from beancount_importer.matching.account_suggest import (
+    account_glyph,
+    is_self_transfer,
+    rank_accounts,
+)
 from beancount_importer.models import LedgerEntry, SourceTransaction
 
 
@@ -31,7 +35,42 @@ def _entry(source: str, target: str, amount: Decimal = Decimal("-10.00")) -> Led
     )
 
 
+class TestIsSelfTransfer:
+    def test_matches_case_and_accent_insensitively(self):
+        assert is_self_transfer("FELIX KARG", ["Félix Karg"])
+
+    def test_matches_as_substring_of_longer_payee(self):
+        assert is_self_transfer("Felix Karg (savings)", ["Felix Karg"])
+
+    def test_non_matching_payee_is_false(self):
+        assert not is_self_transfer("Netflix", ["Felix Karg"])
+
+    def test_empty_payee_is_false(self):
+        assert not is_self_transfer(None, ["Felix Karg"])
+        assert not is_self_transfer("", ["Felix Karg"])
+
+    def test_empty_owner_names_is_false(self):
+        assert not is_self_transfer("Felix Karg", [])
+
+    def test_blank_owner_name_never_matches(self):
+        # A stray "" in owner_names must not turn every payee into a transfer.
+        assert not is_self_transfer("Netflix", ["  "])
+
+
 class TestRankAccounts:
+    def test_boost_prefixes_sort_own_accounts_first(self):
+        existing = [
+            _entry("Assets:B:SPK", "Expenses:Food"),
+            _entry("Assets:B:SPK", "Expenses:Food"),  # frequency-heavy expense
+            _entry("Assets:B:N26", "Liabilities:CreditCard:NO"),
+        ]
+        top, _ = rank_accounts(
+            _txn(), [], existing, boost_prefixes=("Assets:B:", "Liabilities:CreditCard:")
+        )
+        # Own accounts precede the far more frequent Expenses:Food.
+        assert top[0].startswith(("Assets:B:", "Liabilities:CreditCard:"))
+        assert top.index("Liabilities:CreditCard:NO") < top.index("Expenses:Food")
+
     def test_candidate_target_outranks_others(self):
         existing = [
             _entry("Assets:B:SPK", "Expenses:Food"),
