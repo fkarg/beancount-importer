@@ -382,8 +382,8 @@ def _format_new_entry(
         postings.append((p.account, amount_str, dict(p.metadata)))
 
     metadata = dict(proposal.metadata)
-    if proposal.tag:
-        metadata["tag"] = proposal.tag
+    # `#hashtag` on the header, not `tag:` metadata — see format_transaction.
+    tags = (proposal.tag,) if proposal.tag else ()
 
     return format_transaction(
         date_str=txn.booking_date.isoformat(),
@@ -392,5 +392,6 @@ def _format_new_entry(
         narration=narration,
         postings=postings,
         metadata=metadata,
+        tags=tags,
         narration_max_length=narration_max_length,
     )

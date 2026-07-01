@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -104,8 +105,16 @@ def apply_update(
         amount_str = f"{p.amount} {currency}" if p.amount is not None else None
         postings.append((p.account, amount_str, dict(p.metadata)))
     metadata = {**entry.metadata, **proposal.metadata}
-    if proposal.tag:
-        metadata["tag"] = proposal.tag
+    # Migrate the legacy `tag:` metadata written by older versions into a real
+    # #tag, so touching an old entry repairs it rather than re-emitting bad data.
+    legacy_tag = metadata.pop("tag", None)
+    tags = sorted(
+        {
+            t
+            for t in (*entry.tags, legacy_tag, proposal.tag)
+            if t and t.strip()
+        }
+    )
 
     text = format_transaction(
         date_str=entry.date.isoformat(),
@@ -114,6 +123,7 @@ def apply_update(
         narration=narration,
         postings=postings,
         metadata=metadata,
+        tags=tags,
         narration_max_length=narration_max_length,
     )
     if not entry.file_path:
@@ -154,6 +164,7 @@ def format_transaction(
     narration: str,
     postings: list[tuple[str, str | None]] | list[tuple[str, str | None, dict[str, str]]],
     metadata: dict[str, str] | None = None,
+    tags: Iterable[str] = (),
     narration_max_length: int | None = None,
 ) -> str:
     """Format a beancount transaction as a string.
@@ -162,14 +173,22 @@ def format_transaction(
     or a 3-tuple `(account, amount, metadata)` where `metadata` is a per-
     posting key/value dict rendered indented under the posting line. This
     is the mechanism by which `actual:`/`settle:`/`paypal:` get attached
-    to the correct leg per plugin convention. `narration_max_length`, when
-    set, truncates the narration to that many characters (no ellipsis) to
-    keep ledger lines readable.
+    to the correct leg per plugin convention.
+
+    `tags` are beancount `#hashtags` appended to the transaction header line
+    (not `tag:` metadata — those are semantically different in beancount and
+    invisible to `bean-query ... IN tags`). A stray leading `#` is tolerated.
+    `narration_max_length`, when set, truncates the narration to that many
+    characters (no ellipsis) to keep ledger lines readable.
     """
     payee_part = f'"{payee}" ' if payee else ""
     if narration_max_length is not None and len(narration) > narration_max_length:
         narration = narration[:narration_max_length]
     header = f'{date_str} {flag} {payee_part}"{narration}"'
+    tag_suffix = "".join(
+        f" #{t.lstrip('#')}" for t in tags if t and t.strip()
+    )
+    header += tag_suffix
     lines = [header]
     if metadata:
         for k, v in metadata.items():

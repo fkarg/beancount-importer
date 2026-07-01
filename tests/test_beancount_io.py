@@ -674,6 +674,34 @@ class TestFormatTransaction:
         )
         assert '"short"' in text
 
+    def test_tags_rendered_as_hashtags_on_header(self):
+        # beancount tags are #hashtags on the transaction header line, never
+        # `tag:` metadata.
+        text = format_transaction(
+            date_str="2024-01-15",
+            flag="*",
+            payee="P",
+            narration="N",
+            postings=[("Assets:B:SPK", "-1 EUR"), ("Expenses:X", "1 EUR")],
+            tags=("usa-2024", "trip"),
+        )
+        assert text.splitlines()[0] == '2024-01-15 * "P" "N" #usa-2024 #trip'
+        assert "tag:" not in text
+
+    def test_tags_normalize_stray_leading_hash(self):
+        # Internally tags are bare, but a user who typed "#trip" must not yield
+        # a double-hash "##trip".
+        text = format_transaction(
+            date_str="2024-01-15",
+            flag="*",
+            payee=None,
+            narration="N",
+            postings=[("Assets:B:SPK", "-1 EUR"), ("Expenses:X", "1 EUR")],
+            tags=("#trip",),
+        )
+        assert " #trip" in text.splitlines()[0]
+        assert "##trip" not in text
+
     def test_internal_dunder_metadata_is_dropped(self):
         # Reserved `__x__` keys are not valid beancount source syntax; the
         # writer must never emit them, at either the txn or posting level.
@@ -734,6 +762,72 @@ class TestApplyUpdateRobustness:
         assert "__tolerances__" not in out
         assert 'sepa_ref: "NFX"' in out
         assert "Expenses:New" in out
+
+    def test_apply_update_writes_tag_as_hashtag_merging_existing(
+        self, tmp_path: Path
+    ):
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-01-15 * "Netflix" "Old" #existing\n'
+            "  Assets:B:SPK   -15.99 EUR\n"
+            "  Expenses:Old    15.99 EUR\n"
+        )
+        entry = LedgerEntry(
+            date=date(2024, 1, 15),
+            flag="*",
+            payee="Netflix",
+            narration="Old",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Old",
+            amount=Decimal("-15.99"),
+            currency="EUR",
+            tags=("existing",),
+            line_start=1,
+            file_path=str(f),
+        )
+        proposal = CategoryProposal(
+            action="categorize",
+            postings=(Posting(account="Expenses:New"),),
+            tag="fresh",
+        )
+        apply_update(entry, proposal, "Assets:B:SPK")
+        header = f.read_text().splitlines()[0]
+        # Existing header tag preserved, new proposal tag added — both as #tags.
+        assert "#existing" in header
+        assert "#fresh" in header
+        assert "tag:" not in f.read_text()
+
+    def test_apply_update_migrates_legacy_tag_metadata(self, tmp_path: Path):
+        # Entries written by the old (buggy) code carry `tag: "..."` metadata.
+        # Rewriting one should promote it to a real #tag, not re-emit metadata.
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-01-15 * "Netflix" "Old"\n'
+            '  tag: "oldstyle"\n'
+            "  Assets:B:SPK   -15.99 EUR\n"
+            "  Expenses:Old    15.99 EUR\n"
+        )
+        entry = LedgerEntry(
+            date=date(2024, 1, 15),
+            flag="*",
+            payee="Netflix",
+            narration="Old",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Old",
+            amount=Decimal("-15.99"),
+            currency="EUR",
+            metadata={"tag": "oldstyle"},
+            line_start=1,
+            file_path=str(f),
+        )
+        proposal = CategoryProposal(
+            action="categorize",
+            postings=(Posting(account="Expenses:New"),),
+        )
+        apply_update(entry, proposal, "Assets:B:SPK")
+        out = f.read_text()
+        assert "#oldstyle" in out.splitlines()[0]
+        assert 'tag: "oldstyle"' not in out
 
 
 # ── writer: append_entry ─────────────────────────────────────────────────────

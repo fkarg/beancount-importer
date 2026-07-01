@@ -124,6 +124,10 @@ class TestSetAlwaysOnFirstTxn:
         for r in results:
             assert r.proposal is not None
             assert r.proposal.tag == "trip"
+        # …and it's written as a beancount #hashtag on the header, not `tag:`
+        # metadata.
+        assert "#trip" in results[0].new_entry_text.splitlines()[0]
+        assert "tag:" not in results[0].new_entry_text
 
     def test_result_tag_state_delta_records_user_intent(self, tmp_path: Path):
         # The user's set-always delta surfaces on the first result so
