@@ -32,9 +32,9 @@ from beancount_importer.rules.tags import ActiveTag, RememberedTag, TagStateDelt
 # with other positional lists (Screen 2/4).
 _MODE_HOTKEYS: tuple[str, ...] = ("1", "2", "3", "4", "5")
 
-# Letters key the known-tag picker. Capped so the row stays readable and the
-# letters never collide with the numeric mode hotkeys.
-_LETTERS = "abcdefghij"
+# Letters key the known-tag picker — the full alphabet, so up to 26 tags are
+# directly pickable. They never collide with the numeric mode hotkeys.
+_LETTERS = "abcdefghijklmnopqrstuvwxyz"
 _MAX_PICKER = len(_LETTERS)
 
 
