@@ -55,6 +55,22 @@ class TestReadLedger:
         entries = read_ledger(FIXTURES / "sample.bean", "Assets:B:SPK")
         assert entries[0].metadata.get("sepa_ref") == "NETFLIX-001"
 
+    def test_untagged_entry_has_empty_tags(self):
+        entries = read_ledger(FIXTURES / "sample.bean", "Assets:B:SPK")
+        assert entries[0].tags == ()
+
+    def test_extracts_transaction_tags_sorted(self, tmp_path: Path):
+        f = tmp_path / "tagged.bean"
+        f.write_text(
+            "2024-01-01 open Assets:B:SPK EUR\n"
+            "2024-01-01 open Expenses:Travel EUR\n\n"
+            '2024-03-25 * "Uber" "ride" #usa-2024 #trip\n'
+            "  Assets:B:SPK    -25.00 EUR\n"
+            "  Expenses:Travel  25.00 EUR\n"
+        )
+        entries = read_ledger(f, "Assets:B:SPK")
+        assert entries[0].tags == ("trip", "usa-2024")
+
     def test_positive_amount_salary(self):
         entries = read_ledger(FIXTURES / "sample.bean", "Assets:B:SPK")
         salary = next(e for e in entries if "Gehalt" in e.narration)

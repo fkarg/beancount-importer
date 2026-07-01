@@ -173,6 +173,7 @@ def _extract_entry(
         amount_inferred=amount_inferred,
         metadata_dates=tuple(dict.fromkeys(metadata_dates)),  # de-dup, preserve order
         has_multiple_postings=len(txn.postings) > 2,
+        tags=tuple(sorted(txn.tags or ())),
     )
 
 

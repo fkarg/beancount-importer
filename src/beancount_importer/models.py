@@ -58,6 +58,9 @@ class LedgerEntry(BaseModel):
     # changes against such entries because rewriting the merchant-side
     # account would corrupt a multi-posting structure the user authored.
     has_multiple_postings: bool = False
+    # Transaction-level `#tags` on the entry. Beancount stores the bare tag
+    # name (no window); the tag menu unions these into its known-tag picker.
+    tags: tuple[str, ...] = ()
 
 
 class ProposedChange(NamedTuple):
