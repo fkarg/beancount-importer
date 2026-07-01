@@ -11,6 +11,8 @@ and `Reporter` injected from this module.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -439,9 +441,51 @@ def main(
     else:
         bean_stats = compute_bean_provenance_stats(session, base_dir)
         _print_summary(results, config, bean_stats, dry_run=skip_persist)
+    if not skip_persist:
+        _run_ledger_check(config, base_dir, results)
 
 
 # ── Result persistence ────────────────────────────────────────────────────────
+
+
+# Cap on how many bean-check output lines we echo, so a badly-broken ledger
+# doesn't bury the summary under thousands of lines.
+_MAX_CHECK_LINES = 40
+
+
+def _run_ledger_check(
+    config: Config, base_dir: Path, results: list[ImportResult]
+) -> None:
+    """Post-write validation: run `bean-check` against the top-level ledger.
+
+    Non-fatal — the import is already written; this only informs. Unlike the
+    per-fragment splice check (syntax-only, since a fragment has no account
+    `open`s), this validates the *whole* `main_bean` ledger — accounts,
+    balances, plugins — because partial checks don't mean much. Uses the
+    user's `bean-check` on PATH (their plugins/env); skipped when `main_bean`
+    is unset or `bean-check` isn't installed.
+    """
+    if not config.main_bean or shutil.which("bean-check") is None:
+        return
+    years = {r.source_txn.booking_date.year for r in results} or {date.today().year}
+    for path in sorted({_resolve(base_dir, config.main_bean, y) for y in years}):
+        if not path.exists():
+            continue
+        proc = subprocess.run(
+            ["bean-check", str(path)], capture_output=True, text=True
+        )
+        if proc.returncode == 0:
+            console.print(f"[green]✓[/] bean-check {path.name}: clean")
+            continue
+        lines = [ln for ln in proc.stderr.splitlines() if ln.strip()]
+        console.print(
+            f"[yellow]⚠ bean-check[/] found issues in {path.name} "
+            f"[dim](not blocking — already written)[/]:"
+        )
+        for ln in lines[:_MAX_CHECK_LINES]:
+            console.print(f"  [yellow]{ln}[/]")
+        if len(lines) > _MAX_CHECK_LINES:
+            console.print(f"  [dim]… {len(lines) - _MAX_CHECK_LINES} more line(s)[/]")
 
 
 def _persist_results(
