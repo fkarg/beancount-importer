@@ -97,6 +97,11 @@ class CategoryProposal(BaseModel):
     tag: str | None = None
     rule_used: CategorizationRule | None = None
     save_as_rule: bool = False
+    # A fully-formed rule the user built in the interactive rule editor. When
+    # present (and `save_as_rule`), the pipeline persists it verbatim instead
+    # of deriving one from the txn — so an edited match pattern / mode / rewrite
+    # survives. `None` keeps the auto-derive path (replay, non-interactive).
+    pending_rule: CategorizationRule | None = None
     # Optional tag-state mutation: set/clear the active tag mid-run (Screen
     # 1's `[t]` hotkey). Applied by the pipeline before `tag` stamping, so
     # picking "set always" on this screen tags this txn AND all that follow.

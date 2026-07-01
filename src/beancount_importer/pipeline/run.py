@@ -743,7 +743,9 @@ def _maybe_save_as_rule(state: _TxnState) -> _TxnState:
     assert state.proposal is not None
     if not (state.proposal.save_as_rule and state.proposal.action == "categorize"):
         return state
-    new_rule = _derive_rule(state.txn, state.proposal)
+    # A rule edited in the interactive editor is used verbatim; otherwise
+    # auto-derive from the txn (replay / non-interactive save-as-rule).
+    new_rule = state.proposal.pending_rule or _derive_rule(state.txn, state.proposal)
     if new_rule is None:
         return state
     return state.evolve(

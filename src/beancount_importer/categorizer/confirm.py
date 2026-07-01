@@ -31,6 +31,7 @@ from beancount_importer.categorizer.screen import (
     tag_remaining_days,
 )
 from beancount_importer.categorizer.modes.amortize import run as run_amortize
+from beancount_importer.categorizer.rule_editor import run as run_rule_editor
 from beancount_importer.categorizer.tag_menu import run as run_tag_menu
 from beancount_importer.models import (
     CategoryProposal,
@@ -229,16 +230,25 @@ def _render_will_write_block(console: Console, ctx: ConfirmContext) -> None:
     if (tag := _effective_tag(ctx)) is not None:
         console.print(f"    tag:          [magenta]#{tag}[/]")
     if p.save_as_rule:
-        # Show *which* field would seed the synthesized rule's pattern,
-        # so the user knows what they're locking in. Mirrors the
-        # heuristic in `pipeline._derive_rule` (payee wins, description
-        # falls back).
-        rule_field = "payee" if ctx.txn.payee else "description"
-        rule_value = ctx.txn.payee or ctx.txn.description or ""
-        console.print(
-            f"    save as rule: [green]✓[/] "
-            f"[dim](on {rule_field}: {rule_value!r})[/]"
-        )
+        # Show what the rule will match on, so the user knows what they're
+        # locking in. The editor puts its edited rule on `pending_rule`; when
+        # absent (replay / non-interactive save) fall back to the derive
+        # heuristic (payee wins, description falls back).
+        if p.pending_rule is not None:
+            pr = p.pending_rule
+            rule_field = "payee" if pr.payee_pattern else "description"
+            rule_value = pr.payee_pattern or pr.description_pattern
+            console.print(
+                f"    save as rule: [green]✓[/] "
+                f"[dim](on {rule_field} {pr.match_mode}: {rule_value!r})[/]"
+            )
+        else:
+            rule_field = "payee" if ctx.txn.payee else "description"
+            rule_value = ctx.txn.payee or ctx.txn.description or ""
+            console.print(
+                f"    save as rule: [green]✓[/] "
+                f"[dim](on {rule_field}: {rule_value!r})[/]"
+            )
     console.print()
 
 
@@ -313,10 +323,9 @@ def render_near_misses(
 def _render_hotkeys(console: Console, ctx: ConfirmContext) -> None:
     """Hotkey row.
 
-    `[r]` toggles "save this proposal as a rule" — the pipeline derives
-    a `CategorizationRule` from the txn's payee/description and stages
-    it for persistence on confirm. `[u]` (fix matched rule) is still
-    deferred.
+    `[r]` opens the rule editor (an editable MATCH→WRITE panel); saving it
+    stages a `CategorizationRule` on the proposal for persistence on confirm.
+    `[u]` (fix an already-matched rule) is still deferred.
     """
     is_debit = ctx.txn.amount < 0
     rule_label = (
@@ -377,11 +386,14 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             # (suggestions, all_accounts) which Screen 1 doesn't.
             return ConfirmDecision(action="change_account", proposal=proposal)
         if key == "r":
-            # Toggle save_as_rule and re-render so the user can see
-            # the indicator change before they commit.
-            proposal = proposal.model_copy(
-                update={"save_as_rule": not proposal.save_as_rule}
-            )
+            # Open the rule editor pre-filled from this txn + proposal. On
+            # save it returns the edited rule, which rides on the proposal to
+            # the pipeline verbatim; cancel leaves the proposal untouched.
+            edited = run_rule_editor(console, ctx.txn, proposal)
+            if edited is not None:
+                proposal = proposal.model_copy(
+                    update={"save_as_rule": True, "pending_rule": edited}
+                )
             continue
         # Edit/menu hotkeys: mutate `proposal` and loop. `Prompt.ask`'s
         # `choices` list keeps `key` inside this set — no fallthrough.

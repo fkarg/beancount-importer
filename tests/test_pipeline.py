@@ -1591,6 +1591,39 @@ class TestPipelineSaveAsRuleEdges:
         assert nr.description_pattern  # fall-through branch was used
         assert not nr.payee_pattern
 
+    def test_pending_rule_is_used_verbatim(self, tmp_path: Path):
+        # A rule the user edited in the rule editor arrives on the proposal as
+        # `pending_rule`; the pipeline must persist it instead of deriving one
+        # from the txn payee.
+        from beancount_importer.rules.models import CategorizationRule
+
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;Netflix;Netflix Abo;-1,00;EUR;\n"
+        )
+        custom = CategorizationRule(
+            target_account="Expenses:Custom",
+            payee_pattern="AMZN",
+            match_mode="contains",
+            bank_key="spk",
+        )
+
+        def categ(ctx):
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Custom"),),
+                save_as_rule=True,
+                pending_rule=custom,
+            )
+
+        session = make_session(tmp_path)
+        results = run(session, tmp_path, categ, NoopReporter())
+        nr = results[0].new_rule
+        assert nr is not None
+        # Edited pattern wins over the derived "Netflix".
+        assert nr.payee_pattern == "AMZN"
+        assert nr.match_mode == "contains"
+
     def test_save_as_rule_no_postings_returns_none(self, tmp_path: Path):
         # Edge case: action="categorize" + save_as_rule=True + no postings →
         # `_derive_rule`'s `if not proposal.postings: return None` branch.
