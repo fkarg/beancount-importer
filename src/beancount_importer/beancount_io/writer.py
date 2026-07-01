@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from collections.abc import Iterable
 from pathlib import Path
@@ -194,7 +195,7 @@ def format_transaction(
         for k, v in metadata.items():
             if _is_reserved_meta_key(k):
                 continue
-            lines.append(f'  {k}: "{v}"')
+            lines.append(f"  {k}: {_render_meta_value(v)}")
     for posting in postings:
         account, amount, *rest = posting
         posting_meta: dict[str, str] = rest[0] if rest else {}
@@ -205,8 +206,22 @@ def format_transaction(
         for mk, mv in posting_meta.items():
             if _is_reserved_meta_key(mk):
                 continue
-            lines.append(f'    {mk}: "{mv}"')
+            lines.append(f"    {mk}: {_render_meta_value(mv)}")
     return "\n".join(lines) + "\n"
+
+
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _render_meta_value(value: str) -> str:
+    """Render a metadata value: bare for date-shaped values, quoted otherwise.
+
+    beancount parses `settle: 2024-01-17` as a `date` but `settle:
+    "2024-01-17"` as a `str`. Date-consuming plugins (settle/actual/paypal)
+    compare against real dates, so an ISO-date value is emitted bare; everything
+    else stays a quoted string.
+    """
+    return value if _ISO_DATE.fullmatch(value) else f'"{value}"'
 
 
 def _is_reserved_meta_key(key: str) -> bool:

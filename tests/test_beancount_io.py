@@ -644,7 +644,8 @@ class TestFormatTransaction:
         )
         # Posting line plus a metadata line indented two more spaces.
         assert "  Assets:B:N26" in text
-        assert '    settle: "2024-03-17"' in text
+        # Date-shaped metadata is written bare (beancount date, not str).
+        assert "    settle: 2024-03-17" in text
         # The metadata line follows its posting line.
         lines = text.splitlines()
         n26_idx = next(i for i, line in enumerate(lines) if "Assets:B:N26" in line)
@@ -701,6 +702,27 @@ class TestFormatTransaction:
         )
         assert " #trip" in text.splitlines()[0]
         assert "##trip" not in text
+
+    def test_iso_date_metadata_written_bare_not_quoted(self):
+        # beancount parses `settle: "2024-01-17"` as a str but `settle:
+        # 2024-01-17` as a date. Plugins (settle/actual) compare against a
+        # date, so date-shaped metadata must be emitted bare.
+        text = format_transaction(
+            date_str="2024-01-15",
+            flag="*",
+            payee=None,
+            narration="Test",
+            postings=[
+                ("Assets:B:SPK", "-1 EUR", {"settle": "2024-01-17"}),
+                ("Expenses:Other", "1 EUR", {}),
+            ],
+            metadata={"actual": "2024-05-13", "sepa_ref": "REF-123"},
+        )
+        assert "actual: 2024-05-13" in text
+        assert 'actual: "2024-05-13"' not in text
+        assert "settle: 2024-01-17" in text
+        # Non-date metadata stays quoted.
+        assert 'sepa_ref: "REF-123"' in text
 
     def test_internal_dunder_metadata_is_dropped(self):
         # Reserved `__x__` keys are not valid beancount source syntax; the

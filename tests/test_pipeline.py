@@ -2795,7 +2795,7 @@ class TestInSessionCounterLeg:
         spk = next(r for r in results if r.source_txn.bank_key == "spk")
         n26 = next(r for r in results if r.source_txn.bank_key == "n26")
         assert spk.action == "new"
-        assert 'settle: "2024-03-17"' in spk.new_entry_text
+        assert "settle: 2024-03-17" in spk.new_entry_text
         # Leg 2 matched the placeholder (inferred amount, no file) but proposes
         # no splice of its own — the hint went to leg 1.
         assert n26.action == "update"
@@ -3362,7 +3362,7 @@ class TestPipelineSameSessionCounterLeg:
 
         # Leg 1's freshly-formatted entry carries the date hint on its PayPal leg.
         assert spk.action == "new"
-        assert 'settle: "2024-04-15"' in spk.new_entry_text
+        assert "settle: 2024-04-15" in spk.new_entry_text
 
         # Leg 2 matched the in-session placeholder but proposes no splice.
         assert paypal.action == "update"
@@ -3380,6 +3380,6 @@ class TestPipelineSameSessionCounterLeg:
         _persist_results(results, cfg, tmp_path, dry_run=True)  # preview path
         _persist_results(results, cfg, tmp_path, dry_run=False)
         written = (tmp_path / "spk.bean").read_text()
-        assert 'settle: "2024-04-15"' in written
+        assert "settle: 2024-04-15" in written
         # Leg 2 produced no second entry / no paypal.bean write.
         assert not (tmp_path / "paypal.bean").exists()
