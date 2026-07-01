@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from beancount_importer.cli import _persist_results
+from beancount_importer.cli import _persist_new_rules, _persist_results
 from beancount_importer.config import BankConfig, Config, CsvConfig
 from beancount_importer.models import (
     CategoryProposal,
@@ -16,6 +16,8 @@ from beancount_importer.models import (
     ProposedChange,
     SourceTransaction,
 )
+from beancount_importer.rules.models import CategorizationRule
+from beancount_importer.rules.storage import load_rules
 
 
 def _spk_config() -> Config:
@@ -98,6 +100,32 @@ def test_update_action_rewrites_matched_entry(tmp_path: Path, monkeypatch):
     assert "Expenses:Food" in rewritten
     assert "Expenses:Unknown" not in rewritten
     assert "OldPayee" not in rewritten
+
+
+def test_persist_new_rules_replaces_edited_rule_in_place(tmp_path: Path):
+    old = CategorizationRule(
+        target_account="Expenses:Old", payee_pattern="X", match_mode="contains"
+    )
+    new = CategorizationRule(
+        target_account="Expenses:New", payee_pattern="X", match_mode="contains"
+    )
+    other = CategorizationRule(
+        target_account="Expenses:Y", payee_pattern="Y", match_mode="contains"
+    )
+    txn = SourceTransaction(
+        booking_date=date(2024, 1, 1), amount=Decimal("-1"), currency="EUR",
+        payee="X", bank_key="spk",
+    )
+    result = ImportResult(
+        source_txn=txn, action="new", new_rule=new, replaced_rule=old
+    )
+    path = tmp_path / "rules.json"
+    _persist_new_rules([result], [other, old], path, dry_run=False)
+    rules = load_rules(path)
+    assert new in rules
+    assert old not in rules
+    assert other in rules  # untouched, order preserved
+    assert rules.index(new) == 1  # replaced in place, not appended
 
 
 def test_persist_results_isolates_a_failing_write(tmp_path: Path, monkeypatch):

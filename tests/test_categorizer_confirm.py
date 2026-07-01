@@ -453,15 +453,24 @@ class TestRun:
         assert decision.action == "skip"
         assert decision.proposal is None
 
-    def test_r_saves_rule_via_editor_and_persists_through_enter(self, monkeypatch):
-        # `[r]` opens the editor; `[s]` saves the default rule; Enter confirms.
-        # The proposal carries save_as_rule + the built pending_rule.
+    def test_r_edits_matched_rule_and_flags_replacement(self, monkeypatch):
+        # A rule matched this txn → `[r]` edits it and marks it for replacement.
         monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "s", ""))
-        decision = run(_console(), _ctx())
+        decision = run(_console(), _ctx())  # default matched_rule=_rule()
         assert decision.action == "confirm"
         assert decision.proposal is not None
         assert decision.proposal.save_as_rule is True
         assert decision.proposal.pending_rule is not None
+        assert decision.proposal.replaces_rule == _rule()
+
+    def test_r_creates_new_rule_when_none_matched(self, monkeypatch):
+        # No matched rule → `[r]` creates a fresh rule (nothing to replace).
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "s", ""))
+        decision = run(_console(), _ctx(matched_rule=None))
+        assert decision.proposal is not None
+        assert decision.proposal.save_as_rule is True
+        assert decision.proposal.pending_rule is not None
+        assert decision.proposal.replaces_rule is None
 
     def test_r_editor_cancel_leaves_proposal_unsaved(self, monkeypatch):
         # `[r]` then `[c]` cancels the editor — save_as_rule stays off.
@@ -474,13 +483,13 @@ class TestRun:
 
     def test_save_as_rule_indicator_shows_edited_rule(self, monkeypatch):
         # After saving via the editor, the "Will write" block reflects the
-        # pending rule's match field + mode.
+        # pending rule's match field + mode. No matched rule → create path,
+        # seeded contains-mode on the txn payee.
         monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "s", ""))
         console = _console()
-        run(console, _ctx())
+        run(console, _ctx(matched_rule=None))
         out = console.export_text()
         assert "save as rule:" in out
-        # Default fixture txn has a payee → contains-mode rule seeded on it.
         assert "on payee contains:" in out
 
     def test_save_as_rule_indicator_falls_back_without_pending_rule(self):

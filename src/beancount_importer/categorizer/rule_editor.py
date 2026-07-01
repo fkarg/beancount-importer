@@ -67,6 +67,27 @@ def _default_draft(txn: SourceTransaction, proposal: CategoryProposal) -> _Draft
     )
 
 
+def _draft_from_rule(rule: CategorizationRule) -> _Draft:
+    """Pre-fill the editor from an existing rule (the `[r]`-edit-matched path)."""
+    if rule.payee_pattern and rule.description_pattern:
+        field, pattern = "either", rule.payee_pattern
+    elif rule.description_pattern:
+        field, pattern = "description", rule.description_pattern
+    else:
+        field, pattern = "payee", rule.payee_pattern
+    return _Draft(
+        match_field=field,
+        match_mode=rule.match_mode,
+        pattern=pattern,
+        bank_key=rule.bank_key,
+        amount_sign=rule.amount_sign,
+        target_account=rule.target_account,
+        override_payee=rule.override_payee or "",
+        override_narration=rule.override_narration or "",
+        tag=rule.tag or "",
+    )
+
+
 def _sign_label(sign: str) -> str:
     return {"debit": "− debit", "credit": "+ credit"}.get(sign, "any")
 
@@ -126,13 +147,22 @@ def _edit(console: Console, label: str, current: str) -> str:
 
 
 def run(
-    console: Console, txn: SourceTransaction, proposal: CategoryProposal
+    console: Console,
+    txn: SourceTransaction,
+    proposal: CategoryProposal,
+    existing_rule: CategorizationRule | None = None,
 ) -> CategorizationRule | None:
     """Render → prompt → handle until `[s]` save or `[c]` cancel.
 
-    Returns the built `CategorizationRule` on save, or `None` on cancel.
+    With `existing_rule`, the panel is pre-filled from that rule (the
+    `[r]`-edit-the-matched-rule path); otherwise from the txn + proposal (a
+    new rule). Returns the built `CategorizationRule` on save, `None` on cancel.
     """
-    draft = _default_draft(txn, proposal)
+    draft = (
+        _draft_from_rule(existing_rule)
+        if existing_rule is not None
+        else _default_draft(txn, proposal)
+    )
     while True:
         _render(console, draft)
         key = ask_hotkey(

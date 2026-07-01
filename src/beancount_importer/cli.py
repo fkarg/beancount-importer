@@ -656,10 +656,21 @@ def _persist_new_rules(
     *,
     dry_run: bool,
 ) -> None:
-    new_rules = [r.new_rule for r in results if r.new_rule is not None]
-    if not new_rules or dry_run:
+    updates = [
+        (r.replaced_rule, r.new_rule) for r in results if r.new_rule is not None
+    ]
+    if not updates or dry_run:
         return
-    save_rules(existing + new_rules, rules_path)
+    rules = list(existing)
+    for old, new in updates:
+        # Editing a matched rule replaces it in place; a fresh rule appends.
+        # An edit whose original is gone (already replaced this run) appends.
+        idx = next((i for i, r in enumerate(rules) if r == old), None) if old else None
+        if idx is None:
+            rules.append(new)
+        else:
+            rules[idx] = new
+    save_rules(rules, rules_path)
 
 
 def _persist_tag_updates(

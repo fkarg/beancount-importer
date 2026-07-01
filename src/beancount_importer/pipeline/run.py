@@ -278,6 +278,7 @@ class _TxnState:
     matcher_proposal: CategoryProposal | None = None
     proposal: CategoryProposal | None = None
     new_rule: CategorizationRule | None = None
+    replaced_rule: CategorizationRule | None = None
     user_tag_delta: TagStateDelta | None = None
     tag_delta: TagStateDelta | None = None
     next_tag: ActiveTag | None = None
@@ -383,6 +384,7 @@ def _process_transaction(
         matched_rule=state.rule,
         is_replay=False,
         new_rule=state.new_rule,
+        replaced_rule=state.replaced_rule,
         tag_state_delta=state.tag_delta,
         min_score=config.matching.min_score,
         max_date_days=config.matching.max_date_days,
@@ -748,6 +750,17 @@ def _maybe_save_as_rule(state: _TxnState) -> _TxnState:
     new_rule = state.proposal.pending_rule or _derive_rule(state.txn, state.proposal)
     if new_rule is None:
         return state
+    replaced = state.proposal.replaces_rule
+    if replaced is not None:
+        # Editing a matched rule: swap it in place so subsequent txns this
+        # session use the edited version, and flag the result so persistence
+        # replaces rather than appends.
+        working = tuple(
+            new_rule if r == replaced else r for r in state.working_rules
+        )
+        return state.evolve(
+            new_rule=new_rule, replaced_rule=replaced, working_rules=working
+        )
     return state.evolve(
         new_rule=new_rule,
         working_rules=(*state.working_rules, new_rule),

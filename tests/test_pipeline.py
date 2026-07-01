@@ -1624,6 +1624,39 @@ class TestPipelineSaveAsRuleEdges:
         assert nr.payee_pattern == "AMZN"
         assert nr.match_mode == "contains"
 
+    def test_edit_matched_rule_flags_replacement(self, tmp_path: Path):
+        # A rule matched the txn; the user edits it (pending_rule + replaces_rule).
+        # The pipeline flags the result so persistence swaps it in place.
+        from beancount_importer.rules.models import CategorizationRule
+
+        (tmp_path / "SPK_jan.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.01.24;Netflix;Netflix Abo;-1,00;EUR;\n"
+        )
+        old = CategorizationRule(
+            target_account="Expenses:Old", payee_pattern="Netflix",
+            match_mode="contains",
+        )
+        new = CategorizationRule(
+            target_account="Expenses:New", payee_pattern="Netflix",
+            match_mode="contains",
+        )
+
+        def categ(ctx):
+            assert ctx.matched_rule == old  # the rule fired for this txn
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:New"),),
+                save_as_rule=True,
+                pending_rule=new,
+                replaces_rule=ctx.matched_rule,
+            )
+
+        session = make_session(tmp_path, rules=(old,))
+        results = run(session, tmp_path, categ, NoopReporter())
+        assert results[0].new_rule == new
+        assert results[0].replaced_rule == old
+
     def test_save_as_rule_no_postings_returns_none(self, tmp_path: Path):
         # Edge case: action="categorize" + save_as_rule=True + no postings →
         # `_derive_rule`'s `if not proposal.postings: return None` branch.

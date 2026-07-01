@@ -10,6 +10,7 @@ from rich.console import Console
 
 from beancount_importer.categorizer.rule_editor import run
 from beancount_importer.models import CategoryProposal, Posting, SourceTransaction
+from beancount_importer.rules.models import CategorizationRule
 
 
 def _console() -> Console:
@@ -74,6 +75,50 @@ class TestDefaults:
         rule = run(_console(), _txn(payee=""), _proposal(payee=None))
         assert rule.payee_pattern == ""
         assert rule.description_pattern == "EREF 123"
+
+
+class TestEditExistingRule:
+    def test_prefills_from_existing_rule(self, monkeypatch):
+        existing = CategorizationRule(
+            target_account="Expenses:Old",
+            payee_pattern="AMZN",
+            match_mode="contains",
+            bank_key="spk",
+            override_payee="Amazon",
+            tag="shopping",
+        )
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("s"))
+        rule = run(_console(), _txn(), _proposal(), existing_rule=existing)
+        assert rule.payee_pattern == "AMZN"
+        assert rule.target_account == "Expenses:Old"
+        assert rule.bank_key == "spk"
+        assert rule.override_payee == "Amazon"
+        assert rule.tag == "shopping"
+
+    def test_prefills_either_rule(self, monkeypatch):
+        existing = CategorizationRule(
+            target_account="Expenses:X",
+            payee_pattern="REWE",
+            description_pattern="REWE",
+            match_any=True,
+            match_mode="contains",
+        )
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("s"))
+        rule = run(_console(), _txn(), _proposal(), existing_rule=existing)
+        assert rule.match_any is True
+        assert rule.payee_pattern == "REWE"
+        assert rule.description_pattern == "REWE"
+
+    def test_edit_matched_rule_pattern(self, monkeypatch):
+        existing = CategorizationRule(
+            target_account="Expenses:Old", description_pattern="OLD",
+            match_mode="contains",
+        )
+        # [3] edit pattern → "NEW", save. Field stays description.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("3", "NEW", "s"))
+        rule = run(_console(), _txn(), _proposal(), existing_rule=existing)
+        assert rule.description_pattern == "NEW"
+        assert rule.payee_pattern == ""
 
 
 class TestEditing:

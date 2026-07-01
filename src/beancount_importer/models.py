@@ -102,6 +102,9 @@ class CategoryProposal(BaseModel):
     # of deriving one from the txn — so an edited match pattern / mode / rewrite
     # survives. `None` keeps the auto-derive path (replay, non-interactive).
     pending_rule: CategorizationRule | None = None
+    # Set when `pending_rule` edits an already-matched rule: the original rule
+    # to replace in place (rather than appending a new one).
+    replaces_rule: CategorizationRule | None = None
     # Optional tag-state mutation: set/clear the active tag mid-run (Screen
     # 1's `[t]` hotkey). Applied by the pipeline before `tag` stamping, so
     # picking "set always" on this screen tags this txn AND all that follow.
@@ -127,6 +130,9 @@ class ImportResult(BaseModel):
     rule_matched: CategorizationRule | None = None
     is_replay: bool = False
     new_rule: CategorizationRule | None = None
+    # When `new_rule` replaces an existing rule (edited via `[r]`), the original
+    # to swap out in the persisted rules; None means append `new_rule`.
+    replaced_rule: CategorizationRule | None = None
     tag_state_delta: TagStateDelta | None = None
     skip_reason: (
         Literal[

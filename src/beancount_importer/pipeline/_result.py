@@ -37,6 +37,7 @@ def _build_result(
     matched_rule: CategorizationRule | None,
     is_replay: bool,
     new_rule: CategorizationRule | None,
+    replaced_rule: CategorizationRule | None = None,
     tag_state_delta: TagStateDelta | None,
     min_score: float,
     max_date_days: int,
@@ -100,6 +101,7 @@ def _build_result(
         rule_matched=matched_rule,
         is_replay=is_replay,
         new_rule=new_rule,
+        replaced_rule=replaced_rule,
         tag_state_delta=tag_state_delta,
     )
 

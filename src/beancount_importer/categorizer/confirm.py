@@ -386,14 +386,18 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             # (suggestions, all_accounts) which Screen 1 doesn't.
             return ConfirmDecision(action="change_account", proposal=proposal)
         if key == "r":
-            # Open the rule editor pre-filled from this txn + proposal. On
-            # save it returns the edited rule, which rides on the proposal to
-            # the pipeline verbatim; cancel leaves the proposal untouched.
-            edited = run_rule_editor(console, ctx.txn, proposal)
+            # Open the rule editor. If a rule already matched this txn, edit
+            # that rule (pre-filled from it) and replace it; otherwise create a
+            # new rule from the txn + proposal. Cancel leaves the proposal as-is.
+            edited = run_rule_editor(
+                console, ctx.txn, proposal, existing_rule=ctx.matched_rule
+            )
             if edited is not None:
-                proposal = proposal.model_copy(
-                    update={"save_as_rule": True, "pending_rule": edited}
-                )
+                proposal = proposal.model_copy(update={
+                    "save_as_rule": True,
+                    "pending_rule": edited,
+                    "replaces_rule": ctx.matched_rule,
+                })
             continue
         # Edit/menu hotkeys: mutate `proposal` and loop. `Prompt.ask`'s
         # `choices` list keeps `key` inside this set — no fallthrough.
