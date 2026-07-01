@@ -28,7 +28,7 @@ from beancount_importer.models import (
     SourceTransaction,
 )
 from beancount_importer.rules.models import CategorizationRule
-from beancount_importer.rules.tags import ActiveTag
+from beancount_importer.rules.tags import ActiveTag, RememberedTag
 
 
 class NearMiss(BaseModel):
@@ -71,6 +71,9 @@ class CategorizeContext(BaseModel):
     matched_rule: CategorizationRule | None = None
     account_hints: tuple[str, ...] = ()
     active_tag: ActiveTag | None = None
+    # Picker source for the `[t]` menu: interacted tags (with windows) unioned
+    # with ledger tag names, grown in-session. Ordered most-relevant-first.
+    known_tags: tuple[RememberedTag, ...] = ()
     existing_entries: tuple[LedgerEntry, ...] = ()
     # Source-side account (e.g. `Assets:B:SPK`) and run progress; needed by
     # the screen-driven categorizer to render the headline + state header.

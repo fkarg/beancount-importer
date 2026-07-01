@@ -38,7 +38,7 @@ from beancount_importer.models import (
     SourceTransaction,
 )
 from beancount_importer.rules.models import CategorizationRule
-from beancount_importer.rules.tags import ActiveTag
+from beancount_importer.rules.tags import ActiveTag, RememberedTag
 
 # Avoid an import cycle by typing through a TYPE_CHECKING shim — `pipeline`
 # imports from `categorizer/host` which imports this module.
@@ -71,6 +71,9 @@ class ConfirmContext:
     # Full ActiveTag (mode/until) for the [t] sub-menu's "active" header;
     # the string variant above drives the per-screen state header only.
     current_active_tag: ActiveTag | None = None
+    # Known tags offered by the [t] sub-menu's picker (recent + ledger,
+    # grown in-session). Ordered most-relevant-first.
+    known_tags: tuple[RememberedTag, ...] = ()
     similar_upcoming: int = 0
     # Diagnostic-only: rendered above the hotkey row when no entry was
     # matched. Surfaces *why* the user is being prompted instead of seeing

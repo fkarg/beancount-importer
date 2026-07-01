@@ -188,6 +188,7 @@ def _run_confirm(
             active_tag=ctx.active_tag.tag if ctx.active_tag else None,
             tag_remaining=_tag_remaining(ctx),
             current_active_tag=ctx.active_tag,
+            known_tags=ctx.known_tags,
             near_misses=ctx.near_misses if matched_entry is None else (),
         )
         decision = run_confirm(console, confirm_ctx)

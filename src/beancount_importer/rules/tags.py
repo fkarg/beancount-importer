@@ -86,11 +86,33 @@ class TagState(BaseModel):
         Deduped by name (most-recent wins, so a re-used tag's window updates)
         and capped. Takes the full `ActiveTag` so the chosen window is kept.
         """
-        remembered = RememberedTag(
-            tag=tag.tag, from_date=tag.from_date, until_date=tag.until_date
-        )
-        deduped = tuple(r for r in self.recent if r.tag != tag.tag)
-        return TagState(active=self.active, recent=(remembered, *deduped)[:cap])
+        return TagState(active=self.active, recent=remember(self.recent, tag, cap))
 
     def with_active(self, active: ActiveTag | None) -> TagState:
         return TagState(active=active, recent=self.recent)
+
+
+def remember(
+    recent: tuple[RememberedTag, ...], tag: ActiveTag, cap: int | None = None
+) -> tuple[RememberedTag, ...]:
+    """Prepend `tag` (with its window) to `recent`, deduped by name and capped.
+
+    Shared by `TagState.with_recent` (persistence) and the pipeline's in-session
+    known-tag list, so both grow the LRU identically.
+    """
+    entry = RememberedTag(
+        tag=tag.tag, from_date=tag.from_date, until_date=tag.until_date
+    )
+    deduped = tuple(r for r in recent if r.tag != tag.tag)
+    out = (entry, *deduped)
+    return out[:cap] if cap is not None else out
+
+
+def known_tags(
+    recent: tuple[RememberedTag, ...], ledger_names: set[str]
+) -> tuple[RememberedTag, ...]:
+    """The tag-menu picker's source: interacted tags (with windows) first, then
+    ledger tag names not already covered, as name-only entries."""
+    seen = {r.tag for r in recent}
+    extra = tuple(RememberedTag(tag=n) for n in sorted(ledger_names) if n not in seen)
+    return (*recent, *extra)

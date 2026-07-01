@@ -7,6 +7,8 @@ from beancount_importer.rules.tags import (
     RememberedTag,
     TagState,
     TagStateDelta,
+    known_tags,
+    remember,
 )
 
 
@@ -143,3 +145,38 @@ class TestTagStateDelta:
     def test_noop(self):
         d = TagStateDelta(op="noop")
         assert d.op == "noop"
+
+
+class TestRemember:
+    def test_prepends_and_captures_window(self):
+        recent = (_rt("a"), _rt("b"))
+        out = remember(
+            recent, _at("b", mode="duration", until_date=date(2024, 4, 11))
+        )
+        # Moved to front, deduped, and its window updated.
+        assert [r.tag for r in out] == ["b", "a"]
+        assert out[0].until_date == date(2024, 4, 11)
+
+    def test_caps_when_requested(self):
+        recent = tuple(_rt(f"t{i}") for i in range(5))
+        out = remember(recent, _at("new"), cap=3)
+        assert [r.tag for r in out] == ["new", "t0", "t1"]
+
+    def test_no_cap_keeps_all(self):
+        out = remember((_rt("a"),), _at("x"))
+        assert [r.tag for r in out] == ["x", "a"]
+
+
+class TestKnownTags:
+    def test_recent_first_then_ledger_sorted(self):
+        recent = (_rt("usa-2024", until_date=date(2024, 4, 11)), _rt("italy"))
+        ledger = {"italy", "amazon", "rewe"}  # italy duplicates a recent tag
+        out = known_tags(recent, ledger)
+        assert [r.tag for r in out] == ["usa-2024", "italy", "amazon", "rewe"]
+        # recent keeps its window; ledger-only entries are name-only.
+        assert out[0].until_date == date(2024, 4, 11)
+        assert out[2].until_date is None
+
+    def test_empty_ledger_is_just_recent(self):
+        recent = (_rt("a"),)
+        assert known_tags(recent, set()) == recent

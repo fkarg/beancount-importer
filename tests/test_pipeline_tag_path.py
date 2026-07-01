@@ -12,6 +12,7 @@ flows through the run loop:
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 from beancount_importer.config import (
@@ -29,7 +30,12 @@ from beancount_importer.pipeline import (
     NoopReporter,
     run,
 )
-from beancount_importer.rules.tags import ActiveTag, TagStateDelta
+from beancount_importer.rules.tags import (
+    ActiveTag,
+    RememberedTag,
+    TagState,
+    TagStateDelta,
+)
 from beancount_importer.session import ImportOptions, ImportSession
 
 
@@ -205,3 +211,65 @@ class TestClear:
         assert results[1].proposal.tag is None
         assert results[2].proposal is not None
         assert results[2].proposal.tag is None
+
+
+# ── Known-tags picker source threads into the categorize context ─────────────
+
+
+class TestKnownTagsThreading:
+    def _session_with_recent(self, base: Path) -> ImportSession:
+        cfg = Config(
+            banks=[_spk_bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+        )
+        return ImportSession(
+            config=cfg,
+            options=ImportOptions(),
+            tag_state=TagState(
+                recent=(RememberedTag(tag="usa-2024", until_date=date(2024, 4, 11)),)
+            ),
+        )
+
+    def test_known_tags_union_recent_ledger_and_grow_in_session(
+        self, tmp_path: Path
+    ):
+        base = _three_txn_csv(tmp_path)
+        # A previously-written ledger entry contributes a tag name.
+        (base / "transactions" / "SPK.bean").write_text(
+            "2024-01-01 open Assets:B:SPK EUR\n"
+            "2024-01-01 open Expenses:Old EUR\n\n"
+            '2024-02-01 * "x" "y" #ledger-tag\n'
+            "  Assets:B:SPK  -9.00 EUR\n"
+            "  Expenses:Old   9.00 EUR\n"
+        )
+        captured: list[list[str]] = []
+        counter = {"n": 0}
+
+        def cat(ctx: CategorizeContext) -> CategoryProposal:
+            captured.append([r.tag for r in ctx.known_tags])
+            i = counter["n"]
+            counter["n"] += 1
+            # Set a brand-new tag on the first txn only.
+            delta = (
+                TagStateDelta(
+                    op="set", new_state=ActiveTag(tag="new-trip", mode="always")
+                )
+                if i == 0
+                else None
+            )
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:X"),),
+                payee=ctx.txn.payee,
+                narration=ctx.txn.description,
+                tag_state_delta=delta,
+            )
+
+        run(self._session_with_recent(base), base, cat, NoopReporter())
+
+        # First txn: persisted recent (with window) first, then ledger name.
+        assert captured[0] == ["usa-2024", "ledger-tag"]
+        # After setting `new-trip` on txn 0, later txns can re-pick it.
+        assert captured[1][0] == "new-trip"
+        assert set(captured[1]) == {"new-trip", "usa-2024", "ledger-tag"}

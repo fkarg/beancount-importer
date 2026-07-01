@@ -60,7 +60,13 @@ from beancount_importer.pipeline.types import (
 from beancount_importer.replay import DecisionLog
 from beancount_importer.rules.engine import find_matching_rule
 from beancount_importer.rules.models import CategorizationRule
-from beancount_importer.rules.tags import ActiveTag, TagStateDelta
+from beancount_importer.rules.tags import (
+    ActiveTag,
+    RememberedTag,
+    TagStateDelta,
+    known_tags,
+    remember,
+)
 from beancount_importer.session import ImportSession
 from beancount_importer.transforms import apply_transforms, load_transforms
 
@@ -127,6 +133,12 @@ def run(
     matchers = load_matchers(list(config.matching.enabled_matchers))
     working_rules: list[CategorizationRule] = list(session.rules)
     working_tag: ActiveTag | None = session.tag_state.active
+    # Picker source for the `[t]` menu: persisted interacted tags (with their
+    # windows) unioned with every tag already written to the ledger. Grown
+    # in-session as the user sets new tags, so later transactions can re-pick
+    # them without re-typing.
+    ledger_tag_names = {t for e in existing for t in e.tags}
+    working_known = known_tags(session.tag_state.recent, ledger_tag_names)
 
     # Pre-bucket all CSV rows by bank key so cross-source matchers can scan
     # the PayPal CSV (or any other bank) without re-iterating `inputs` per call.
@@ -167,6 +179,7 @@ def run(
             config=config,
             working_rules=working_rules,
             working_tag=working_tag,
+            working_known=working_known,
             transforms_hooks=transforms,
             categorize_fn=categorize_fn,
             merge_fn=merge_fn,
@@ -174,6 +187,15 @@ def run(
             auto_threshold=session.options.auto_threshold,
             progress=(progress, total),
         )
+
+        # Grow the in-session picker list when the user just set a tag, so the
+        # next transaction can re-pick it (and its window) without re-typing.
+        if (
+            (delta := result.tag_state_delta) is not None
+            and delta.op == "set"
+            and delta.new_state is not None
+        ):
+            working_known = remember(working_known, delta.new_state)
 
         # Leg 2 of a same-session transfer: it matched an in-session placeholder
         # that has no file to splice into. Redirect its date hint onto leg 1's
@@ -242,6 +264,7 @@ class _TxnState:
     progress: tuple[int, int]
     working_rules: tuple[CategorizationRule, ...]
     working_tag: ActiveTag | None
+    working_known: tuple[RememberedTag, ...] = ()
 
     rule: CategorizationRule | None = None
     match_txn: SourceTransaction | None = None
@@ -268,6 +291,7 @@ def _process_transaction(
     config,  # Config; type omitted to avoid a circular import at type level
     working_rules: list[CategorizationRule],
     working_tag: ActiveTag | None,
+    working_known: tuple[RememberedTag, ...],
     transforms_hooks,
     categorize_fn: CategorizeFn,
     merge_fn: MergeFn | None,
@@ -292,6 +316,7 @@ def _process_transaction(
         progress=progress,
         working_rules=tuple(working_rules),
         working_tag=working_tag,
+        working_known=working_known,
     )
     state = _resolve_rule(state)
     advanced_tag = _advance_tag(state.working_tag, txn.booking_date)
@@ -651,6 +676,7 @@ def _resolve_proposal(
         matched_rule=state.rule,
         account_hints=tuple(hints),
         active_tag=state.working_tag,
+        known_tags=state.working_known,
         existing_entries=tuple(existing_all),
         source_account=bank.account,
         progress=state.progress,
