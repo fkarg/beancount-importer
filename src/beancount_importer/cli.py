@@ -328,6 +328,14 @@ def main(
             help="Migrate a legacy importer setup in the current directory, then exit",
         ),
     ] = False,
+    commit: Annotated[
+        bool | None,
+        typer.Option(
+            "--commit/--no-commit",
+            help="Commit importer-owned files after a successful run "
+            "(overrides config.auto_commit_after_run)",
+        ),
+    ] = None,
     version: Annotated[
         bool,
         typer.Option(
@@ -471,6 +479,48 @@ def main(
         _print_summary(results, config, bean_stats, dry_run=skip_persist)
     if not skip_persist:
         _run_ledger_check(config, base_dir, results)
+        should_commit = (
+            commit if commit is not None else config.auto_commit_after_run
+        )
+        if should_commit:
+            _commit_session(config, base_dir, results)
+
+
+def _commit_session(
+    config: Config, base_dir: Path, results: list[ImportResult]
+) -> None:
+    """Commit the importer-owned files after a successful run.
+
+    Scoped to the files the importer writes (rules, decisions, tag state, and
+    the ledger under `transactions_dir`) so unrelated untracked files in the
+    finances root aren't swept in. Git failures (not a repo, git absent,
+    nothing staged) are reported but never fatal — the writes already happened.
+    """
+    paths = [
+        base_dir / config.rules_file,
+        base_dir / config.decisions_file,
+        base_dir / config.tag_state_file,
+        base_dir / config.transactions_dir,
+    ]
+    existing = [str(p) for p in paths if p.exists()]
+    if not existing:
+        return
+    years = sorted({r.source_txn.booking_date.year for r in results})
+    n_new = sum(1 for r in results if r.action == "new")
+    n_upd = sum(1 for r in results if r.action == "update")
+    label = ",".join(str(y) for y in years) if years else "none"
+    message = f"bean-import: {label} — {n_new} new, {n_upd} updated"
+    git = ["git", "-C", str(base_dir)]
+    try:
+        subprocess.run([*git, "add", "--", *existing], check=True, capture_output=True)
+        # `diff --cached --quiet` exits 0 when nothing is staged.
+        if subprocess.run([*git, "diff", "--cached", "--quiet"]).returncode == 0:
+            console.print("[dim]auto-commit: nothing changed[/]")
+            return
+        subprocess.run([*git, "commit", "-m", message], check=True, capture_output=True)
+        console.print(f"[green]committed:[/] {message}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        console.print(f"[yellow]auto-commit skipped ({exc})[/]")
 
 
 # ── Rule doctor ─────────────────────────────────────────────────────────────

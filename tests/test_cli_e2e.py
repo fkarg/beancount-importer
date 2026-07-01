@@ -18,6 +18,7 @@ What this covers that the unit tests don't:
 
 from __future__ import annotations
 
+import subprocess
 import textwrap
 from decimal import Decimal
 from pathlib import Path
@@ -94,6 +95,85 @@ def _inject(
         "beancount_importer.cli.make_screen_merge_fn",
         lambda _console: merge_fn if merge_fn is not None else None,
     )
+
+
+def _init_git_repo(d: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(d)], check=True)
+
+    def run(*a: str) -> None:
+        subprocess.run(["git", "-C", str(d), *a], check=True, capture_output=True)
+
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "Test")
+    run("add", "-A")
+    run("commit", "-qm", "init")
+
+
+def _head(d: Path) -> str:
+    return subprocess.check_output(["git", "-C", str(d), "rev-parse", "HEAD"]).decode()
+
+
+def _two_row_categorizer() -> ScriptedCategorizer:
+    return ScriptedCategorizer({
+        ("Netflix", Decimal("15.99")): categorize_as(
+            "Expenses:Streaming", payee="Netflix", narration="Netflix Abo"),
+        ("Rewe", Decimal("42.50")): categorize_as(
+            "Expenses:Groceries", payee="Rewe", narration="REWE Filiale"),
+    })
+
+
+class TestAutoCommit:
+    def test_commit_flag_commits_importer_files(self, project, monkeypatch):
+        _init_git_repo(project)
+        _inject(monkeypatch, _two_row_categorizer())
+        before = _head(project)
+        result = CliRunner().invoke(app, [
+            "2024", "--config", str(project / "import_config.toml"), "--commit",
+        ])
+        assert result.exit_code == 0, result.output
+        assert _head(project) != before  # a commit happened
+        files = subprocess.check_output(
+            ["git", "-C", str(project), "show", "--name-only", "--format=", "HEAD"]
+        ).decode()
+        assert "transactions/2024/SPK.bean" in files
+        assert "decisions.jsonl" in files
+
+    def test_config_default_commits_without_flag(self, project, monkeypatch):
+        cfg = (project / "import_config.toml").read_text().replace(
+            "[matching]", "auto_commit_after_run = true\n\n[matching]"
+        )
+        (project / "import_config.toml").write_text(cfg)
+        _init_git_repo(project)
+        _inject(monkeypatch, _two_row_categorizer())
+        before = _head(project)
+        result = CliRunner().invoke(
+            app, ["2024", "--config", str(project / "import_config.toml")]
+        )
+        assert result.exit_code == 0, result.output
+        assert _head(project) != before
+
+    def test_no_commit_flag_overrides_config_default(self, project, monkeypatch):
+        cfg = (project / "import_config.toml").read_text().replace(
+            "[matching]", "auto_commit_after_run = true\n\n[matching]"
+        )
+        (project / "import_config.toml").write_text(cfg)
+        _init_git_repo(project)
+        _inject(monkeypatch, _two_row_categorizer())
+        before = _head(project)
+        result = CliRunner().invoke(app, [
+            "2024", "--config", str(project / "import_config.toml"), "--no-commit",
+        ])
+        assert result.exit_code == 0, result.output
+        assert _head(project) == before  # nothing committed
+
+    def test_commit_in_non_git_dir_is_nonfatal(self, project, monkeypatch):
+        # No git repo → the run still succeeds; the commit is skipped with a note.
+        _inject(monkeypatch, _two_row_categorizer())
+        result = CliRunner().invoke(app, [
+            "2024", "--config", str(project / "import_config.toml"), "--commit",
+        ])
+        assert result.exit_code == 0, result.output
+        assert "auto-commit skipped" in result.output
 
 
 class TestCrashPreservesDecisions:
