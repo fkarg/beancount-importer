@@ -606,19 +606,12 @@ class TestSpliceEntries:
     are mocked here — we don't need the binary to validate the logic.
     """
 
-    def _stub_bean_check(self, monkeypatch, returncode: int = 0, stderr: str = ""):
-        """Replace `subprocess.run` so bean-check returns the requested status
-        without actually shelling out."""
+    def _stub_syntax_ok(self, monkeypatch):
+        """Make the post-splice validation always pass, so line-manipulation
+        tests can use non-beancount placeholder content (`L1`, `L2`, …)."""
         from beancount_importer.beancount_io import writer as writer_mod
 
-        class _Result:
-            def __init__(self):
-                self.returncode = returncode
-                self.stderr = stderr
-
-        monkeypatch.setattr(
-            writer_mod.subprocess, "run", lambda *a, **kw: _Result()
-        )
+        monkeypatch.setattr(writer_mod, "_syntax_errors", lambda content: [])
 
     def test_splices_apply_back_to_front(self, tmp_path: Path, monkeypatch):
         # Replace two non-overlapping single-line ranges where the EARLIER
@@ -635,7 +628,7 @@ class TestSpliceEntries:
             "L5\n"
             "L6\n"
         )
-        self._stub_bean_check(monkeypatch)
+        self._stub_syntax_ok(monkeypatch)
         splice_entries(
             [
                 # (start, end) ranges are 1-based inclusive — `start` and
@@ -652,18 +645,16 @@ class TestSpliceEntries:
     def test_dry_run_does_not_modify(self, tmp_path: Path, monkeypatch):
         target = tmp_path / "x.bean"
         target.write_text("hello\n")
-        # Even with a stubbed bean-check, dry_run should short-circuit
-        # before touching the file.
+        # Even with validation stubbed, dry_run should short-circuit before
+        # touching the file (and never validate).
         called = []
         from beancount_importer.beancount_io import writer as writer_mod
         monkeypatch.setattr(
-            writer_mod.subprocess,
-            "run",
-            lambda *a, **kw: called.append(a) or None,
+            writer_mod, "_syntax_errors", lambda content: called.append(content) or []
         )
         splice_entries([(1, 1, "OOPS")], target, dry_run=True)
         assert target.read_text() == "hello\n"
-        assert called == []  # bean-check not invoked
+        assert called == []  # validation not invoked
 
     def test_empty_updates_is_noop(self, tmp_path: Path, monkeypatch):
         target = tmp_path / "x.bean"
@@ -671,35 +662,53 @@ class TestSpliceEntries:
         called = []
         from beancount_importer.beancount_io import writer as writer_mod
         monkeypatch.setattr(
-            writer_mod.subprocess,
-            "run",
-            lambda *a, **kw: called.append(a) or None,
+            writer_mod, "_syntax_errors", lambda content: called.append(content) or []
         )
         splice_entries([], target)
         assert target.read_text() == "hello\n"
-        # No bean-check needed when there's nothing to splice.
+        # No validation needed when there's nothing to splice.
         assert called == []
 
-    def test_bean_check_failure_rolls_back(self, tmp_path: Path, monkeypatch):
-        # Critical: if bean-check rejects the post-splice file, the writer
-        # restores the .bak and raises so the user's ledger is never left
-        # in a broken state.
-
+    def test_syntax_error_rolls_back(self, tmp_path: Path):
+        # Critical: if the splice produces structurally broken beancount, the
+        # writer restores the .bak and raises so the ledger is never corrupted.
+        # Uses the real parser (no stub) — splicing garbage into a valid file.
         target = tmp_path / "x.bean"
-        original = "L1\nL2\nL3\n"
+        original = (
+            '2024-01-02 * "shop" "x"\n'
+            "  Assets:B:SPK   -5.00 EUR\n"
+            "  Expenses:Foo    5.00 EUR\n"
+        )
         target.write_text(original)
-        self._stub_bean_check(monkeypatch, returncode=1, stderr="syntax error")
-        with pytest.raises(RuntimeError, match="bean-check failed"):
-            splice_entries([(2, 2, "REPLACED")], target)
-        # File contents must equal the pre-splice state.
+        with pytest.raises(RuntimeError, match="parse failed"):
+            splice_entries([(2, 2, "  this is not valid beancount @@ @@ ((")], target)
         assert target.read_text() == original
-        # Backup file must have been cleaned up after rollback.
+        assert not target.with_suffix(target.suffix + ".bak").exists()
+
+    def test_unknown_accounts_do_not_roll_back(self, tmp_path: Path):
+        # Regression: the per-year files are fragments with no `open`
+        # directives, so a full bean-check would flag every account as
+        # "unknown" and roll back. Parse-only validation must let the write
+        # through — the accounts exist in the root ledger.
+        target = tmp_path / "SPK.bean"
+        target.write_text(
+            '2024-01-02 * "old" "x"\n'
+            "  Assets:B:SPK   -5.00 EUR\n"
+            "  Expenses:Old    5.00 EUR\n"
+        )
+        new = (
+            '2024-01-02 * "Hetzner Online GmbH" "Invoice"\n'
+            "  Assets:B:SPK              -5.11 EUR\n"
+            "  Expenses:PersonalCompute   5.11 EUR\n"
+        )
+        splice_entries([(1, 3, new)], target)
+        assert "Expenses:PersonalCompute" in target.read_text()
         assert not target.with_suffix(target.suffix + ".bak").exists()
 
     def test_successful_splice_removes_backup(self, tmp_path: Path, monkeypatch):
         target = tmp_path / "x.bean"
         target.write_text("L1\nL2\nL3\n")
-        self._stub_bean_check(monkeypatch)
+        self._stub_syntax_ok(monkeypatch)
         splice_entries([(2, 2, "REPLACED")], target)
         # Backup is cleaned up on success.
         assert not target.with_suffix(target.suffix + ".bak").exists()

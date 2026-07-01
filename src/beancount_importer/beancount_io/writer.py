@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from beancount.parser import parser as _bc_parser
 
 if TYPE_CHECKING:
     from beancount_importer.models import CategoryProposal, LedgerEntry
@@ -45,20 +46,36 @@ def splice_entries(
         replacement = new_text.rstrip() + "\n"
         lines[s:e] = [replacement]
 
-    target.write_text("".join(lines), encoding="utf-8")
+    content = "".join(lines)
+    target.write_text(content, encoding="utf-8")
 
-    result = subprocess.run(
-        ["bean-check", str(target)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
+    # Validate that the splice produced *syntactically* valid beancount — the
+    # splice's only job is not to corrupt the file. We deliberately do NOT run
+    # a full `bean-check`: these per-year files are fragments whose account
+    # `open`s and balance context live in the root ledger, so account/balance
+    # validation would false-positive ("unknown account") on every posting and
+    # roll back perfectly good writes. Parse-only catches real corruption
+    # (bad line offsets producing malformed beancount) without that.
+    syntax_errors = _syntax_errors(content)
+    if syntax_errors:
         shutil.copy2(bak, target)
         bak.unlink()
         raise RuntimeError(
-            f"bean-check failed after splice — rolled back:\n{result.stderr}"
+            "beancount parse failed after splice — rolled back:\n"
+            + "\n".join(syntax_errors)
         )
     bak.unlink()
+
+
+def _syntax_errors(content: str) -> list[str]:
+    """Return human-readable syntax errors from parsing `content`, if any.
+
+    Parse-only: `beancount.parser` reports malformed syntax but never
+    account/balance problems (those come from the loader against the whole
+    ledger), which is exactly the distinction we want for a fragment splice.
+    """
+    _, errors, _ = _bc_parser.parse_string(content)
+    return [getattr(e, "message", str(e)) for e in errors]
 
 
 def apply_update(

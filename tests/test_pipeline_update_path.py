@@ -38,13 +38,11 @@ def _spk_config() -> Config:
 
 
 def _stub_bean_check(monkeypatch):
+    # The post-splice validation is parse-only now; keep these integration
+    # tests hermetic by forcing it to pass regardless of parser availability.
     from beancount_importer.beancount_io import writer as writer_mod
 
-    monkeypatch.setattr(
-        writer_mod.subprocess,
-        "run",
-        lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
-    )
+    monkeypatch.setattr(writer_mod, "_syntax_errors", lambda content: [])
 
 
 def test_update_action_rewrites_matched_entry(tmp_path: Path, monkeypatch):
