@@ -19,6 +19,7 @@ from beancount_importer.config import BankConfig
 from beancount_importer.models import LedgerEntry, SourceTransaction
 from beancount_importer.parsers.base import Parser
 from beancount_importer.parsers.generic import GenericCsvParser
+from beancount_importer.pipeline._paypal_bundles import collapse_paypal_bundles
 from beancount_importer.session import ImportSession
 
 
@@ -143,6 +144,10 @@ def _parse_all_inputs(
                 if reporter is not None:
                     reporter.on_error(f"{bank.key}: failed to parse {csv_file}: {exc}")
                 continue
+            if bank.key == "paypal":
+                # Collapse PayPal's multi-row currency-conversion bundles and
+                # drop hold/reversal noise before the rows enter the pipeline.
+                rows = collapse_paypal_bundles(rows)
             if allowed is not None:
                 rows = [t for t in rows if t.booking_date.year in allowed]
             # Zero-amount rows produce no useful proposal and would
