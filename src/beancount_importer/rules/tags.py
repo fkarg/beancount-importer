@@ -56,18 +56,41 @@ class TagStateDelta(BaseModel):
     new_state: ActiveTag | None = None  # required for op="set"
 
 
+class RememberedTag(BaseModel):
+    """A tag the user has interacted with, remembered for the `[t]` picker.
+
+    Beancount stores only the bare tag name, never the window the user chose,
+    so we persist it here. `from_date`/`until_date` pre-fill the tag menu's
+    date prompt when the tag is re-picked; a name-only remembered tag (from a
+    ledger scan or legacy state) carries neither.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tag: str
+    from_date: date | None = None
+    until_date: date | None = None
+
+
 class TagState(BaseModel):
     """Persisted state. Loaded into ImportSession at start, written by CLI after run()."""
 
     model_config = ConfigDict(frozen=True)
 
     active: ActiveTag | None = None
-    recent: tuple[str, ...] = ()  # LRU of recently used tags
+    recent: tuple[RememberedTag, ...] = ()  # LRU of interacted tags (+ windows)
 
-    def with_recent(self, tag: str, cap: int = 10) -> TagState:
-        """Return a new TagState with `tag` moved to the front of `recent`, capped."""
-        deduped = tuple(t for t in self.recent if t != tag)
-        return TagState(active=self.active, recent=(tag, *deduped)[:cap])
+    def with_recent(self, tag: ActiveTag, cap: int = 10) -> TagState:
+        """Return a new TagState with `tag` moved to the front of `recent`.
+
+        Deduped by name (most-recent wins, so a re-used tag's window updates)
+        and capped. Takes the full `ActiveTag` so the chosen window is kept.
+        """
+        remembered = RememberedTag(
+            tag=tag.tag, from_date=tag.from_date, until_date=tag.until_date
+        )
+        deduped = tuple(r for r in self.recent if r.tag != tag.tag)
+        return TagState(active=self.active, recent=(remembered, *deduped)[:cap])
 
     def with_active(self, active: ActiveTag | None) -> TagState:
         return TagState(active=active, recent=self.recent)

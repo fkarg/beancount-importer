@@ -44,7 +44,7 @@ from beancount_importer.categorizer.host import (
 from beancount_importer.replay import DecisionLog
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.storage import load_rules, save_rules
-from beancount_importer.rules.tags import ActiveTag, TagState
+from beancount_importer.rules.tags import ActiveTag, RememberedTag, TagState
 from beancount_importer.session import ImportOptions, ImportSession
 
 
@@ -88,15 +88,26 @@ def _load_tag_state(path: Path) -> TagState:
     raw = json.loads(path.read_text(encoding="utf-8"))
     active_data = raw.get("active")
     active = ActiveTag.model_validate(active_data) if active_data else None
-    recent = tuple(raw.get("recent", ()))
+    recent = tuple(_parse_remembered(r) for r in raw.get("recent", ()))
     return TagState(active=active, recent=recent)
+
+
+def _parse_remembered(raw) -> RememberedTag:
+    """Parse one `recent` entry, tolerating the legacy bare-string format.
+
+    Old state (and the reference's `recent_tags`) stored plain names with no
+    window; those become name-only remembered tags.
+    """
+    if isinstance(raw, str):
+        return RememberedTag(tag=raw)
+    return RememberedTag.model_validate(raw)
 
 
 def _save_tag_state(state: TagState, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "active": state.active.model_dump(mode="json") if state.active else None,
-        "recent": list(state.recent),
+        "recent": [r.model_dump(mode="json") for r in state.recent],
     }
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -551,8 +562,10 @@ def _persist_tag_updates(
         delta = r.tag_state_delta
         if delta is None or delta.op == "noop":
             continue
-        if delta.op == "set":
-            state = state.with_active(delta.new_state)
+        if delta.op == "set" and delta.new_state is not None:
+            # Record both the active tag AND its window in `recent`, so the
+            # picker can re-offer it (and pre-fill its dates) next time.
+            state = state.with_active(delta.new_state).with_recent(delta.new_state)
         elif delta.op == "clear":
             state = state.with_active(None)
     if dry_run:

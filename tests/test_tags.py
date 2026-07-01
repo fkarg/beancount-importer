@@ -2,7 +2,20 @@ from datetime import date
 
 import pytest
 
-from beancount_importer.rules.tags import ActiveTag, TagState, TagStateDelta
+from beancount_importer.rules.tags import (
+    ActiveTag,
+    RememberedTag,
+    TagState,
+    TagStateDelta,
+)
+
+
+def _at(name: str, **kw) -> ActiveTag:
+    return ActiveTag(tag=name, mode=kw.pop("mode", "always"), **kw)
+
+
+def _rt(name: str, **kw) -> RememberedTag:
+    return RememberedTag(tag=name, **kw)
 
 
 class TestActiveTagAppliesTo:
@@ -80,19 +93,25 @@ class TestTagState:
         assert s.recent == ()
 
     def test_with_recent_prepends(self):
-        s = TagState().with_recent("a").with_recent("b")
-        assert s.recent == ("b", "a")
+        s = TagState().with_recent(_at("a")).with_recent(_at("b"))
+        assert [r.tag for r in s.recent] == ["b", "a"]
 
     def test_with_recent_dedupes(self):
-        s = TagState(recent=("a", "b", "c")).with_recent("b")
-        assert s.recent == ("b", "a", "c")
+        s = TagState(recent=(_rt("a"), _rt("b"), _rt("c"))).with_recent(_at("b"))
+        assert [r.tag for r in s.recent] == ["b", "a", "c"]
+
+    def test_with_recent_keeps_the_window(self):
+        s = TagState().with_recent(
+            _at("usa-2024", mode="duration", until_date=date(2024, 4, 11))
+        )
+        assert s.recent[0] == RememberedTag(tag="usa-2024", until_date=date(2024, 4, 11))
 
     def test_with_recent_caps(self):
-        s = TagState(recent=tuple(f"t{i}" for i in range(10)))
-        s = s.with_recent("new", cap=10)
+        s = TagState(recent=tuple(_rt(f"t{i}") for i in range(10)))
+        s = s.with_recent(_at("new"), cap=10)
         assert len(s.recent) == 10
-        assert s.recent[0] == "new"
-        assert "t9" not in s.recent  # oldest evicted
+        assert s.recent[0].tag == "new"
+        assert all(r.tag != "t9" for r in s.recent)  # oldest evicted
 
     def test_with_active_replaces(self):
         tag = ActiveTag(tag="x", mode="always")
@@ -100,13 +119,13 @@ class TestTagState:
         assert s.active == tag
 
     def test_with_active_preserves_recent(self):
-        s = TagState(recent=("a", "b")).with_active(ActiveTag(tag="x", mode="always"))
-        assert s.recent == ("a", "b")
+        s = TagState(recent=(_rt("a"), _rt("b"))).with_active(_at("x"))
+        assert [r.tag for r in s.recent] == ["a", "b"]
 
     def test_frozen(self):
         s = TagState()
         with pytest.raises(Exception):
-            s.recent = ("x",)  # type: ignore[misc]
+            s.recent = (_rt("x"),)  # type: ignore[misc]
 
 
 class TestTagStateDelta:
