@@ -88,6 +88,15 @@ class TestEditing:
         assert rule.payee_pattern == ""
         assert rule.description_pattern == "AMZN MKTP DE*RT4"
 
+    def test_toggle_field_to_either_sets_match_any(self, monkeypatch):
+        # [1] cycles payee → description → either; "either" matches payee OR
+        # narration via one rule (match_any), both patterns set to the text.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("1", "1", "s"))
+        rule = run(_console(), _txn(), _proposal())
+        assert rule.match_any is True
+        assert rule.payee_pattern == "AMZN MKTP DE*RT4"
+        assert rule.description_pattern == "AMZN MKTP DE*RT4"
+
     def test_toggle_mode_to_regex(self, monkeypatch):
         # [2] cycles contains → exact → regex (two presses).
         monkeypatch.setattr(

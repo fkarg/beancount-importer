@@ -27,7 +27,7 @@ from beancount_importer.categorizer.screen import ask_hotkey, bottom_rule, hotke
 from beancount_importer.models import CategoryProposal, SourceTransaction
 from beancount_importer.rules.models import CategorizationRule
 
-_FIELDS: tuple[str, ...] = ("payee", "description")
+_FIELDS: tuple[str, ...] = ("payee", "description", "either")
 _MODES: tuple[str, ...] = ("contains", "exact", "regex")
 _SIGNS: tuple[str, ...] = ("", "debit", "credit")
 _HOTKEYS: tuple[str, ...] = ("1", "2", "3", "4", "5", "6", "7", "8", "9", "s", "c")
@@ -69,12 +69,20 @@ def _sign_label(sign: str) -> str:
 
 
 def _build(draft: _Draft) -> CategorizationRule:
-    """Materialize the draft into a validated rule (raises on bad regex)."""
+    """Materialize the draft into a validated rule (raises on bad regex).
+
+    "either" sets both patterns to the same text with `match_any` — one rule
+    matching payee OR narration, instead of a duplicated pair.
+    """
+    either = draft.match_field == "either"
+    on_payee = draft.match_field in ("payee", "either")
+    on_desc = draft.match_field in ("description", "either")
     return CategorizationRule(
         target_account=draft.target_account,
-        payee_pattern=draft.pattern if draft.match_field == "payee" else "",
-        description_pattern=draft.pattern if draft.match_field == "description" else "",
+        payee_pattern=draft.pattern if on_payee else "",
+        description_pattern=draft.pattern if on_desc else "",
         match_mode=draft.match_mode,  # type: ignore[arg-type]
+        match_any=either,
         bank_key=draft.bank_key,
         amount_sign=draft.amount_sign,  # type: ignore[arg-type]
         override_payee=draft.override_payee or None,

@@ -23,6 +23,10 @@ class CategorizationRule(BaseModel):
     # Defaults to "regex" so rules persisted before this field existed keep
     # their original semantics on load. New / derived rules use "contains".
     match_mode: Literal["contains", "exact", "regex"] = "regex"
+    # When both patterns are set: False → both must match (AND, default);
+    # True → either may match (OR). Lets one rule cover "payee OR narration"
+    # instead of a duplicated payee-rule + description-rule pair.
+    match_any: bool = False
     # "credit" = positive amounts, "debit" = negative, "" = any
     amount_sign: Literal["credit", "debit", ""] = ""
     bank_key: str = ""  # empty = match any bank
@@ -79,11 +83,13 @@ class CategorizationRule(BaseModel):
         if self.amount_sign == "debit" and txn.amount >= Decimal(0):
             return False
 
-        if self.payee_pattern and not self._pattern_matches(
-            self.payee_pattern, txn.payee or ""
-        ):
-            return False
-
-        if not self.description_pattern:
+        results: list[bool] = []
+        if self.payee_pattern:
+            results.append(self._pattern_matches(self.payee_pattern, txn.payee or ""))
+        if self.description_pattern:
+            results.append(
+                self._pattern_matches(self.description_pattern, txn.description or "")
+            )
+        if not results:
             return True
-        return self._pattern_matches(self.description_pattern, txn.description or "")
+        return any(results) if self.match_any else all(results)

@@ -91,6 +91,22 @@ class TestCategorizationRuleMatches:
         assert rule.matches(make_txn(payee="Netflix", description="Netflix Abo"))
         assert not rule.matches(make_txn(payee="Netflix", description="Premium"))
 
+    def test_match_any_matches_when_either_field_hits(self):
+        # `match_any` turns the two patterns into an OR — one rule replaces a
+        # payee-rule + description-rule pair.
+        rule = make_rule(
+            payee_pattern="REWE", description_pattern="REWE", match_any=True
+        )
+        assert rule.matches(make_txn(payee="REWE Markt", description="card 123"))
+        assert rule.matches(make_txn(payee="unknown", description="REWE Filiale"))
+        assert not rule.matches(make_txn(payee="Aldi", description="card 123"))
+
+    def test_match_any_defaults_off_keeps_and_semantics(self):
+        assert make_rule().match_any is False
+        rule = make_rule(payee_pattern="Netflix", description_pattern="Abo")
+        # AND (default): both must hit.
+        assert not rule.matches(make_txn(payee="Netflix", description="Premium"))
+
     def test_invalid_regex_raises(self):
         with pytest.raises(ValueError):
             make_rule(payee_pattern="[invalid")
