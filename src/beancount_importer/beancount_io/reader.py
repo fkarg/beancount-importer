@@ -196,6 +196,7 @@ def _extract_entry(
         metadata_dates=tuple(dict.fromkeys(metadata_dates)),  # de-dup, preserve order
         has_multiple_postings=len(txn.postings) > 2,
         tags=tuple(sorted(txn.tags or ())),
+        links=tuple(sorted(txn.links or ())),
     )
 
 

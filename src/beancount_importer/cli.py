@@ -660,9 +660,25 @@ def _persist_results(
     The splice itself is atomic (rolls its own file back on parse failure), so
     continuing past a failure never leaves a half-written file. Returns the
     `(result, exception)` pairs that failed, for the caller to report.
+
+    Updates splice at line numbers captured when the ledger was loaded. A
+    splice that changes an entry's line count shifts every line below it, so
+    applying a file's updates top-down would land each later splice on stale
+    coordinates and rewrite an innocent neighbour. Updates therefore apply
+    bottom-up (descending line_start per file); appends never shift existing
+    lines, so their order relative to the updates is free.
     """
+
+    def splice_position(r: ImportResult) -> tuple[str, int]:
+        e = r.matched_entry
+        return (e.file_path, -e.line_start) if e is not None else ("", 0)
+
+    ordered = [r for r in results if r.action != "update"]
+    ordered += sorted(
+        (r for r in results if r.action == "update"), key=splice_position
+    )
     failures: list[tuple[ImportResult, Exception]] = []
-    for r in results:
+    for r in ordered:
         try:
             bank_cfg = config.bank(r.source_txn.bank_key)
         except KeyError:

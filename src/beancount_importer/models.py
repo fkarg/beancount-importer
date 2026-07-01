@@ -61,6 +61,10 @@ class LedgerEntry(BaseModel):
     # Transaction-level `#tags` on the entry. Beancount stores the bare tag
     # name (no window); the tag menu unions these into its known-tag picker.
     tags: tuple[str, ...] = ()
+    # Transaction-level `^links` (bare name, no caret) — e.g. the `^xfer-...`
+    # pair binding both legs of a cross-bank transfer. Preserved verbatim
+    # when the entry is rewritten.
+    links: tuple[str, ...] = ()
 
 
 class ProposedChange(NamedTuple):

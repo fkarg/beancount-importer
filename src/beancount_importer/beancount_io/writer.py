@@ -92,9 +92,13 @@ def apply_update(
 
     `entry.line_start` pins the splice; the end of the transaction is detected
     by scanning the file for the first blank line (or next top-level directive)
-    after the start. The bank-side leg always carries the original amount; any
-    additional postings come from the proposal. Metadata merges entry-side
-    metadata with proposal metadata (proposal wins) and includes `tag` when set.
+    after the start. Before splicing, the line at `line_start` must actually
+    begin with the entry's date — stale coordinates (the file changed since
+    the ledger was loaded) raise ValueError instead of silently rewriting
+    whatever transaction now sits there. The bank-side leg always carries the
+    original amount; any additional postings come from the proposal. Metadata
+    merges entry-side metadata with proposal metadata (proposal wins) and
+    includes `tag` when set; header `#tags` and `^links` are preserved.
     """
     payee = proposal.payee or entry.payee
     narration = proposal.narration or entry.narration
@@ -125,6 +129,7 @@ def apply_update(
         postings=postings,
         metadata=metadata,
         tags=tags,
+        links=entry.links,
         narration_max_length=narration_max_length,
     )
     if not entry.file_path:
@@ -134,18 +139,29 @@ def apply_update(
         # persistence; reaching here is a contract violation, not user error.
         raise ValueError("apply_update: entry has no file_path to splice into")
     target = Path(entry.file_path)
-    line_end = entry.line_end or _detect_entry_end(target, entry.line_start)
+    lines = target.read_text(encoding="utf-8").splitlines()
+    header = (
+        lines[entry.line_start - 1]
+        if 1 <= entry.line_start <= len(lines)
+        else ""
+    )
+    if not header.startswith(entry.date.isoformat()):
+        raise ValueError(
+            f"splice target mismatch at {target}:{entry.line_start}: expected "
+            f"a transaction dated {entry.date.isoformat()}, found {header!r} — "
+            "line numbers are stale, refusing to splice"
+        )
+    line_end = entry.line_end or _detect_entry_end(lines, entry.line_start)
     splice_entries([(entry.line_start, line_end, text)], target, dry_run=dry_run)
 
 
-def _detect_entry_end(target: Path, line_start: int) -> int:
+def _detect_entry_end(lines: list[str], line_start: int) -> int:
     """Find the 1-based last line of the transaction starting at `line_start`.
 
     Beancount's loader only records the start line. The end is whatever comes
     before the next blank line or top-level directive — postings and metadata
     are indented, so we stop at the first un-indented line after the header.
     """
-    lines = target.read_text(encoding="utf-8").splitlines()
     end = len(lines)
     # Header is at index line_start - 1 (1-based → 0-based). Scan from the
     # next line forward.
@@ -166,6 +182,7 @@ def format_transaction(
     postings: list[tuple[str, str | None]] | list[tuple[str, str | None, dict[str, str]]],
     metadata: dict[str, str] | None = None,
     tags: Iterable[str] = (),
+    links: Iterable[str] = (),
     narration_max_length: int | None = None,
 ) -> str:
     """Format a beancount transaction as a string.
@@ -179,17 +196,20 @@ def format_transaction(
     `tags` are beancount `#hashtags` appended to the transaction header line
     (not `tag:` metadata — those are semantically different in beancount and
     invisible to `bean-query ... IN tags`). A stray leading `#` is tolerated.
-    `narration_max_length`, when set, truncates the narration to that many
-    characters (no ellipsis) to keep ledger lines readable.
+    `links` are `^links` appended after the tags, same tolerance for a stray
+    leading `^`. `narration_max_length`, when set, truncates the narration to
+    that many characters (no ellipsis) to keep ledger lines readable.
     """
     payee_part = f'"{payee}" ' if payee else ""
     if narration_max_length is not None and len(narration) > narration_max_length:
         narration = narration[:narration_max_length]
     header = f'{date_str} {flag} {payee_part}"{narration}"'
-    tag_suffix = "".join(
+    header += "".join(
         f" #{t.lstrip('#')}" for t in tags if t and t.strip()
     )
-    header += tag_suffix
+    header += "".join(
+        f" ^{ln.lstrip('^')}" for ln in links if ln and ln.strip()
+    )
     lines = [header]
     if metadata:
         for k, v in metadata.items():

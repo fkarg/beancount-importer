@@ -24,6 +24,8 @@ requiring a Typer subprocess.
 from __future__ import annotations
 
 import textwrap
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -35,7 +37,14 @@ from beancount_importer.config import (
     CsvConfig,
     MatchingConfig,
 )
-from beancount_importer.models import CategoryProposal, Posting
+from beancount_importer.models import (
+    CategoryProposal,
+    ImportResult,
+    LedgerEntry,
+    Posting,
+    ProposedChange,
+    SourceTransaction,
+)
 from beancount_importer.pipeline import (
     CategorizeContext,
     CategorizeFn,
@@ -252,3 +261,93 @@ class TestBeanOutputSnapshot:
         assert netflix_idx < rewe_idx
         between = out[netflix_idx:rewe_idx]
         assert between.count("\n\n") == 1
+
+
+class TestPersistUpdateOrdering:
+    """Regression for the 2024 ledger corruption: multiple updates to the same
+    file were spliced one at a time in results order (top-down) using line
+    numbers captured when the ledger was loaded. Each splice that grew an
+    entry shifted every later target down, so subsequent splices landed on —
+    and rewrote — whatever transaction now sat at the stale coordinates.
+    `_persist_results` must apply a file's updates bottom-up.
+    """
+
+    def _entry(self, f: Path, line_start: int, d: date, payee: str,
+               amount: str, old_account: str) -> LedgerEntry:
+        return LedgerEntry(
+            date=d,
+            payee=payee,
+            narration="orig",
+            source_account="Assets:B:SPK",
+            target_account=old_account,
+            amount=Decimal(amount),
+            line_start=line_start,
+            file_path=str(f),
+        )
+
+    def _update(self, entry: LedgerEntry, new_account: str) -> ImportResult:
+        return ImportResult(
+            source_txn=SourceTransaction(
+                booking_date=entry.date, amount=entry.amount, bank_key="spk"
+            ),
+            action="update",
+            matched_entry=entry,
+            proposal=CategoryProposal(
+                action="categorize",
+                postings=(Posting(account=new_account),),
+                # Metadata makes the replacement one line longer than the
+                # original — the growth that shifts everything below it.
+                metadata={"note": "recategorized"},
+            ),
+            proposed_changes=[
+                ProposedChange("target_account", entry.target_account, new_account)
+            ],
+        )
+
+    def test_updates_in_top_down_order_do_not_corrupt_later_targets(
+        self, tmp_path: Path
+    ):
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-01-10 * "A" "orig"\n'          # line 1
+            "  Assets:B:SPK   -1.00 EUR\n"
+            "  Expenses:OldA   1.00 EUR\n"
+            "\n"
+            '2024-01-11 * "B" "orig"\n'          # line 5
+            "  Assets:B:SPK   -2.00 EUR\n"
+            "  Expenses:OldB   2.00 EUR\n"
+            "\n"
+            '2024-01-12 * "C" "orig"\n'          # line 9
+            "  Assets:B:SPK   -3.00 EUR\n"
+            "  Expenses:OldC   3.00 EUR\n"
+        )
+        results = [
+            # Deliberately top-down: A's splice grows the file by one line,
+            # invalidating B's line_start=5 unless persistence reorders.
+            self._update(
+                self._entry(f, 1, date(2024, 1, 10), "A", "-1.00", "Expenses:OldA"),
+                "Expenses:NewA",
+            ),
+            self._update(
+                self._entry(f, 5, date(2024, 1, 11), "B", "-2.00", "Expenses:OldB"),
+                "Expenses:NewB",
+            ),
+        ]
+        config = Config(banks=[_spk_bank()], matching=MatchingConfig(min_score=0.35))
+        failures = _persist_results(results, config, tmp_path, dry_run=False)
+        assert failures == []
+
+        out = f.read_text()
+        # Both updates landed; neither original categorization survives.
+        assert "Expenses:NewA" in out
+        assert "Expenses:NewB" in out
+        assert "Expenses:OldA" not in out
+        assert "Expenses:OldB" not in out
+        # B was rewritten in place, not duplicated at stale coordinates.
+        assert out.count("2024-01-11") == 1
+        # The untouched neighbour C survives byte-for-byte.
+        assert (
+            '2024-01-12 * "C" "orig"\n'
+            "  Assets:B:SPK   -3.00 EUR\n"
+            "  Expenses:OldC   3.00 EUR\n"
+        ) in out

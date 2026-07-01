@@ -996,3 +996,133 @@ class TestSpliceEntries:
         splice_entries([(2, 2, "REPLACED")], target)
         # Backup is cleaned up on success.
         assert not target.with_suffix(target.suffix + ".bak").exists()
+
+
+# ── writer: splice-target guard ──────────────────────────────────────────────
+
+class TestApplyUpdateTargetGuard:
+    """`apply_update` must refuse to splice when `line_start` no longer points
+    at the entry's own header line. Stale coordinates (e.g. after an earlier
+    splice shifted the file) would otherwise silently rewrite whatever
+    innocent transaction sits there — the 2024 ledger-corruption incident.
+    """
+
+    PROPOSAL = CategoryProposal(
+        action="categorize", postings=(Posting(account="Expenses:New"),)
+    )
+
+    def _ledger(self, tmp_path: Path) -> Path:
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-01-15 * "Netflix" "Old"\n'
+            "  Assets:B:SPK   -15.99 EUR\n"
+            "  Expenses:Old    15.99 EUR\n"
+            "\n"
+            '2024-01-20 * "Rewe" "Food"\n'
+            "  Assets:B:SPK   -42.50 EUR\n"
+            "  Expenses:Food   42.50 EUR\n"
+        )
+        return f
+
+    def _entry(self, f: Path, line_start: int) -> LedgerEntry:
+        return LedgerEntry(
+            date=date(2024, 1, 15),
+            payee="Netflix",
+            narration="Old",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Old",
+            amount=Decimal("-15.99"),
+            line_start=line_start,
+            file_path=str(f),
+        )
+
+    def test_line_start_on_wrong_transaction_raises_untouched(self, tmp_path: Path):
+        # line 5 is the Rewe header — a date line, but the wrong date. This is
+        # exactly the shape stale coordinates produce after an earlier splice.
+        f = self._ledger(tmp_path)
+        original = f.read_text()
+        with pytest.raises(ValueError, match="mismatch"):
+            apply_update(self._entry(f, 5), self.PROPOSAL, "Assets:B:SPK")
+        assert f.read_text() == original
+
+    def test_line_start_on_posting_line_raises_untouched(self, tmp_path: Path):
+        f = self._ledger(tmp_path)
+        original = f.read_text()
+        with pytest.raises(ValueError, match="mismatch"):
+            apply_update(self._entry(f, 2), self.PROPOSAL, "Assets:B:SPK")
+        assert f.read_text() == original
+
+    def test_line_start_beyond_eof_raises_untouched(self, tmp_path: Path):
+        f = self._ledger(tmp_path)
+        original = f.read_text()
+        with pytest.raises(ValueError, match="mismatch"):
+            apply_update(self._entry(f, 99), self.PROPOSAL, "Assets:B:SPK")
+        assert f.read_text() == original
+
+    def test_correct_line_start_still_splices(self, tmp_path: Path):
+        f = self._ledger(tmp_path)
+        apply_update(self._entry(f, 1), self.PROPOSAL, "Assets:B:SPK")
+        out = f.read_text()
+        assert "Expenses:New" in out
+        assert 'Rewe' in out  # neighbour untouched
+
+
+# ── links: reader → model → writer round-trip ────────────────────────────────
+
+class TestLinksRoundTrip:
+    """Transaction `^links` (e.g. the `^xfer-...` pair binding both legs of a
+    cross-bank transfer) must survive an update rewrite. Previously
+    `format_transaction` had no links parameter, so every splice silently
+    dropped them.
+    """
+
+    def test_reader_extracts_links_sorted(self, tmp_path: Path):
+        f = tmp_path / "l.bean"
+        f.write_text(
+            '2024-05-15 * "Steam" "game" ^xfer-b ^xfer-a\n'
+            "  Assets:B:SPK    -33.82 EUR\n"
+            "  Assets:B:PayPal  33.82 EUR\n"
+        )
+        entries = read_ledger(f, "Assets:B:SPK")
+        assert entries[0].links == ("xfer-a", "xfer-b")
+
+    def test_format_transaction_renders_links_after_tags(self):
+        text = format_transaction(
+            date_str="2024-05-15",
+            flag="*",
+            payee="Steam",
+            narration="game",
+            postings=[("Assets:B:SPK", "-33.82 EUR"), ("Assets:B:PayPal", None)],
+            tags=("t",),
+            links=("xfer-a",),
+        )
+        assert text.splitlines()[0] == '2024-05-15 * "Steam" "game" #t ^xfer-a'
+
+    def test_format_transaction_normalizes_stray_leading_caret(self):
+        text = format_transaction(
+            date_str="2024-05-15",
+            flag="*",
+            payee=None,
+            narration="game",
+            postings=[("Assets:B:SPK", "-33.82 EUR")],
+            links=("^xfer-a", ""),
+        )
+        header = text.splitlines()[0]
+        assert header.endswith(" ^xfer-a")
+        assert "^^" not in header
+
+    def test_apply_update_preserves_links(self, tmp_path: Path):
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-05-15 * "Steam" "game" ^xfer-1\n'
+            "  Assets:B:SPK    -33.82 EUR\n"
+            "  Expenses:Old     33.82 EUR\n"
+        )
+        entry = read_ledger(f, "Assets:B:SPK")[0]
+        proposal = CategoryProposal(
+            action="categorize", postings=(Posting(account="Expenses:Games"),)
+        )
+        apply_update(entry, proposal, "Assets:B:SPK")
+        out = f.read_text()
+        assert "^xfer-1" in out.splitlines()[0]
+        assert "Expenses:Games" in out
