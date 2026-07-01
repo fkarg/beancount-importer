@@ -204,6 +204,64 @@ class TestDecisionLogRecord:
         assert reloaded.lookup(txn) is not None
 
 
+class TestDecisionLogSelfClean:
+    def _seed(self, log_path: Path, sepa: str = "X", target: str = "Expenses:Old"):
+        log = DecisionLog(log_path)
+        txn = make_txn(sepa_reference=sepa)
+        log.record(txn, make_result(txn, proposal=make_proposal(target)))
+        log.flush()
+        return txn
+
+    def test_rule_supersedes_and_drops_decision(self, tmp_path: Path):
+        log_path = tmp_path / "decisions.jsonl"
+        txn = self._seed(log_path)
+        log = DecisionLog(log_path)
+        assert log.lookup(txn) is not None
+        rule = CategorizationRule(target_account="Expenses:Ruled")
+        log.record(txn, make_result(txn, rule_matched=rule))
+        assert log.lookup(txn) is None  # dropped in-session
+        log.flush()
+        assert DecisionLog(log_path).lookup(txn) is None  # gone from file
+
+    def test_dedup_supersedes_decision(self, tmp_path: Path):
+        log_path = tmp_path / "decisions.jsonl"
+        txn = self._seed(log_path)
+        log = DecisionLog(log_path)
+        dedup = ImportResult(
+            source_txn=txn, action="skip", proposal=None, skip_reason="duplicate"
+        )
+        log.record(txn, dedup)
+        log.flush()
+        assert DecisionLog(log_path).lookup(txn) is None
+
+    def test_placeholder_supersedes_decision(self, tmp_path: Path):
+        log_path = tmp_path / "decisions.jsonl"
+        txn = self._seed(log_path)
+        log = DecisionLog(log_path)
+        log.record(txn, make_result(txn, proposal=make_proposal("Expenses:Unknown")))
+        log.flush()
+        assert DecisionLog(log_path).lookup(txn) is None
+
+    def test_user_skip_keeps_decision(self, tmp_path: Path):
+        log_path = tmp_path / "decisions.jsonl"
+        txn = self._seed(log_path)
+        log = DecisionLog(log_path)
+        skip = ImportResult(
+            source_txn=txn, action="skip", proposal=None, skip_reason="user_skipped"
+        )
+        log.record(txn, skip)
+        log.flush()
+        assert DecisionLog(log_path).lookup(txn) is not None  # left alone
+
+    def test_flush_is_noop_when_nothing_changed(self, tmp_path: Path):
+        log_path = tmp_path / "decisions.jsonl"
+        self._seed(log_path)
+        content = log_path.read_text()
+        log = DecisionLog(log_path)
+        assert log.flush() == 0  # no pending, no superseded
+        assert log_path.read_text() == content
+
+
 # ── DecisionLog: persistence and corruption tolerance ────────────────────────
 
 class TestDecisionLogPersistence:

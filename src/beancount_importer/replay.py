@@ -131,9 +131,12 @@ class DecisionLog:
         self.session_id = session_id or _new_session_id()
         self.placeholder_account = placeholder_account
         self._index: dict[str, CategoryProposal] = {}
-        # Records accumulated during the run. `flush()` writes them; Ctrl+C
-        # just drops the buffer.
+        # Full loaded records (keyed by signature) — kept so `flush()` can
+        # rewrite the file, dropping decisions superseded this run.
+        self._records: dict[str, dict[str, Any]] = {}
+        # New one-off records this run, and keys to drop on the next flush.
         self._pending: list[dict[str, Any]] = []
+        self._superseded: set[str] = set()
         if path is not None and path.exists():
             self._load()
 
@@ -148,15 +151,11 @@ class DecisionLog:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue  # ignore corrupt lines rather than fail the whole import
-                sig = entry.get("sig", {})
-                key = (
-                    f"sepa:{sig['sepa_ref']}"
-                    if sig.get("sepa_ref")
-                    else f"hash:{sig.get('hash', '')}"
-                )
                 decision = entry.get("decision")
                 if decision is None:
                     continue
+                key = _record_key(entry.get("sig", {}))
+                self._records[key] = entry  # last line wins (dedups the file)
                 self._index[key] = _deserialize_proposal(decision)
 
     def lookup(self, txn: SourceTransaction) -> CategoryProposal | None:
@@ -187,61 +186,104 @@ class DecisionLog:
         next run replay the same outcome without re-running the
         scorer or prompting again.
 
-        The in-memory `_index` is updated immediately so subsequent
-        `lookup()` calls within the same run see the new decision.
-        Only the disk write is deferred until `flush()`.
+        Also self-cleans: if a stored decision exists for this txn but the txn
+        is now handled by the ledger (dedup), a cross-source match, or a rule
+        — or was reset to the placeholder — that stored decision is superseded
+        and dropped on the next `flush()`.
+
+        The in-memory `_index` is updated immediately so subsequent `lookup()`
+        calls within the same run see the change. Disk write is deferred to
+        `flush()`.
         """
-        if self.path is None or result.proposal is None:
+        if self.path is None:
             return
-        if result.is_replay or result.action in ("skip", "quit"):
+        key = make_decision_signature(txn).as_key()
+        if result.is_replay:
+            return  # the decision was used — keep it
+        if _is_one_off(result, self.placeholder_account):
+            assert result.proposal is not None
+            sig = make_decision_signature(txn)
+            self._pending.append({
+                "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "session": self.session_id,
+                "bank": txn.bank_key,
+                # Human-readable context so decisions.jsonl can be scanned and
+                # hand-edited; ignored on load (matching keys off `sig`).
+                "date": txn.booking_date.isoformat(),
+                "payee": txn.payee or txn.description or "",
+                "amount": str(txn.amount),
+                "target": result.proposal.target_account,
+                "sig": {"sepa_ref": sig.sepa_ref, "hash": sig.content_hash},
+                "decision": _serialize_proposal(result.proposal),
+            })
+            self._index[key] = result.proposal
+            self._superseded.discard(key)
             return
-        # A rule (matched or created) is the durable record; a per-txn replay
-        # decision would only shadow it. And a placeholder is "not decided yet".
-        if result.rule_matched is not None or result.new_rule is not None:
-            return
-        if result.proposal.target_account == self.placeholder_account:
-            return
-
-        sig = make_decision_signature(txn)
-        record = {
-            "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "session": self.session_id,
-            "bank": txn.bank_key,
-            # Human-readable context so decisions.jsonl can be scanned and
-            # hand-edited; ignored on load (matching keys off `sig`).
-            "date": txn.booking_date.isoformat(),
-            "payee": txn.payee or txn.description or "",
-            "amount": str(txn.amount),
-            "target": result.proposal.target_account,
-            "sig": {"sepa_ref": sig.sepa_ref, "hash": sig.content_hash},
-            "decision": _serialize_proposal(result.proposal),
-        }
-
-        self._pending.append(record)
-        self._index[sig.as_key()] = result.proposal
+        if key in self._index and _supersedes_decision(result, self.placeholder_account):
+            self._index.pop(key, None)
+            self._superseded.add(key)
 
     def flush(self) -> int:
-        """Persist all pending records to the JSONL. Returns the count.
+        """Rewrite the JSONL: loaded records minus superseded, plus new ones.
 
-        Called by the CLI when the user signals the session was a
-        success (natural completion or `[q] quit`). On Ctrl+C, the
-        caller skips this — `_pending` falls away with the process,
-        so no rollback step is needed.
+        Returns the count of new one-offs recorded this run. Called by the CLI
+        on a successful session (natural completion or `[q] quit`); on Ctrl+C
+        the caller skips it, so the buffered changes fall away with the process.
 
-        Append-only with fsync per batch. A single fsync amortises
-        the durability cost across the whole session.
+        Rewrite (not append) so superseded decisions can be dropped and
+        duplicate signatures collapsed. The file is left untouched when nothing
+        changed, so a no-op run produces no spurious diff.
         """
-        if self.path is None or not self._pending:
+        if self.path is None or (not self._pending and not self._superseded):
             return 0
+        merged = {
+            k: rec for k, rec in self._records.items() if k not in self._superseded
+        }
+        for rec in self._pending:
+            merged[_record_key(rec["sig"])] = rec  # new wins, keeps stable order
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        count = len(self._pending)
-        with self.path.open("a", encoding="utf-8") as fh:
-            for record in self._pending:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with self.path.open("w", encoding="utf-8") as fh:
+            for rec in merged.values():
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
+        count = len(self._pending)
+        self._records = merged
         self._pending.clear()
+        self._superseded.clear()
         return count
+
+
+def _record_key(sig: dict[str, Any]) -> str:
+    return (
+        f"sepa:{sig['sepa_ref']}"
+        if sig.get("sepa_ref")
+        else f"hash:{sig.get('hash', '')}"
+    )
+
+
+def _is_one_off(result: ImportResult, placeholder_account: str) -> bool:
+    """A genuine one-off worth persisting: a real category the user chose for
+    this specific txn, with no rule involved and not a placeholder."""
+    if result.proposal is None or result.action in ("skip", "quit"):
+        return False
+    if result.rule_matched is not None or result.new_rule is not None:
+        return False
+    return result.proposal.target_account != placeholder_account
+
+
+def _supersedes_decision(result: ImportResult, placeholder_account: str) -> bool:
+    """Whether this outcome makes a stored decision obsolete — the txn is now
+    handled authoritatively by the ledger, a cross-source match, or a rule, or
+    was reset to the placeholder. A plain user skip/quit leaves it alone."""
+    if result.rule_matched is not None or result.new_rule is not None:
+        return True
+    if result.skip_reason in ("duplicate", "cross_source_match"):
+        return True
+    return (
+        result.proposal is not None
+        and result.proposal.target_account == placeholder_account
+    )
 
 
 def _new_session_id() -> str:
