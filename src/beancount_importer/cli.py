@@ -379,7 +379,11 @@ def main(
     tags_path = base_dir / config.tag_state_file
 
     rules = tuple(load_rules(rules_path))
-    decisions = DecisionLog(None) if preview else DecisionLog(decisions_path)
+    decisions = (
+        DecisionLog(None)
+        if preview
+        else DecisionLog(decisions_path, placeholder_account=config.placeholder_account)
+    )
     tag_state = _load_tag_state(tags_path)
 
     if year_filter:

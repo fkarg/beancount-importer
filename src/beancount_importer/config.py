@@ -166,6 +166,10 @@ class Config(BaseModel):
     tag_state_file: str = ".beancount-importer/tag_state.json"
     documents_dir: str = "documents"
     transactions_dir: str = "transactions"
+    # The "haven't decided yet" account. Decisions landing here are placeholders
+    # and are never recorded to the replay log (nor would they be worth
+    # replaying over a later rule).
+    placeholder_account: str = "Expenses:Unknown"
     # When true, a successful (non-dry-run) import commits the files it owns
     # — rules, decisions, tag state, and the written ledger — in the finances
     # root. Opt-in; the `--commit/--no-commit` CLI flag overrides it per run.

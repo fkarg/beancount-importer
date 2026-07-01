@@ -121,9 +121,15 @@ class DecisionLog:
     `path=None` produces a no-op log (useful for tests that don't care).
     """
 
-    def __init__(self, path: Path | None, session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None,
+        session_id: str | None = None,
+        placeholder_account: str = "Expenses:Unknown",
+    ) -> None:
         self.path = path
         self.session_id = session_id or _new_session_id()
+        self.placeholder_account = placeholder_account
         self._index: dict[str, CategoryProposal] = {}
         # Records accumulated during the run. `flush()` writes them; Ctrl+C
         # just drops the buffer.
@@ -169,8 +175,10 @@ class DecisionLog:
           (`user_skipped`, `user_blocked`) flow through `_apply_merge_decision`
           which already clears `proposal`, so they're caught by the
           `proposal is None` guard above.
-        - rule-driven decisions where the user didn't ask to save as a rule
-          (the rule itself is the persistent record; replaying would shadow it)
+        - any rule-involved decision (matched or newly created) — the rule is
+          the durable record; a replay entry would only shadow it
+        - placeholder decisions (target == the configured placeholder account),
+          which are "not decided yet", not one-offs worth persisting
 
         Silent-match updates (`update` action with no proposed_changes)
         ARE recorded — the seed-silent-skip path produced a proposal
@@ -187,7 +195,11 @@ class DecisionLog:
             return
         if result.is_replay or result.action in ("skip", "quit"):
             return
-        if result.rule_matched is not None and result.new_rule is None:
+        # A rule (matched or created) is the durable record; a per-txn replay
+        # decision would only shadow it. And a placeholder is "not decided yet".
+        if result.rule_matched is not None or result.new_rule is not None:
+            return
+        if result.proposal.target_account == self.placeholder_account:
             return
 
         sig = make_decision_signature(txn)
@@ -195,6 +207,12 @@ class DecisionLog:
             "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "session": self.session_id,
             "bank": txn.bank_key,
+            # Human-readable context so decisions.jsonl can be scanned and
+            # hand-edited; ignored on load (matching keys off `sig`).
+            "date": txn.booking_date.isoformat(),
+            "payee": txn.payee or txn.description or "",
+            "amount": str(txn.amount),
+            "target": result.proposal.target_account,
             "sig": {"sepa_ref": sig.sepa_ref, "hash": sig.content_hash},
             "decision": _serialize_proposal(result.proposal),
         }

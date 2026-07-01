@@ -137,16 +137,23 @@ class TestDecisionLogRecord:
         log.record(txn, make_result(txn, rule_matched=rule))
         assert log.lookup(txn) is None
 
-    def test_records_new_rule_creation(self, tmp_path: Path):
-        log_path = tmp_path / "decisions.jsonl"
-        log = DecisionLog(log_path)
+    def test_skips_rule_creation(self, tmp_path: Path):
+        # Creating a rule makes the rule the durable record — don't also freeze
+        # a per-txn replay decision that would shadow it.
+        log = DecisionLog(tmp_path / "decisions.jsonl")
         txn = make_txn(sepa_reference="X")
         rule = CategorizationRule(target_account="Expenses:Auto")
-        # rule_matched + new_rule both set: the user accepted a rule match AND
-        # asked to save it as a (new/updated) rule. We DO record this so re-imports
-        # can replay the choice even if rules.json is later deleted.
-        log.record(txn, make_result(txn, rule_matched=rule, new_rule=rule))
-        assert log.lookup(txn) is not None
+        log.record(txn, make_result(txn, new_rule=rule))
+        assert log.lookup(txn) is None
+
+    def test_skips_placeholder_target(self, tmp_path: Path):
+        # "Haven't decided yet" (the placeholder account) is not a real one-off.
+        log = DecisionLog(tmp_path / "decisions.jsonl")
+        txn = make_txn(sepa_reference="X")
+        log.record(
+            txn, make_result(txn, proposal=make_proposal(account="Expenses:Unknown"))
+        )
+        assert log.lookup(txn) is None
 
     def test_records_manual_decision(self, tmp_path: Path):
         log_path = tmp_path / "decisions.jsonl"
@@ -154,6 +161,20 @@ class TestDecisionLogRecord:
         txn = make_txn(sepa_reference="X")
         log.record(txn, make_result(txn))
         assert log.lookup(txn) is not None
+
+    def test_recorded_line_carries_human_readable_context(self, tmp_path: Path):
+        log_path = tmp_path / "decisions.jsonl"
+        log = DecisionLog(log_path)
+        txn = make_txn(sepa_reference="X", payee="Netflix")
+        log.record(txn, make_result(txn, proposal=make_proposal("Expenses:Streaming")))
+        log.flush()
+        import json
+
+        rec = json.loads(log_path.read_text().splitlines()[0])
+        assert rec["payee"] == "Netflix"
+        assert rec["date"] == "2024-01-15"
+        assert rec["amount"] == "-15.99"
+        assert rec["target"] == "Expenses:Streaming"
 
     def test_records_silent_match_update(self, tmp_path: Path):
         # `update` action with no proposed_changes — seed-silent-skip
