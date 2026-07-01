@@ -4,7 +4,7 @@ A matcher inspects a CSV row against the union of CSV rows across banks plus
 existing ledger entries, and emits a `MatchOutcome` (or None) when it finds
 that the row is already accounted for elsewhere.
 
-Two outcome kinds today:
+Three outcome kinds today:
 
 - `skip`: the row is a duplicate of something already booked. The pipeline
   drops it without prompting.
@@ -12,6 +12,10 @@ Two outcome kinds today:
   generic categorizer would pick — e.g. a PayPal-funded SPK debit should
   book to `Assets:B:PayPal`, not the merchant. The pipeline replaces the
   proposal with the matcher-provided account + metadata.
+- `link_placeholder`: the row completes a `via_paypal: TRUE` placeholder
+  entry (`matched_entry` must be set). The pipeline rewrites that entry in
+  place — upgrading the marker to posting-level `paypal: <date>` — and
+  consumes the row without prompting.
 
 Hooks live in modules listed in `MatchingConfig.enabled_matchers`. Each
 module exposes a top-level `hook` object satisfying the `MatcherHook`
@@ -32,7 +36,7 @@ from beancount_importer.models import LedgerEntry, SourceTransaction
 class MatchOutcome(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
-    kind: Literal["skip", "rewrite_target"]
+    kind: Literal["skip", "rewrite_target", "link_placeholder"]
     reason: str
     target_account: str | None = None
     metadata: dict[str, str] = {}

@@ -472,3 +472,95 @@ class TestDefaultMatcherOrder:
         assert outcome is not None
         assert outcome.kind == "skip"
         assert outcome.reason == "settled_via_intermediary"
+
+
+# ── via_paypal placeholder linking ───────────────────────────────────────────
+
+from beancount_importer.matching.via_paypal import hook as via_paypal_hook
+
+
+def _placeholder_entry(**overrides) -> LedgerEntry:
+    defaults = dict(
+        date=date(2024, 4, 15),
+        payee="Penny",
+        narration="PayPal",
+        source_account="Assets:B:SPK",
+        target_account="Expenses:Food:Groceries",
+        amount=Decimal("-7.81"),
+        currency="EUR",
+        metadata={"via_paypal": "True", "sepa_ref": "REF-P"},
+        file_path="SPK.bean",
+        line_start=1,
+    )
+    defaults.update(overrides)
+    return LedgerEntry(**defaults)
+
+
+def _paypal_purchase(**overrides) -> SourceTransaction:
+    defaults = dict(
+        booking_date=date(2024, 4, 13),
+        amount=Decimal("-7.81"),
+        currency="EUR",
+        payee="Penny Markt",
+        description="Penny Markt",
+        bank_key="paypal",
+    )
+    defaults.update(overrides)
+    return SourceTransaction(**defaults)
+
+
+class TestViaPaypalMatcher:
+    """Pairs a PayPal CSV row with a `via_paypal: TRUE` placeholder entry:
+    exact signed amount, same currency, booking dates within 7 days, text
+    floor, unique candidate. Emits `link_placeholder` carrying the entry.
+    """
+
+    def test_links_placeholder(self):
+        entry = _placeholder_entry()
+        outcome = via_paypal_hook.match(_paypal_purchase(), {}, [entry])
+        assert outcome is not None
+        assert outcome.kind == "link_placeholder"
+        assert outcome.matched_entry is entry
+
+    def test_marker_value_case_insensitive(self):
+        # Old-importer files carry bare `TRUE` (bool → str "True" via the
+        # reader); hand-written ones may carry the string "TRUE".
+        entry = _placeholder_entry(metadata={"via_paypal": "TRUE"})
+        outcome = via_paypal_hook.match(_paypal_purchase(), {}, [entry])
+        assert outcome is not None
+
+    def test_no_marker_no_match(self):
+        entry = _placeholder_entry(metadata={"sepa_ref": "REF-P"})
+        assert via_paypal_hook.match(_paypal_purchase(), {}, [entry]) is None
+
+    def test_sign_must_match_exactly(self):
+        # A +7.81 deposit row must not link a -7.81 purchase placeholder.
+        txn = _paypal_purchase(amount=Decimal("7.81"))
+        assert via_paypal_hook.match(txn, {}, [_placeholder_entry()]) is None
+
+    def test_date_window_seven_days(self):
+        txn = _paypal_purchase(booking_date=date(2024, 4, 4))
+        assert via_paypal_hook.match(txn, {}, [_placeholder_entry()]) is None
+        txn = _paypal_purchase(booking_date=date(2024, 4, 8))
+        assert via_paypal_hook.match(txn, {}, [_placeholder_entry()]) is not None
+
+    def test_text_floor_blocks_coincidence(self):
+        txn = _paypal_purchase(payee="Zzqx", description="Zzqx")
+        assert via_paypal_hook.match(txn, {}, [_placeholder_entry()]) is None
+
+    def test_empty_txn_text_abstains(self):
+        txn = _paypal_purchase(payee=None, description=None)
+        assert via_paypal_hook.match(txn, {}, [_placeholder_entry()]) is None
+
+    def test_ambiguous_candidates_abstain(self):
+        e1 = _placeholder_entry()
+        e2 = _placeholder_entry(date=date(2024, 4, 16))
+        assert via_paypal_hook.match(_paypal_purchase(), {}, [e1, e2]) is None
+
+    def test_multi_posting_placeholder_abstains(self):
+        entry = _placeholder_entry(has_multiple_postings=True)
+        assert via_paypal_hook.match(_paypal_purchase(), {}, [entry]) is None
+
+    def test_currency_must_match(self):
+        entry = _placeholder_entry(currency="USD")
+        assert via_paypal_hook.match(_paypal_purchase(), {}, [entry]) is None

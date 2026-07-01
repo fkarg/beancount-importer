@@ -133,6 +133,12 @@ class ImportResult(BaseModel):
     proposal: CategoryProposal | None = None
     rule_matched: CategorizationRule | None = None
     is_replay: bool = False
+    # True when a cross-source matcher produced this update directly (e.g.
+    # the via_paypal placeholder link). Matcher-derived updates render
+    # collapse-style (proposal postings verbatim), are never recorded as
+    # replay one-offs (the matcher re-derives them deterministically), and
+    # supersede any stale stored decision for the row.
+    matcher_link: bool = False
     new_rule: CategorizationRule | None = None
     # When `new_rule` replaces an existing rule (edited via `[r]`), the original
     # to swap out in the persisted rules; None means append `new_rule`.

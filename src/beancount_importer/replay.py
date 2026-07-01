@@ -269,6 +269,11 @@ def _is_one_off(result: ImportResult, placeholder_account: str) -> bool:
         return False
     if result.rule_matched is not None or result.new_rule is not None:
         return False
+    if result.matcher_link:
+        # Matcher-derived link, re-derived deterministically each run; a
+        # replayed copy would re-materialize with no candidate entry and
+        # append its collapse-shaped proposal as a malformed new entry.
+        return False
     return result.proposal.target_account != placeholder_account
 
 
@@ -279,6 +284,10 @@ def _supersedes_decision(result: ImportResult, placeholder_account: str) -> bool
     if result.rule_matched is not None or result.new_rule is not None:
         return True
     if result.skip_reason in ("duplicate", "cross_source_match"):
+        return True
+    if result.matcher_link:
+        # The row is now settlement evidence for a placeholder — any older
+        # one-off categorization of it is obsolete.
         return True
     return (
         result.proposal is not None

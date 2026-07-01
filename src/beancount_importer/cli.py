@@ -699,9 +699,11 @@ def _persist_results(
                     r.matched_entry,
                     r.proposal,
                     bank_cfg.account,
-                    # Inferred (transit-leg) matches only ever carry
-                    # collapse-shaped proposals — see `_propose_collapse`.
-                    collapse=r.matched_entry.amount_inferred,
+                    # Inferred (transit-leg) matches and matcher links only
+                    # ever carry collapse-shaped proposals with the complete
+                    # posting list — see `_propose_collapse` and
+                    # `_link_placeholder_result`.
+                    collapse=r.matched_entry.amount_inferred or r.matcher_link,
                     dry_run=dry_run,
                     narration_max_length=config.narration_max_length,
                 )

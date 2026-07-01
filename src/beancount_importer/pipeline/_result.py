@@ -101,7 +101,13 @@ def _build_result(
             proposed_changes = []
     else:
         new_entry_text = _format_new_entry(
-            bank, txn, proposal, narration_max_length=narration_max_length
+            bank,
+            txn,
+            proposal,
+            narration_max_length=narration_max_length,
+            bank_posting_metadata=_via_paypal_marker(
+                txn, bank, proposal, paypal_account
+            ),
         )
 
     return ImportResult(
@@ -201,6 +207,71 @@ def _fold_inflight_date_hint(
     )
     return origin.model_copy(
         update={"proposal": amended, "new_entry_text": new_text}
+    )
+
+
+def _via_paypal_marker(
+    txn: SourceTransaction,
+    bank: BankConfig,
+    proposal: CategoryProposal,
+    paypal_account: str | None,
+) -> dict[str, str]:
+    """Bank-leg metadata for a new entry: `via_paypal: TRUE` when the row is
+    PayPal-funded but couldn't be paired this run.
+
+    A PayPal-funded row categorized straight to an expense has no PayPal-side
+    date yet (the PayPal CSV wasn't in the run — otherwise the paypal matcher
+    would have rewritten it to a transfer). The marker makes the entry
+    discoverable by the via_paypal matcher on a later PayPal import, which
+    upgrades it to `paypal: <date>`. Only funding-bank rows qualify — a row
+    on the PayPal bank itself mentions PayPal by definition — and only
+    direct Expenses:/Income: categorizations; transfer targets mean the flow
+    is already represented explicitly.
+    """
+    if paypal_account is None or bank.account == paypal_account:
+        return {}
+    text = f"{txn.payee or ''} {txn.description or ''}".lower()
+    if "paypal" not in text:
+        return {}
+    if not proposal.target_account.startswith(("Expenses:", "Income:")):
+        return {}
+    return {"via_paypal": "TRUE"}
+
+
+def _link_placeholder_result(
+    txn: SourceTransaction, entry: LedgerEntry
+) -> ImportResult:
+    """Build the update that upgrades a `via_paypal: TRUE` placeholder.
+
+    The proposal carries the complete posting list (collapse-style render):
+    the placeholder's own bank leg with `paypal: <CSV date>` replacing the
+    marker, plus its existing expense leg. Payee/narration/tags/links/other
+    metadata survive via `apply_update`'s entry-side merge; the writer drops
+    the served marker in collapse mode. No prompt: the categorization
+    already happened when the placeholder was written.
+    """
+    pp_date = (txn.value_date or txn.booking_date).isoformat()
+    proposal = CategoryProposal(
+        action="categorize",
+        postings=(
+            Posting(
+                account=entry.source_account,
+                amount=entry.amount,
+                currency=entry.currency,
+                metadata={"paypal": pp_date},
+            ),
+            Posting(account=entry.target_account),
+        ),
+    )
+    return ImportResult(
+        source_txn=txn,
+        action="update",
+        matched_entry=entry,
+        proposal=proposal,
+        proposed_changes=[
+            ProposedChange("posting:paypal", "via_paypal: TRUE", pp_date)
+        ],
+        matcher_link=True,
     )
 
 
@@ -452,15 +523,20 @@ def _format_new_entry(
     txn: SourceTransaction,
     proposal: CategoryProposal,
     narration_max_length: int | None = None,
+    bank_posting_metadata: dict[str, str] | None = None,
 ) -> str:
-    """Render a new beancount transaction text from the proposal."""
+    """Render a new beancount transaction text from the proposal.
+
+    `bank_posting_metadata` lands on the bank leg (e.g. the `via_paypal`
+    placeholder marker) — proposal postings only ever describe counter legs.
+    """
     payee = proposal.payee or txn.payee
     narration = proposal.narration or txn.description or ""
 
     postings: list[tuple[str, str | None, dict[str, str]]] = []
     # Source-account leg always carries the explicit amount + currency.
     postings.append(
-        (bank.account, f"{txn.amount} {txn.currency}", {})
+        (bank.account, f"{txn.amount} {txn.currency}", bank_posting_metadata or {})
     )
     # A collapsed foreign-currency purchase (e.g. PayPal's General Currency
     # Conversion bundle) books the home amount on the source leg and prices

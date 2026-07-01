@@ -148,6 +148,7 @@ class MatchingConfig(BaseModel):
     # the first matcher to fire wins. See `matching/registry.py`.
     enabled_matchers: list[str] = [
         "beancount_importer.matching.settled",
+        "beancount_importer.matching.via_paypal",
         "beancount_importer.matching.transfers",
         "beancount_importer.matching.paypal",
     ]

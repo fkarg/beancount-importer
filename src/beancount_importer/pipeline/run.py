@@ -45,8 +45,9 @@ from beancount_importer.pipeline._proposal import (
 )
 from beancount_importer.pipeline._result import (
     _build_result,
-    _synthesize_counter_leg,
     _fold_inflight_date_hint,
+    _link_placeholder_result,
+    _synthesize_counter_leg,
 )
 from beancount_importer.pipeline._shared import (
     _load_account_chart,
@@ -598,6 +599,19 @@ def _try_matcher(
     outcome = first_outcome(matchers, state.txn, csv_by_bank, existing_all)
     if outcome is None:
         return state
+    if outcome.kind == "link_placeholder":
+        matched = outcome.matched_entry
+        if matched is None or matched.source_account == state.bank.account:
+            # Protocol requires the entry. And a row can never settle a
+            # placeholder on its *own* bank — that shape is the funding row
+            # itself (a re-import that slipped past dedup), not the
+            # PayPal-side purchase; linking it would stamp the bank date as
+            # the PayPal date and pre-settle the flow.
+            return state
+        # The cross-bank gate above means only the global view holds the
+        # placeholder — the row's own bucket can't.
+        existing_all.remove(matched)
+        return _link_placeholder_result(state.txn, matched)
     if outcome.kind == "skip":
         # Shipped matchers always set `matched_entry` on a skip outcome
         # and pull it from `existing_all`; the protocol allows None for

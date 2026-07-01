@@ -1205,3 +1205,75 @@ class TestApplyUpdateCollapse:
                 self._entry(f), proposal, "Assets:B:PayPal", collapse=True
             )
         assert f.read_text() == original
+
+
+# ── writer: via_paypal marker handling ───────────────────────────────────────
+
+class TestViaPaypalRendering:
+    def test_boolean_ish_metadata_rendered_bare(self):
+        # `via_paypal: TRUE` must be a bare beancount boolean, matching the
+        # convention of existing placeholder entries — `"TRUE"` (a string)
+        # would be a different value to beancount. The reader stringifies a
+        # parsed bool as "True", so that spelling normalizes too.
+        text = format_transaction(
+            date_str="2024-04-15",
+            flag="*",
+            payee="Penny",
+            narration="PayPal",
+            postings=[
+                ("Assets:B:SPK", "-7.81 EUR", {"via_paypal": "TRUE"}),
+                ("Expenses:Food", None, {"marker": "True"}),
+            ],
+        )
+        lines = text.splitlines()
+        assert "    via_paypal: TRUE" in lines
+        assert "    marker: TRUE" in lines
+
+    def test_collapse_drops_via_paypal_marker(self, tmp_path: Path):
+        # Rewriting a placeholder (the link upgrade) must not carry the
+        # marker over — it has served its purpose.
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-04-15 * "Penny" "PayPal"\n'
+            "  Assets:B:SPK  -7.81 EUR\n"
+            "    via_paypal: TRUE\n"
+            "  Expenses:Food  7.81 EUR\n"
+        )
+        entry = read_ledger(f, "Assets:B:SPK")[0]
+        assert entry.metadata.get("via_paypal") == "True"
+        proposal = CategoryProposal(
+            action="categorize",
+            postings=(
+                Posting(
+                    account="Assets:B:SPK",
+                    amount=Decimal("-7.81"),
+                    currency="EUR",
+                    metadata={"paypal": "2024-04-13"},
+                ),
+                Posting(account="Expenses:Food"),
+            ),
+        )
+        apply_update(entry, proposal, "Assets:B:PayPal", collapse=True)
+        out = f.read_text()
+        assert "via_paypal" not in out
+        assert "    paypal: 2024-04-13" in out.splitlines()
+
+    def test_standard_update_keeps_marker(self, tmp_path: Path):
+        # Recategorizing a placeholder before it is linked must not lose the
+        # marker — the future PayPal import still needs to find it.
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-04-15 * "Penny" "PayPal"\n'
+            "  Assets:B:SPK  -7.81 EUR\n"
+            "    via_paypal: TRUE\n"
+            "  Expenses:Food  7.81 EUR\n"
+        )
+        entry = read_ledger(f, "Assets:B:SPK")[0]
+        proposal = CategoryProposal(
+            action="categorize",
+            postings=(Posting(account="Expenses:Groceries"),),
+        )
+        apply_update(entry, proposal, "Assets:B:SPK")
+        out = f.read_text()
+        assert "via_paypal: TRUE" in out
+        assert "Expenses:Groceries" in out

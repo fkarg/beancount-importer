@@ -18,6 +18,7 @@ from beancount_importer.config import (
 )
 from beancount_importer.models import (
     CategoryProposal,
+    ImportResult,
     Posting,
 )
 from beancount_importer.pipeline import (
@@ -3743,3 +3744,242 @@ class TestProposeCollapseUnit:
         changes, updated = _propose_collapse(txn, entry, proposal)
         assert changes == []
         assert updated is proposal
+
+
+# ── via_paypal placeholders: marker emission + linking ───────────────────────
+
+
+class TestPipelineViaPaypal:
+    """SPK-side: a PayPal-funded row categorized straight to an expense gets
+    a `via_paypal: TRUE` marker on the bank posting — the "link me later"
+    placeholder. PayPal-side: a purchase row matching a placeholder upgrades
+    the marker to posting-level `paypal: <date>` silently (no prompt) and is
+    consumed; the link is matcher-derived, so it is never recorded as a
+    replay decision and supersedes any stale one.
+    """
+
+    PLACEHOLDER = (
+        '2024-04-15 * "Penny" "PayPal"\n'
+        "  Assets:B:SPK  -7.81 EUR\n"
+        "    via_paypal: TRUE\n"
+        '    sepa_ref: "REF-P"\n'
+        "  Expenses:Food:Groceries  7.81 EUR\n"
+    )
+
+    def _paypal_bank(self) -> BankConfig:
+        return BankConfig(
+            key="paypal",
+            display_name="PayPal",
+            account="Assets:B:PayPal",
+            file_glob="PayPal_*.csv",
+            output_file="transactions/PAYPAL.bean",
+            csv=CsvConfig(
+                delimiter=",",
+                date_format=["%Y-%m-%d"],
+                amount_locale="en",
+                field_date="Date",
+                field_amount="Gross",
+                field_currency="Currency",
+                field_description="Description",
+            ),
+        )
+
+    def _config(self, banks: list[BankConfig]) -> Config:
+        return Config(
+            banks=banks,
+            transactions_dir="transactions",
+            paypal_account="Assets:B:PayPal",
+            matching=MatchingConfig(min_score=0.35),
+        )
+
+    def _run_paypal(self, tmp_path: Path, csv_row: str, categorize, **kwargs):
+        (tmp_path / "transactions").mkdir(exist_ok=True)
+        (tmp_path / "transactions" / "SPK.bean").write_text(self.PLACEHOLDER)
+        (tmp_path / "PayPal_2024.csv").write_text(
+            "Date,Description,Currency,Gross\n" f"{csv_row}\n"
+        )
+        session = ImportSession(
+            config=self._config([self._paypal_bank()]), options=ImportOptions()
+        )
+        return run(session, tmp_path, categorize, NoopReporter(), **kwargs)
+
+    def _err_categorize(self):
+        def _fn(ctx: CategorizeContext) -> CategoryProposal:
+            raise AssertionError("categorize_fn invoked — link must be silent")
+        return _fn
+
+    def test_purchase_row_links_placeholder_without_prompt(self, tmp_path: Path):
+        results = self._run_paypal(
+            tmp_path,
+            "2024-04-13,Penny Markt,EUR,-7.81",
+            self._err_categorize(),
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.action == "update"
+        assert r.matcher_link is True
+        assert r.matched_entry is not None
+        assert r.matched_entry.source_account == "Assets:B:SPK"
+        assert r.proposal is not None
+        assert r.proposal.postings == (
+            Posting(
+                account="Assets:B:SPK",
+                amount=Decimal("-7.81"),
+                currency="EUR",
+                metadata={"paypal": "2024-04-13"},
+            ),
+            Posting(account="Expenses:Food:Groceries"),
+        )
+        assert r.proposed_changes
+
+    def test_link_is_not_recorded_and_supersedes_stale_decision(
+        self, tmp_path: Path
+    ):
+        # Pre-seed a stale one-off decision for the purchase row (as if the
+        # user had categorized it before the placeholder existed).
+        log_path = tmp_path / "decisions.jsonl"
+        seed = DecisionLog(log_path)
+        # Mirror the parsed CSV row exactly (the PayPal CSV maps only a
+        # description, no payee) so the decision signatures line up.
+        txn = SourceTransaction(
+            booking_date=date(2024, 4, 13),
+            amount=Decimal("-7.81"),
+            currency="EUR",
+            description="Penny Markt",
+            bank_key="paypal",
+        )
+        seed.record(
+            txn,
+            ImportResult(
+                source_txn=txn,
+                action="new",
+                proposal=CategoryProposal(
+                    action="categorize",
+                    # A real category — the placeholder account
+                    # (Expenses:Unknown) is deliberately never recorded.
+                    postings=(Posting(account="Expenses:Misc"),),
+                ),
+            ),
+        )
+        seed.flush()
+        assert DecisionLog(log_path).lookup(txn) is not None
+
+        log = DecisionLog(log_path)
+        results = self._run_paypal(
+            tmp_path,
+            "2024-04-13,Penny Markt,EUR,-7.81",
+            self._err_categorize(),
+            decisions=log,
+        )
+        assert results[0].matcher_link is True
+        assert log.flush() == 0  # link itself not recorded as a one-off
+        # The stale decision was superseded — a fresh log no longer finds it.
+        assert DecisionLog(log_path).lookup(txn) is None
+
+    def test_paypal_funded_expense_row_gets_marker(self, tmp_path: Path):
+        # SPK CSV only, no PayPal CSV in the run: the row is PayPal-funded
+        # but has no counterpart to pair with — the written entry carries
+        # the placeholder marker on the bank posting, bare beancount bool.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "SPK_2024.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.04.24;PayPal Europe;PayPal Einkauf Penny Markt 123;-7,81;EUR;REF-P\n"
+        )
+        session = ImportSession(
+            config=self._config([make_spk_bank(year_template_output=False)]),
+            options=ImportOptions(),
+        )
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Food:Groceries"),
+            NoopReporter(),
+        )
+        assert len(results) == 1
+        assert results[0].action == "new"
+        lines = results[0].new_entry_text.splitlines()
+        assert "    via_paypal: TRUE" in lines
+        # Marker sits under the bank leg, before the expense posting.
+        assert lines.index("    via_paypal: TRUE") > lines.index(
+            next(ln for ln in lines if ln.startswith("  Assets:B:SPK"))
+        )
+        assert lines.index("    via_paypal: TRUE") < lines.index(
+            next(ln for ln in lines if ln.startswith("  Expenses:"))
+        )
+
+    def test_transfer_categorization_gets_no_marker(self, tmp_path: Path):
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "SPK_2024.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.04.24;PayPal Europe;PayPal Aufladung;-7,81;EUR;REF-P\n"
+        )
+        session = ImportSession(
+            config=self._config([make_spk_bank(year_template_output=False)]),
+            options=ImportOptions(),
+        )
+        results = run(
+            session, tmp_path, fixed_categorize("Assets:B:PayPal"),
+            NoopReporter(),
+        )
+        assert "via_paypal" not in results[0].new_entry_text
+
+    def test_non_paypal_row_gets_no_marker(self, tmp_path: Path):
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "SPK_2024.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "15.04.24;Netflix;Netflix Abo;-15,99;EUR;NFX\n"
+        )
+        session = ImportSession(
+            config=self._config([make_spk_bank(year_template_output=False)]),
+            options=ImportOptions(),
+        )
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Streaming"),
+            NoopReporter(),
+        )
+        assert "via_paypal" not in results[0].new_entry_text
+
+    def test_paypal_bank_rows_get_no_marker(self, tmp_path: Path):
+        # A row on the PayPal bank itself mentions PayPal by definition —
+        # the marker is only for *funding-bank* rows.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "PayPal_2024.csv").write_text(
+            "Date,Description,Currency,Gross\n"
+            "2024-04-13,PayPal fee,EUR,-1.99\n"
+        )
+        session = ImportSession(
+            config=self._config([self._paypal_bank()]), options=ImportOptions()
+        )
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Fees"), NoopReporter()
+        )
+        assert "via_paypal" not in results[0].new_entry_text
+
+    def test_own_bank_row_cannot_link_its_own_placeholder(self, tmp_path: Path):
+        # A re-imported SPK row that slips past dedup (payee drifted) looks
+        # exactly like its own placeholder: same signed amount, same date,
+        # similar text. Linking it would stamp the *bank* date as the PayPal
+        # date and mark the flow settled before the real PayPal row arrives.
+        # Only rows from another bank may settle a placeholder.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "SPK.bean").write_text(self.PLACEHOLDER)
+        # No Kundenreferenz and a six-day date drift: outside dedup's
+        # 5-day window but inside the via_paypal matcher's 7-day one, so
+        # the row genuinely reaches the matcher phase.
+        (tmp_path / "SPK_2024.csv").write_text(
+            "Buchungstag;Beguenstigter;Verwendungszweck;Betrag;Waehrung;Kundenreferenz\n"
+            "21.04.24;PayPal Europe;PayPal Einkauf Penny Markt 123;-7,81;EUR;\n"
+        )
+        session = ImportSession(
+            config=self._config([make_spk_bank(year_template_output=False)]),
+            options=ImportOptions(),
+        )
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Food:Groceries"),
+            NoopReporter(),
+        )
+        assert len(results) == 1
+        assert results[0].matcher_link is False
+        # Whatever the row becomes, it must not have stamped a paypal date.
+        proposal = results[0].proposal
+        assert proposal is None or all(
+            "paypal" not in p.metadata for p in proposal.postings
+        )

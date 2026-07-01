@@ -128,6 +128,13 @@ def apply_update(
             )
         postings.insert(0, (bank_account, f"{entry.amount} {entry.currency}", {}))
     metadata = {**entry.metadata, **proposal.metadata}
+    if collapse:
+        # A collapse rewrite either upgrades the placeholder marker to
+        # `paypal: <date>` (carried on the proposal's funding leg) or
+        # deliberately supersedes it — the served marker must not resurface
+        # at transaction level. Standard updates keep it: an unlinked
+        # placeholder that gets recategorized still awaits its PayPal row.
+        metadata.pop("via_paypal", None)
     # Migrate the legacy `tag:` metadata written by older versions into a real
     # #tag, so touching an old entry repairs it rather than re-emitting bad data.
     legacy_tag = metadata.pop("tag", None)
@@ -252,13 +259,19 @@ _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _render_meta_value(value: str) -> str:
-    """Render a metadata value: bare for date-shaped values, quoted otherwise.
+    """Render a metadata value: bare for date-shaped and boolean values,
+    quoted otherwise.
 
     beancount parses `settle: 2024-01-17` as a `date` but `settle:
     "2024-01-17"` as a `str`. Date-consuming plugins (settle/actual/paypal)
-    compare against real dates, so an ISO-date value is emitted bare; everything
-    else stays a quoted string.
+    compare against real dates, so an ISO-date value is emitted bare;
+    likewise `via_paypal: TRUE` must be the bare boolean the existing
+    placeholder convention uses (the reader stringifies a parsed bool as
+    "True", so that spelling normalizes back to bare uppercase too).
+    Everything else stays a quoted string.
     """
+    if value in ("TRUE", "True", "FALSE", "False"):
+        return value.upper()
     return value if _ISO_DATE.fullmatch(value) else f'"{value}"'
 
 
