@@ -7,13 +7,14 @@ than re-testing the pipeline. Interactive prompts are sidestepped via
 
 from __future__ import annotations
 
+import json
 import textwrap
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from beancount_importer.cli import app
+from beancount_importer.cli import app, doctor_app
 
 
 CONFIG_TOML = textwrap.dedent("""\
@@ -59,6 +60,38 @@ def project_dir(tmp_path: Path) -> Path:
     (docs / "SPK_jan.csv").write_text(SPK_CSV)
     (tmp_path / "transactions").mkdir()
     return tmp_path
+
+
+class TestRulesDoctor:
+    def _write_rules(self, project_dir: Path, rules: list[dict]) -> None:
+        (project_dir / "rules.json").write_text(json.dumps(rules))
+
+    def test_reports_shadowed_rule(self, project_dir: Path):
+        self._write_rules(project_dir, [
+            {"target_account": "Expenses:Groceries", "payee_pattern": "REWE",
+             "match_mode": "contains"},
+            {"target_account": "Expenses:Groceries", "payee_pattern": "REWE Filiale",
+             "match_mode": "contains"},
+        ])
+        result = CliRunner().invoke(doctor_app, [
+            "--config", str(project_dir / "import_config.toml"),
+            "--root", str(project_dir),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "SHADOWED" in result.output
+        assert "REWE Filiale" in result.output
+
+    def test_reports_clean_when_no_shadows(self, project_dir: Path):
+        self._write_rules(project_dir, [
+            {"target_account": "Expenses:X", "payee_pattern": "AMZN",
+             "match_mode": "contains"},
+        ])
+        result = CliRunner().invoke(doctor_app, [
+            "--config", str(project_dir / "import_config.toml"),
+            "--root", str(project_dir),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "no shadowed rules" in result.output.lower()
 
 
 class TestImportYearPreview:

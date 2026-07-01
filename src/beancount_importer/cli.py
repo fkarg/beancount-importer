@@ -473,6 +473,39 @@ def main(
         _run_ledger_check(config, base_dir, results)
 
 
+# ── Rule doctor ─────────────────────────────────────────────────────────────
+
+# A separate Typer app (own `bean-rules-doctor` entry point) so `bean-import`
+# stays a single-command CLI — adding a subcommand here would force
+# `bean-import main <year>` and break the primary invocation.
+doctor_app = typer.Typer(
+    no_args_is_help=False,
+    add_completion=False,
+    help="Report shadowed/unreachable categorization rules (read-only).",
+)
+
+
+@doctor_app.command()
+def doctor(
+    config_path: Annotated[
+        Path,
+        typer.Option("--config", "-c", help="Path to the importer config TOML"),
+    ] = Path(".beancount-importer/config.toml"),
+    root: Annotated[
+        Path | None,
+        typer.Option("--root", "-R", help="Override the finances root"),
+    ] = None,
+) -> None:
+    """Static hygiene check: which rules an earlier rule makes unreachable."""
+    from beancount_importer.rules.doctor import analyze_rules, format_report
+
+    config = Config.load(config_path)
+    base_dir = _resolve_finances_root(config_path, root)
+    rules = load_rules(base_dir / config.rules_file)
+    for line in format_report(rules, analyze_rules(rules)):
+        console.print(line)
+
+
 # ── Result persistence ────────────────────────────────────────────────────────
 
 
