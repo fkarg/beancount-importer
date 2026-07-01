@@ -436,9 +436,9 @@ def _resolve_rule(state: _TxnState) -> _TxnState:
     written with rule overrides applied, so the txn side has to mirror
     those overrides for the texts to line up. Without this pre-rewrite,
     the second import of a rule-affected row content-hash-mismatches its
-    own previously-written entry and gets re-prompted. Replay still wins
-    over rules — it's a stronger signal — but it short-circuits before
-    we get here.
+    own previously-written entry and gets re-prompted. A matched rule also
+    takes precedence over the replay log (`_try_replay` bows out when
+    `state.rule` is set).
     """
     rule = find_matching_rule(state.txn, list(state.working_rules))
     return state.evolve(rule=rule, match_txn=_apply_rule_overrides(state.txn, rule))
@@ -460,11 +460,12 @@ def _short_circuit(
     txn's terminal outcome), or the (possibly evolved) state if every
     path falls through. The matcher path may evolve state with a
     `matcher_proposal` even when it doesn't short-circuit.
-    """
-    replay = _try_replay(state, decisions=decisions, existing=existing, config=config)
-    if replay is not None:
-        return replay
 
+    Priority is matches > rules > replay: an already-booked row (dedup),
+    cross-source match, or matching rule all take precedence, and the replay
+    log is the lowest-priority fallback — consulted only for a row none of
+    those handle.
+    """
     dedup = _try_dedup(
         state,
         existing=existing,
@@ -477,13 +478,20 @@ def _short_circuit(
     if skip is not None:
         return skip
 
-    return _try_matcher(
+    matched = _try_matcher(
         state,
         matchers=matchers,
         csv_by_bank=csv_by_bank,
         existing=existing,
         existing_all=existing_all,
     )
+    if isinstance(matched, ImportResult):
+        return matched
+
+    replay = _try_replay(matched, decisions=decisions, existing=existing, config=config)
+    if replay is not None:
+        return replay
+    return matched
 
 
 def _try_replay(
@@ -493,7 +501,14 @@ def _try_replay(
     existing: list[LedgerEntry],
     config,
 ) -> ImportResult | None:
-    """If a past decision matches this txn, reproduce its result."""
+    """If a past decision matches this txn, reproduce its result.
+
+    Skipped when a rule matched or a cross-source matcher fired — those are
+    stronger, current signals; replay only fills the gap for a row nothing
+    else claims.
+    """
+    if state.rule is not None or state.matcher_proposal is not None:
+        return None
     replayed = decisions.lookup(state.txn)
     if replayed is None:
         return None

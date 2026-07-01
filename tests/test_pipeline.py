@@ -380,6 +380,39 @@ class TestPipelineReplay:
         assert called == []
         assert all(r.is_replay for r in results if r.action == "new")
 
+    def test_rule_takes_precedence_over_replay(self, base_dir: Path):
+        # Seed replay decisions for all three rows, then add a rule matching
+        # Netflix. On re-run the rule suppresses replay for Netflix (it goes
+        # through categorize), while the ruleless rows still replay.
+        log_path = base_dir / "decisions.jsonl"
+        seed = DecisionLog(log_path)
+        run(
+            make_session(base_dir), base_dir,
+            fixed_categorize("Expenses:From-Replay"), NoopReporter(), decisions=seed,
+        )
+        seed.flush()
+
+        rule = CategorizationRule(
+            target_account="Expenses:Ruled", payee_pattern="Netflix",
+            match_mode="contains",
+        )
+        seen: list[str] = []
+
+        def categ(ctx: CategorizeContext) -> CategoryProposal:
+            seen.append(ctx.txn.payee or "")
+            return CategoryProposal(
+                action="categorize", postings=(Posting(account="Expenses:Prompt"),)
+            )
+
+        results = run(
+            make_session(base_dir, rules=(rule,)), base_dir, categ,
+            NoopReporter(), decisions=DecisionLog(log_path),
+        )
+        netflix = next(r for r in results if r.source_txn.payee == "Netflix")
+        assert "Netflix" in seen  # rule suppressed replay → categorize ran
+        assert netflix.is_replay is False
+        assert "Rewe" not in seen  # no rule → still replayed silently
+
 
 # ── Year filter ──────────────────────────────────────────────────────────────
 
