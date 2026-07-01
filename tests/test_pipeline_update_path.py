@@ -100,6 +100,72 @@ def test_update_action_rewrites_matched_entry(tmp_path: Path, monkeypatch):
     assert "OldPayee" not in rewritten
 
 
+def test_persist_results_isolates_a_failing_write(tmp_path: Path, monkeypatch):
+    """One entry that fails to write must not abort the rest of the batch.
+
+    Previously a single `apply_update` raise (e.g. the `__tolerances__` splice
+    crash) killed the whole loop, so every later good entry was lost too. Now
+    the failure is isolated and surfaced, and the good entries still land.
+    """
+    _stub_bean_check(monkeypatch)
+    # An update whose matched entry points at a missing file → apply_update
+    # raises FileNotFoundError while detecting the entry end.
+    bad_txn = SourceTransaction(
+        booking_date=date(2024, 1, 10),
+        amount=Decimal("-5.00"),
+        currency="EUR",
+        payee="Bad",
+        description="x",
+        bank_key="spk",
+    )
+    bad_entry = LedgerEntry(
+        date=date(2024, 1, 10),
+        payee="Bad",
+        narration="x",
+        source_account="Assets:B:SPK",
+        target_account="Expenses:Unknown",
+        amount=Decimal("-5.00"),
+        currency="EUR",
+        file_path=str(tmp_path / "missing.bean"),
+        line_start=1,
+    )
+    bad = ImportResult(
+        source_txn=bad_txn,
+        action="update",
+        matched_entry=bad_entry,
+        proposed_changes=[ProposedChange("payee", "Bad", "Bad2")],
+        proposal=CategoryProposal(
+            action="categorize",
+            postings=(Posting(account="Expenses:Food"),),
+            payee="Bad2",
+        ),
+    )
+    good_txn = SourceTransaction(
+        booking_date=date(2024, 1, 11),
+        amount=Decimal("-9.00"),
+        currency="EUR",
+        payee="Good",
+        description="y",
+        bank_key="spk",
+    )
+    good = ImportResult(
+        source_txn=good_txn,
+        action="new",
+        new_entry_text=(
+            '2024-01-11 * "Good" "y"\n'
+            "  Assets:B:SPK   -9.00 EUR\n"
+            "  Expenses:Food   9.00 EUR\n"
+        ),
+    )
+
+    failures = _persist_results([bad, good], _spk_config(), tmp_path, dry_run=False)
+
+    # The good entry landed despite the earlier failure.
+    assert "Good" in (tmp_path / "SPK.bean").read_text(encoding="utf-8")
+    # The failure is surfaced, not swallowed.
+    assert [r for r, _exc in failures] == [bad]
+
+
 def test_update_with_empty_changes_is_noop(tmp_path: Path, monkeypatch):
     """A matched entry with no proposed_changes must not rewrite the file."""
     bean_file = tmp_path / "SPK.bean"

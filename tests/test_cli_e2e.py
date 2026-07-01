@@ -26,6 +26,7 @@ import pytest
 from typer.testing import CliRunner
 
 from beancount_importer.cli import app
+from beancount_importer.models import CategoryProposal, Posting
 from beancount_importer.pipeline import MergeDecision
 from scripted import (
     ScriptedCategorizer,
@@ -93,6 +94,46 @@ def _inject(
         "beancount_importer.cli.make_screen_merge_fn",
         lambda _console: merge_fn if merge_fn is not None else None,
     )
+
+
+class TestCrashPreservesDecisions:
+    def test_unexpected_crash_midrun_flushes_decisions_for_replay(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A crash mid-run is NOT a Ctrl+C abandon: the decisions made before the
+        # crash must survive so a re-run replays them (the .bean is derived and
+        # regenerated). Only KeyboardInterrupt drops them.
+        calls: list[str] = []
+
+        def crashing(ctx):
+            calls.append(ctx.txn.payee or "")
+            if len(calls) == 1:
+                return CategoryProposal(
+                    action="categorize",
+                    postings=(Posting(account="Expenses:Streaming"),),
+                    payee=ctx.txn.payee,
+                    narration=ctx.txn.description,
+                )
+            raise RuntimeError("boom mid-run")
+
+        monkeypatch.setattr(
+            "beancount_importer.cli.make_screen_categorizer", lambda _c: crashing
+        )
+        monkeypatch.setattr(
+            "beancount_importer.cli.make_screen_merge_fn", lambda _c: None
+        )
+
+        result = CliRunner().invoke(
+            app, ["2024", "--config", str(project / "import_config.toml")]
+        )
+        # The crash still surfaces (non-zero exit), but the first decision was
+        # persisted before it propagated.
+        assert result.exit_code != 0
+        decisions_file = project / "decisions.jsonl"
+        assert decisions_file.exists()
+        lines = [ln for ln in decisions_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 1
+        assert "Netflix" in lines[0]
 
 
 class TestInteractiveRunWritesLedger:

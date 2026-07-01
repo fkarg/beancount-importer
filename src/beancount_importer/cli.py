@@ -436,6 +436,18 @@ def main(
         )
         console.print(f"\n[yellow]interrupted — no decisions saved{suffix}[/]")
         raise typer.Exit(code=130) from None
+    except Exception:
+        # An unexpected crash mid-run is NOT an abandon (that's Ctrl+C above).
+        # Preserve the user's decisions and rules so a re-run replays them
+        # instead of re-prompting — the .bean is derived and regenerated from
+        # the replay. Then re-raise so the failure still surfaces.
+        if not skip_persist:
+            saved = decisions.flush()
+            _persist_new_rules(results, list(rules), rules_path, dry_run=False)
+            console.print(
+                f"\n[red]run failed — saved {saved} decision(s) for replay[/]"
+            )
+        raise
 
     # Natural completion (or `[q] quit` mid-run, which breaks the loop
     # cleanly inside `run_pipeline`). Flush decisions FIRST so the
@@ -443,7 +455,12 @@ def main(
     # — the original "decisions are durable before .bean" contract.
     if not skip_persist:
         decisions.flush()
-    _persist_results(results, config, base_dir, dry_run=skip_persist)
+    persist_failures = _persist_results(results, config, base_dir, dry_run=skip_persist)
+    for failed, exc in persist_failures:
+        console.print(
+            f"[red]failed to write {failed.source_txn.bank_key} "
+            f"{failed.source_txn.booking_date}: {exc}[/]"
+        )
     _persist_new_rules(results, list(rules), rules_path, dry_run=skip_persist)
     _persist_tag_updates(results, tag_state, tags_path, dry_run=skip_persist)
     if preview:
@@ -505,36 +522,48 @@ def _persist_results(
     base_dir: Path,
     *,
     dry_run: bool,
-) -> None:
+) -> list[tuple[ImportResult, Exception]]:
     """Persist each result to disk: append "new" entries, splice "update" entries.
 
     Entries route by the source transaction's booking year. Skipped/quit
     actions are no-ops. Updates without proposed_changes are silent — the
     matched entry is already correct, no rewrite needed.
+
+    Each write is isolated: a single failing entry (a splice that won't
+    reparse, a missing target file) is collected and returned rather than
+    aborting the batch, so one bad row can't strand every good row after it.
+    The splice itself is atomic (rolls its own file back on parse failure), so
+    continuing past a failure never leaves a half-written file. Returns the
+    `(result, exception)` pairs that failed, for the caller to report.
     """
+    failures: list[tuple[ImportResult, Exception]] = []
     for r in results:
         try:
             bank_cfg = config.bank(r.source_txn.bank_key)
         except KeyError:
             continue
-        if r.action == "new" and r.new_entry_text:
-            out_path = _resolve(
-                base_dir, bank_cfg.output_file, r.source_txn.booking_date.year
-            )
-            append_entry(r.new_entry_text, out_path, dry_run=dry_run)
-        elif (
-            r.action == "update"
-            and r.matched_entry is not None
-            and r.proposal is not None
-            and r.proposed_changes
-        ):
-            apply_update(
-                r.matched_entry,
-                r.proposal,
-                bank_cfg.account,
-                dry_run=dry_run,
-                narration_max_length=config.narration_max_length,
-            )
+        try:
+            if r.action == "new" and r.new_entry_text:
+                out_path = _resolve(
+                    base_dir, bank_cfg.output_file, r.source_txn.booking_date.year
+                )
+                append_entry(r.new_entry_text, out_path, dry_run=dry_run)
+            elif (
+                r.action == "update"
+                and r.matched_entry is not None
+                and r.proposal is not None
+                and r.proposed_changes
+            ):
+                apply_update(
+                    r.matched_entry,
+                    r.proposal,
+                    bank_cfg.account,
+                    dry_run=dry_run,
+                    narration_max_length=config.narration_max_length,
+                )
+        except Exception as exc:  # noqa: BLE001 — isolate one bad write from the batch
+            failures.append((r, exc))
+    return failures
 
 
 def _persist_new_rules(
