@@ -455,7 +455,7 @@ class TestRun:
 
     def test_r_edits_matched_rule_and_flags_replacement(self, monkeypatch):
         # A rule matched this txn → `[r]` edits it and marks it for replacement.
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "s", ""))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "", ""))
         decision = run(_console(), _ctx())  # default matched_rule=_rule()
         assert decision.action == "confirm"
         assert decision.proposal is not None
@@ -465,7 +465,7 @@ class TestRun:
 
     def test_r_creates_new_rule_when_none_matched(self, monkeypatch):
         # No matched rule → `[r]` creates a fresh rule (nothing to replace).
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "s", ""))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "", ""))
         decision = run(_console(), _ctx(matched_rule=None))
         assert decision.proposal is not None
         assert decision.proposal.save_as_rule is True
@@ -473,8 +473,8 @@ class TestRun:
         assert decision.proposal.replaces_rule is None
 
     def test_r_editor_cancel_leaves_proposal_unsaved(self, monkeypatch):
-        # `[r]` then `[c]` cancels the editor — save_as_rule stays off.
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "c", ""))
+        # `[r]` then `[.]` cancels the editor — save_as_rule stays off.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", ".", ""))
         decision = run(_console(), _ctx())
         assert decision.action == "confirm"
         assert decision.proposal is not None
@@ -485,7 +485,7 @@ class TestRun:
         # After saving via the editor, the "Will write" block reflects the
         # pending rule's match field + mode. No matched rule → create path,
         # seeded contains-mode on the txn payee.
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "s", ""))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("r", "", ""))
         console = _console()
         run(console, _ctx(matched_rule=None))
         out = console.export_text()

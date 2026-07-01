@@ -54,7 +54,7 @@ def _scripted(*answers):
 
 class TestDefaults:
     def test_save_builds_rule_from_txn_and_proposal(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
         rule = run(_console(), _txn(), _proposal())
         assert rule is not None
         # Raw payee as a clean contains literal — no regex escapes.
@@ -67,11 +67,11 @@ class TestDefaults:
         assert rule.override_payee == "Amazon"
 
     def test_cancel_returns_none(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("c"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("."))
         assert run(_console(), _txn(), _proposal()) is None
 
     def test_no_payee_defaults_match_to_description(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
         rule = run(_console(), _txn(payee=""), _proposal(payee=None))
         assert rule.payee_pattern == ""
         assert rule.description_pattern == "EREF 123"
@@ -87,7 +87,7 @@ class TestEditExistingRule:
             override_payee="Amazon",
             tag="shopping",
         )
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
         rule = run(_console(), _txn(), _proposal(), existing_rule=existing)
         assert rule.payee_pattern == "AMZN"
         assert rule.target_account == "Expenses:Old"
@@ -103,7 +103,7 @@ class TestEditExistingRule:
             match_any=True,
             match_mode="contains",
         )
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted(""))
         rule = run(_console(), _txn(), _proposal(), existing_rule=existing)
         assert rule.match_any is True
         assert rule.payee_pattern == "REWE"
@@ -115,7 +115,7 @@ class TestEditExistingRule:
             match_mode="contains",
         )
         # [3] edit pattern → "NEW", save. Field stays description.
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("3", "NEW", "s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("3", "NEW", ""))
         rule = run(_console(), _txn(), _proposal(), existing_rule=existing)
         assert rule.description_pattern == "NEW"
         assert rule.payee_pattern == ""
@@ -123,13 +123,13 @@ class TestEditExistingRule:
 
 class TestEditing:
     def test_edit_pattern(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("3", "AMZN", "s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("3", "AMZN", ""))
         rule = run(_console(), _txn(), _proposal())
         assert rule.payee_pattern == "AMZN"
 
     def test_toggle_field_to_description(self, monkeypatch):
         # [1] cycles payee → description; the pattern moves with it.
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("1", "s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("1", ""))
         rule = run(_console(), _txn(), _proposal())
         assert rule.payee_pattern == ""
         assert rule.description_pattern == "AMZN MKTP DE*RT4"
@@ -137,7 +137,7 @@ class TestEditing:
     def test_toggle_field_to_either_sets_match_any(self, monkeypatch):
         # [1] cycles payee → description → either; "either" matches payee OR
         # narration via one rule (match_any), both patterns set to the text.
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("1", "1", "s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("1", "1", ""))
         rule = run(_console(), _txn(), _proposal())
         assert rule.match_any is True
         assert rule.payee_pattern == "AMZN MKTP DE*RT4"
@@ -146,7 +146,7 @@ class TestEditing:
     def test_toggle_mode_to_regex(self, monkeypatch):
         # [2] cycles contains → exact → regex (two presses).
         monkeypatch.setattr(
-            "rich.prompt.Prompt.ask", _scripted("2", "2", "3", "AMZN.*", "s")
+            "rich.prompt.Prompt.ask", _scripted("2", "2", "3", "AMZN.*", "")
         )
         rule = run(_console(), _txn(), _proposal())
         assert rule.match_mode == "regex"
@@ -156,7 +156,7 @@ class TestEditing:
         # regex mode + bad pattern → save is refused, panel stays; fix + save.
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask",
-            _scripted("2", "2", "3", "[bad", "s", "3", "ok", "s"),
+            _scripted("2", "2", "3", "[bad", "", "3", "ok", ""),
         )
         console = _console()
         rule = run(console, _txn(), _proposal())
@@ -165,25 +165,25 @@ class TestEditing:
         assert "invalid" in console.export_text().lower()
 
     def test_edit_rewrite_payee(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("7", "Amazon EU", "s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("p", "Amazon EU", ""))
         rule = run(_console(), _txn(), _proposal(payee="Amazon"))
         assert rule.override_payee == "Amazon EU"
 
     def test_set_tag(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("9", "trip", "s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("t", "trip", ""))
         rule = run(_console(), _txn(), _proposal())
         assert rule.tag == "trip"
 
     def test_set_bank_narrows_from_any(self, monkeypatch):
         # Default is any bank ([4] blank); the user can narrow to one.
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("4", "spk", "s"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("4", "spk", ""))
         rule = run(_console(), _txn(), _proposal())
         assert rule.bank_key == "spk"
 
 
 class TestRender:
     def test_panel_shows_match_and_write_sections(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("c"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("."))
         con = _console()
         run(con, _txn(), _proposal())
         out = con.export_text()
@@ -193,7 +193,7 @@ class TestRender:
 
     def test_sign_renders_glyph_when_set(self, monkeypatch):
         # [5] cycles sign any → debit; the panel shows the − glyph, not "debit".
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("5", "c"))
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("5", "."))
         con = _console()
         run(con, _txn(), _proposal())
         assert "−" in con.export_text()

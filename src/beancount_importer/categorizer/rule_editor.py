@@ -11,8 +11,12 @@ map one-to-one onto `CategorizationRule`:
   "what does it do?".
 
 Defaults come from the current transaction + proposal, so the common case
-("match this payee, book it here") needs a single `[s]`. Scope is
+("match this payee, book it here") needs a single `[enter]`. Scope is
 create-from-proposal only; editing an already-matched rule is separate.
+
+Hotkeys: the MATCH fields are numbered (no natural letters), but the WRITE
+fields reuse Screen 1's letters — `[c]` account, `[p]` payee, `[n]` narration,
+`[t]` tag — so the muscle memory carries over. `[enter]` saves, `[.]` cancels.
 """
 
 from __future__ import annotations
@@ -30,7 +34,9 @@ from beancount_importer.rules.models import CategorizationRule
 _FIELDS: tuple[str, ...] = ("payee", "description", "either")
 _MODES: tuple[str, ...] = ("contains", "exact", "regex")
 _SIGNS: tuple[str, ...] = ("", "debit", "credit")
-_HOTKEYS: tuple[str, ...] = ("1", "2", "3", "4", "5", "6", "7", "8", "9", "s", "c")
+# MATCH fields keep their numbers; WRITE fields use Screen 1's letters. `""`
+# is Enter (save); `"."` cancels — matching the tag menu's control keys.
+_HOTKEYS: tuple[str, ...] = ("1", "2", "3", "4", "5", "c", "p", "n", "t", "", ".")
 
 
 @dataclass
@@ -117,7 +123,10 @@ def _build(draft: _Draft) -> CategorizationRule:
 
 def _render(console: Console, draft: _Draft) -> None:
     console.print()
-    console.print("  [bold]Save as rule[/]  —  edit, then [s] save / [c] cancel")
+    console.print(
+        f"  [bold]Save as rule[/]  —  edit, then {hotkey('enter')} save"
+        f" / {hotkey('.')} cancel"
+    )
     console.print()
     console.print("  [dim]MATCH — when does this fire?[/]")
     console.print(f"   {hotkey('1')} field      {draft.match_field}")
@@ -126,15 +135,15 @@ def _render(console: Console, draft: _Draft) -> None:
     console.print(f"   {hotkey('4')} bank       {draft.bank_key or 'any'}")
     console.print(f"   {hotkey('5')} sign       {_sign_label(draft.amount_sign)}")
     console.print("  [dim]WRITE — what does it do?[/]")
-    console.print(f"   {hotkey('6')} account    {draft.target_account or '—'}")
+    console.print(f"   {hotkey('c')} account    {draft.target_account or '—'}")
     console.print(
-        f"   {hotkey('7')} payee      {draft.override_payee or '(keep original)'}"
+        f"   {hotkey('p')} payee      {draft.override_payee or '(keep original)'}"
     )
     console.print(
-        f"   {hotkey('8')} narration  {draft.override_narration or '(keep original)'}"
+        f"   {hotkey('n')} narration  {draft.override_narration or '(keep original)'}"
     )
-    console.print(f"   {hotkey('9')} tag        {('#' + draft.tag) if draft.tag else '—'}")
-    console.print(f"  {hotkey('s')} save   {hotkey('c')} cancel")
+    console.print(f"   {hotkey('t')} tag        {('#' + draft.tag) if draft.tag else '—'}")
+    console.print(f"  {hotkey('enter')} save   {hotkey('.')} cancel")
     bottom_rule(console)
 
 
@@ -168,9 +177,9 @@ def run(
         key = ask_hotkey(
             _HOTKEYS, console=console, redraw=lambda: _render(console, draft)
         )
-        if key == "c":
+        if key == ".":
             return None
-        if key == "s":
+        if key == "":  # Enter saves
             try:
                 return _build(draft)
             except (ValidationError, ValueError):
@@ -189,15 +198,15 @@ def run(
             draft.bank_key = _edit(console, "bank (empty = any)", draft.bank_key)
         elif key == "5":
             draft.amount_sign = _cycle(_SIGNS, draft.amount_sign)
-        elif key == "6":
+        elif key == "c":
             draft.target_account = _edit(console, "account", draft.target_account)
-        elif key == "7":
+        elif key == "p":
             draft.override_payee = _edit(
                 console, "payee rewrite (empty = keep)", draft.override_payee
             )
-        elif key == "8":
+        elif key == "n":
             draft.override_narration = _edit(
                 console, "narration rewrite (empty = keep)", draft.override_narration
             )
-        else:  # key == "9" (ask_hotkey restricts to _HOTKEYS)
+        else:  # key == "t" (ask_hotkey restricts to _HOTKEYS)
             draft.tag = _edit(console, "tag (empty = none)", draft.tag)
