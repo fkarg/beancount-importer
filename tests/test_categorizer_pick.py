@@ -169,6 +169,18 @@ class TestRun:
         assert decision.action == "pick"
         assert decision.account == "Expenses:WeirdNew"
 
+    def test_w_unknown_account_default_accepts(self, monkeypatch):
+        # You only reach `[w]` because the account wasn't in the list, so
+        # deliberately typing it means you want it — Enter (empty → default)
+        # must accept, not bounce you back.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask",
+            _scripted("w", "Expenses:BrandNew", ""),
+        )
+        decision = run(_console(), _ctx())
+        assert decision.action == "pick"
+        assert decision.account == "Expenses:BrandNew"
+
     def test_w_unknown_account_with_n_loops_back(self, monkeypatch):
         # `n` rejects, which falls back to the hotkey prompt; subsequent
         # `s` resolves the run as a skip.

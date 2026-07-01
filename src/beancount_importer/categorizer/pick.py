@@ -309,14 +309,17 @@ def _write_custom(console: Console, known: tuple[str, ...]) -> str | None:
     if name in known:
         return name
     console.print(
-        f"  [yellow]'{name}' is not in any existing entry yet.[/]"
+        f"  [yellow]'{name}' is not a known account yet.[/]"
     )
+    # Default to yes: the user only reaches `[w]` because the account wasn't in
+    # the list, so typing it is intent enough. The prompt exists to catch a
+    # typo — an explicit `n` backs out; Enter accepts.
     confirm = Prompt.ask(
-        "use anyway?", choices=["y", "n"], default="n", show_choices=False
+        "use anyway?", choices=["y", "n"], default="y", show_choices=True
     ).strip()
-    if confirm == "y":
-        return name
-    return None
+    if confirm == "n":
+        return None
+    return name
 
 
 def _transfer_to_own(
