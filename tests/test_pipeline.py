@@ -3101,6 +3101,60 @@ class TestPaypalNoiseCleaner:
         assert cleaned.payee in ("Spotify", "PayPal")
 
 
+class TestSpkTransferPrefixCleaner:
+    """`clean_spk_transfer_prefix` strips the "DATUM <date>, <time> UHR
+    <TYPE>" transport/narration segment SPK prepends to the Verwendungszweck.
+    The date/time duplicate the booking date and the type duplicates the
+    Buchungstext column, so the whole segment is noise.
+    """
+
+    def _txn(self, *, description: str | None) -> SourceTransaction:
+        return SourceTransaction(
+            booking_date=date(2025, 5, 3),
+            amount=Decimal("-500.00"),
+            currency="EUR",
+            bank_key="spk",
+            payee="Landlord",
+            description=description,
+        )
+
+    def test_strips_full_prefix_leaving_real_narration(self):
+        from beancount_importer.pipeline._clean import clean_spk_transfer_prefix
+        txn = self._txn(
+            description="DATUM 03.05.2025, 02.09 UHR ONLINE-UEBERWEISUNG Miete Mai",
+        )
+        cleaned = clean_spk_transfer_prefix(txn)
+        assert cleaned.description == "Miete Mai"
+
+    def test_strips_prefix_that_is_entire_narration(self):
+        from beancount_importer.pipeline._clean import clean_spk_transfer_prefix
+        txn = self._txn(description="DATUM 03.05.2025, 02.09 UHR ONLINE-UEBERWEISUNG")
+        cleaned = clean_spk_transfer_prefix(txn)
+        assert cleaned.description == ""
+
+    def test_strips_datum_uhr_even_without_known_type(self):
+        from beancount_importer.pipeline._clean import clean_spk_transfer_prefix
+        txn = self._txn(description="DATUM 03.05.2025, 02.09 UHR Rewe Einkauf")
+        cleaned = clean_spk_transfer_prefix(txn)
+        assert cleaned.description == "Rewe Einkauf"
+
+    def test_original_description_preserved_in_raw_data(self):
+        from beancount_importer.pipeline._clean import clean_spk_transfer_prefix
+        original = "DATUM 03.05.2025, 02.09 UHR ONLINE-UEBERWEISUNG Miete Mai"
+        cleaned = clean_spk_transfer_prefix(self._txn(description=original))
+        assert cleaned.raw_data["_original_description"] == original
+
+    def test_non_matching_description_returns_unchanged(self):
+        from beancount_importer.pipeline._clean import clean_spk_transfer_prefix
+        txn = self._txn(description="Rewe SAGT DANKE")
+        assert clean_spk_transfer_prefix(txn) is txn
+
+    def test_none_description_returns_unchanged(self):
+        from beancount_importer.pipeline._clean import clean_spk_transfer_prefix
+        txn = self._txn(description=None)
+        assert clean_spk_transfer_prefix(txn) is txn
+
+
 class TestAcquirerPrefixCleaner:
     """`clean_acquirer_prefix` strips card-acquirer / PSP descriptors
     ("SumUp  *Merchant", "SQ *Merchant", "UZR*Merchant") from the payee,

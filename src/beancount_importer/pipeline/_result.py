@@ -431,11 +431,16 @@ def _foreign_price_str(txn: SourceTransaction) -> str | None:
     foreign amount as a positive magnitude, whereas the generic/N26 parser
     stores a signed raw value (negative for debits). This keeps `@@` rendering
     PayPal-only for now — N26 multi-currency stays as-is until we opt it in.
+
+    `@@` is a cross-currency cost annotation and carries no information when the
+    original and home currencies match — PayPal fills the "Original Currency"
+    column even for same-currency rows — so same-currency is left unpriced.
     """
     if (
         txn.original_amount is None
         or txn.original_currency is None
         or txn.original_amount <= 0
+        or txn.original_currency == txn.currency
     ):
         return None
     foreign = txn.original_amount if txn.amount < 0 else -txn.original_amount

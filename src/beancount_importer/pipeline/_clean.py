@@ -90,6 +90,43 @@ def clean_acquirer_prefix(txn: SourceTransaction) -> SourceTransaction:
     )
 
 
+# Leading "DATUM <date>, <time> UHR <TYPE>" transport segment SPK prepends to
+# the Verwendungszweck of online transfers / standing orders — e.g.
+#   "DATUM 03.05.2025, 02.09 UHR ONLINE-UEBERWEISUNG Miete Mai"
+# The date/time duplicate the booking date and the transaction-type token
+# duplicates the Buchungstext column, so the whole segment is pure narration
+# noise. The type token is optional: if it isn't one we recognise we still drop
+# the "DATUM ... UHR" part but leave the following text as narration.
+_SPK_TRANSFER_PREFIX = re.compile(
+    r"^\s*DATUM\s+\d{2}\.\d{2}\.\d{4},\s*\d{2}\.\d{2}\s+UHR"
+    r"(?:\s+(?:ONLINE[-\s]UEBERWEISUNG|UEBERWEISUNG"
+    r"|DAUERAUFTRAG|FOLGELASTSCHRIFT|LASTSCHRIFT|GUTSCHRIFT))?"
+    r"\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_spk_transfer_prefix(txn: SourceTransaction) -> SourceTransaction:
+    """Strip SPK's "DATUM <date>, <time> UHR <TYPE>" narration prefix.
+
+    Fires only when the description opens with that transport segment. The
+    original description is preserved in `raw_data['_original_description']`.
+    Self-anchoring on the distinctive shape, so it needs no bank gate.
+    """
+    desc = txn.description
+    if not desc:
+        return txn
+    stripped = _SPK_TRANSFER_PREFIX.sub("", desc).strip()
+    if stripped == desc:
+        return txn
+    return txn.model_copy(
+        update={
+            "description": stripped,
+            "raw_data": {**txn.raw_data, "_original_description": desc},
+        }
+    )
+
+
 def _looks_like_paypal(payee: str | None) -> bool:
     return bool(payee) and "paypal" in payee.lower()
 

@@ -68,6 +68,12 @@ class TestForeignPriceStr:
         txn = _foreign_txn().model_copy(update={"original_currency": None})
         assert _foreign_price_str(txn) is None
 
+    def test_none_when_original_currency_matches_home(self):
+        # PayPal fills "Original Currency" even for same-currency rows; a
+        # same-currency `X EUR @@ Y EUR` is meaningless noise.
+        txn = _foreign_txn().model_copy(update={"original_currency": "EUR"})
+        assert _foreign_price_str(txn) is None
+
     def test_none_for_negative_original_amount_n26_convention(self):
         # The generic/N26 parser stores a signed (negative) original amount;
         # that must NOT trigger `@@` — N26 multi-currency stays deferred.
