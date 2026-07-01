@@ -394,7 +394,7 @@ def run(console: Console, ctx: ConfirmContext) -> ConfirmDecision:
             new = Prompt.ask(f"payee [{current}]", default=current)
             proposal = proposal.model_copy(update={"payee": new})
         elif key == "t":
-            delta = run_tag_menu(console, ctx.current_active_tag)
+            delta = run_tag_menu(console, ctx.current_active_tag, ctx.known_tags)
             if delta is not None:
                 proposal = proposal.model_copy(update={"tag_state_delta": delta})
                 # Reflect the pending delta in the next render: the header

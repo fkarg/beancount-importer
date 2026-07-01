@@ -8,16 +8,32 @@ from io import StringIO
 from rich.console import Console
 
 from beancount_importer.categorizer.tag_menu import render, run
-from beancount_importer.rules.tags import ActiveTag
+from beancount_importer.rules.tags import ActiveTag, RememberedTag
 
 
 def _console() -> Console:
     return Console(file=StringIO(), record=True, width=120, emoji=False)
 
 
+# Sentinel: the scripted answer "accept the prompt's pre-filled default",
+# mirroring Rich returning `default` on empty input (which a plain stub can't).
+_USE_DEFAULT = object()
+
+
 def _scripted(*answers):
     it = iter(answers)
-    return lambda *a, **kw: next(it)
+
+    def ask(*a, **kw):
+        ans = next(it)
+        return kw.get("default", "") if ans is _USE_DEFAULT else ans
+
+    return ask
+
+
+_KNOWN = (
+    RememberedTag(tag="usa-2024", until_date=date(2024, 4, 11)),
+    RememberedTag(tag="italy"),
+)
 
 
 # ── Render ────────────────────────────────────────────────────────────────────
@@ -120,3 +136,62 @@ class TestRunBranches:
             _scripted("3", "trip", ""),
         )
         assert run(_console(), current=None) is None
+
+
+# ── Known-tag picker ──────────────────────────────────────────────────────────
+
+
+class TestPicker:
+    def test_render_lists_known_tags(self):
+        con = _console()
+        render(con, None, _KNOWN)
+        out = con.export_text()
+        assert "known:" in out
+        assert "[a] usa-2024" in out
+        assert "[b] italy" in out
+
+    def test_render_omits_picker_when_empty(self):
+        con = _console()
+        render(con, None)
+        assert "known:" not in con.export_text()
+
+    def test_pick_known_then_always(self, monkeypatch):
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("a", "2"))
+        delta = run(_console(), None, _KNOWN)
+        assert delta is not None and delta.new_state is not None
+        assert delta.new_state.tag == "usa-2024"
+        assert delta.new_state.mode == "always"
+
+    def test_pick_known_until_prefills_remembered_window(self, monkeypatch):
+        # letter a → mode 3 (until) → accept the pre-filled remembered date.
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("a", "3", _USE_DEFAULT)
+        )
+        delta = run(_console(), None, _KNOWN)
+        assert delta is not None and delta.new_state is not None
+        assert delta.new_state.mode == "duration"
+        assert delta.new_state.until_date == date(2024, 4, 11)
+
+    def test_pick_known_until_override_date(self, monkeypatch):
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("a", "3", "2025-01-01")
+        )
+        delta = run(_console(), None, _KNOWN)
+        assert delta is not None and delta.new_state is not None
+        assert delta.new_state.until_date == date(2025, 1, 1)
+
+    def test_pick_name_only_tag_asks_mode(self, monkeypatch):
+        # `italy` has no remembered window; pick b → once.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("b", "1"))
+        delta = run(_console(), None, _KNOWN)
+        assert delta is not None and delta.new_state is not None
+        assert delta.new_state.tag == "italy"
+        assert delta.new_state.mode == "once"
+
+    def test_pick_name_only_until_has_no_default_so_empty_cancels(self, monkeypatch):
+        # `italy` has no window → the date prompt's default is empty →
+        # accepting it cancels (no bad date committed).
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("b", "3", _USE_DEFAULT)
+        )
+        assert run(_console(), None, _KNOWN) is None

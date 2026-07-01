@@ -361,7 +361,8 @@ class TestEnterIsNeverASilentCancel:
         # is typed (visible to the user) instead of silently bailing.
         from beancount_importer.categorizer import tag_menu
 
-        assert "" not in tag_menu._HOTKEYS
+        assert "" not in tag_menu._MODE_HOTKEYS
+        assert "" not in list(tag_menu._LETTERS)
 
     def test_amortize_does_not_advertise_enter(self):
         # Same contract: amortize has no Enter shortcut, so Rich's
