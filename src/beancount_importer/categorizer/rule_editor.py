@@ -55,7 +55,10 @@ def _default_draft(txn: SourceTransaction, proposal: CategoryProposal) -> _Draft
         match_field=field,
         match_mode="contains",
         pattern=pattern,
-        bank_key=txn.bank_key,
+        # Default to any bank — most rules are payee-based and apply across
+        # banks; the user narrows to a specific bank via [4] on the rare rule
+        # that needs it.
+        bank_key="",
         amount_sign="",
         target_account=proposal.target_account,
         override_payee=proposal.payee or "",

@@ -60,7 +60,8 @@ class TestDefaults:
         assert rule.payee_pattern == "AMZN MKTP DE*RT4"
         assert rule.description_pattern == ""
         assert rule.match_mode == "contains"
-        assert rule.bank_key == "spk"
+        # Defaults to any bank, not the txn's bank.
+        assert rule.bank_key == ""
         assert rule.target_account == "Expenses:Online"
         assert rule.override_payee == "Amazon"
 
@@ -128,10 +129,11 @@ class TestEditing:
         rule = run(_console(), _txn(), _proposal())
         assert rule.tag == "trip"
 
-    def test_clear_bank_to_any(self, monkeypatch):
-        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("4", "", "s"))
+    def test_set_bank_narrows_from_any(self, monkeypatch):
+        # Default is any bank ([4] blank); the user can narrow to one.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("4", "spk", "s"))
         rule = run(_console(), _txn(), _proposal())
-        assert rule.bank_key == ""
+        assert rule.bank_key == "spk"
 
 
 class TestRender:

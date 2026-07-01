@@ -153,7 +153,8 @@ def _derive_rule(
         payee_pattern=payee_pattern,
         description_pattern=desc_pattern,
         match_mode="contains",
-        bank_key=txn.bank_key,
+        # Any bank by default — most payee-based rules aren't bank-specific.
+        bank_key="",
         override_payee=proposal.payee,
         override_narration=proposal.narration,
         tag=proposal.tag,
