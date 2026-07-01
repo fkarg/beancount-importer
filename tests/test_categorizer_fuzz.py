@@ -186,16 +186,10 @@ def _pick_ctx() -> PickContext:
         bank_account="Assets:B:SPK",
         suggestions=suggestions,
         suggestion_counts={"Expenses:Online": 5},
-        all_accounts=suggestions + ("Expenses:Travel", "Expenses:Software"),
-        existing_entries=(
-            LedgerEntry(
-                date=date(2024, 1, 1),
-                narration="x",
-                source_account="Assets:B:SPK",
-                target_account="Assets:B:N26",
-                amount=Decimal("100"),
-            ),
-        ),
+        # Own accounts (Assets/Liabilities) are in the chart so the `[o]`
+        # path has something to list when the fuzzer walks into it.
+        all_accounts=suggestions
+        + ("Expenses:Travel", "Expenses:Software", "Assets:B:N26"),
     )
 
 

@@ -84,6 +84,30 @@ class TestRankAccounts:
         assert top == []
         assert all_ == []
 
+    def test_known_accounts_appear_in_all_but_not_suggestions(self):
+        # `known_accounts` is the authoritative chart (opened accounts).
+        # Opened-but-unused accounts must show up in the full `all` pool the
+        # `[l]` picker lists, but must NOT pollute the ranked suggestions —
+        # they carry no usage signal.
+        existing = [_entry("Assets:B:SPK", "Expenses:Food")]
+        top, all_ = rank_accounts(
+            _txn(),
+            [],
+            existing,
+            known_accounts=("Liabilities:Familie:Anna", "Expenses:Food"),
+        )
+        assert "Liabilities:Familie:Anna" in all_
+        assert "Liabilities:Familie:Anna" not in top
+        # Used accounts still rank as suggestions.
+        assert "Expenses:Food" in top
+
+    def test_known_accounts_deduped_against_usage(self):
+        existing = [_entry("Assets:B:SPK", "Expenses:Food")]
+        _, all_ = rank_accounts(
+            _txn(), [], existing, known_accounts=("Expenses:Food", "Assets:B:SPK")
+        )
+        assert sorted(all_) == ["Assets:B:SPK", "Expenses:Food"]
+
     @given(
         amount=st.decimals(allow_nan=False, allow_infinity=False, places=2).filter(
             lambda d: d != 0

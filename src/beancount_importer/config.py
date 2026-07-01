@@ -166,6 +166,13 @@ class Config(BaseModel):
     tag_state_file: str = ".beancount-importer/tag_state.json"
     documents_dir: str = "documents"
     transactions_dir: str = "transactions"
+    # File whose `open` directives define the authoritative account chart the
+    # interactive pickers list. Resolved relative to the finances root. The
+    # transaction sweep under `transactions_dir` only ever surfaces accounts
+    # that appear on a posting, so accounts opened here but not yet used (or
+    # only ever a 3rd+ posting leg) are invisible without this. If the file is
+    # absent, the pipeline falls back to `main_bean`'s include-resolved opens.
+    accounts_file: str = "accounts.bean"
     # Path to the top-level beancount file used by `bean-query` to compute
     # the plugin-expanded transaction count shown in the preview. May contain
     # `{year}` for per-year main files. Optional — the count is skipped if

@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from beancount_importer.beancount_io.reader import read_ledger, read_ledger_multi
+from beancount_importer.beancount_io.reader import (
+    read_ledger,
+    read_ledger_multi,
+    read_open_accounts,
+)
 from beancount_importer.beancount_io.writer import append_entry, format_transaction, splice_entries
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -79,6 +83,45 @@ class TestReadLedger:
     def test_no_entries_for_wrong_account(self):
         entries = read_ledger(FIXTURES / "sample.bean", "Assets:B:N26")
         assert entries == []
+
+
+class TestReadOpenAccounts:
+    """`read_open_accounts` sources the authoritative chart from `open`
+    directives — including accounts that carry no transaction yet, which the
+    transaction-derived pool can never surface.
+    """
+
+    def test_returns_opened_accounts_including_unused(self, tmp_path: Path):
+        f = tmp_path / "accounts.bean"
+        f.write_text(
+            "2024-01-01 open Assets:B:SPK EUR\n"
+            "2024-01-01 open Expenses:Travel EUR\n"
+            "2024-01-01 open Liabilities:Familie:Anna EUR\n\n"
+            # A used account still shows; an unused open (Liabilities:Familie:Anna)
+            # must show too — that's the whole point.
+            '2024-03-25 * "Uber" "ride"\n'
+            "  Assets:B:SPK    -25.00 EUR\n"
+            "  Expenses:Travel  25.00 EUR\n"
+        )
+        assert read_open_accounts(f) == frozenset(
+            {"Assets:B:SPK", "Expenses:Travel", "Liabilities:Familie:Anna"}
+        )
+
+    def test_missing_file_returns_empty(self, tmp_path: Path):
+        assert read_open_accounts(tmp_path / "nope.bean") == frozenset()
+
+    def test_resolves_includes(self, tmp_path: Path):
+        (tmp_path / "leaf.bean").write_text(
+            "2024-01-01 open Liabilities:CreditCard:Visa EUR\n"
+        )
+        main = tmp_path / "main.bean"
+        main.write_text(
+            'include "leaf.bean"\n'
+            "2024-01-01 open Assets:B:SPK EUR\n"
+        )
+        assert read_open_accounts(main) == frozenset(
+            {"Assets:B:SPK", "Liabilities:CreditCard:Visa"}
+        )
 
 
 class TestReadLedgerInferredAmount:

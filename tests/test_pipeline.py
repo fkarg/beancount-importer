@@ -137,6 +137,33 @@ class TestPipelineSmoke:
         assert results[0].proposal.action == "categorize"
 
 
+# ── Account chart ────────────────────────────────────────────────────────────
+
+
+class TestPipelineAccountChart:
+    def test_known_accounts_include_unused_opens(self, base_dir: Path):
+        # An account opened in accounts.bean but never posted to must still
+        # reach the categorizer, so the `[l]` picker can list every opened
+        # account, not just the ones already used.
+        (base_dir / "accounts.bean").write_text(textwrap.dedent("""\
+            2024-01-01 open Assets:B:SPK EUR
+            2024-01-01 open Expenses:Unknown EUR
+            2024-01-01 open Liabilities:Familie:Anna EUR
+        """))
+        captured: dict[str, tuple[str, ...]] = {}
+
+        def categ(ctx: CategorizeContext) -> CategoryProposal:
+            captured["chart"] = ctx.known_accounts
+            return CategoryProposal(
+                action="categorize",
+                postings=(Posting(account="Expenses:Unknown"),),
+            )
+
+        session = make_session(base_dir)
+        run(session, base_dir, categ, NoopReporter())
+        assert "Liabilities:Familie:Anna" in captured["chart"]
+
+
 # ── Skip / quit ──────────────────────────────────────────────────────────────
 
 

@@ -45,6 +45,7 @@ from beancount_importer.pipeline._result import (
     _fold_inflight_date_hint,
 )
 from beancount_importer.pipeline._shared import (
+    _load_account_chart,
     _load_all_outputs,
     _parse_all_inputs,
     _select_banks,
@@ -126,6 +127,10 @@ def run(
     for entry in existing:
         existing_by_account.setdefault(entry.source_account, []).append(entry)
 
+    # The authoritative account chart from `open` directives — includes
+    # accounts opened but not yet used, which the postings sweep can't see.
+    account_chart = _load_account_chart(base_dir, session)
+
     bank_account_by_key = {b.key: b.account for b in banks}
     bank_by_key = {b.key: b for b in banks}
 
@@ -174,6 +179,7 @@ def run(
             bank=bank_cfg,
             existing=bucket,
             existing_all=existing,
+            account_chart=account_chart,
             csv_by_bank=csv_by_bank,
             matchers=matchers,
             config=config,
@@ -286,6 +292,7 @@ def _process_transaction(
     bank: BankConfig,
     existing: list[LedgerEntry],
     existing_all: list[LedgerEntry],
+    account_chart: tuple[str, ...],
     csv_by_bank: dict[str, list[SourceTransaction]],
     matchers: list[MatcherHook],
     config,  # Config; type omitted to avoid a circular import at type level
@@ -350,6 +357,7 @@ def _process_transaction(
         config=config,
         existing=existing,
         existing_all=existing_all,
+        account_chart=account_chart,
         bank=bank,
         auto_threshold=auto_threshold,
         categorize_fn=categorize_fn,
@@ -614,6 +622,7 @@ def _resolve_proposal(
     config,
     existing: list[LedgerEntry],
     existing_all: list[LedgerEntry],
+    account_chart: tuple[str, ...],
     bank: BankConfig,
     auto_threshold: float | None,
     categorize_fn: CategorizeFn,
@@ -678,6 +687,7 @@ def _resolve_proposal(
         active_tag=state.working_tag,
         known_tags=state.working_known,
         existing_entries=tuple(existing_all),
+        known_accounts=account_chart,
         source_account=bank.account,
         progress=state.progress,
         near_misses=near_misses,

@@ -90,6 +90,9 @@ class TestConfigLoad:
         assert cfg.rules_file == ".beancount-importer/rules.json"
         assert cfg.decisions_file == ".beancount-importer/decisions.jsonl"
         assert cfg.tag_state_file == ".beancount-importer/tag_state.json"
+        # The authoritative account chart for the pickers is sourced from
+        # `open` directives in this file (falling back to `main_bean`).
+        assert cfg.accounts_file == "accounts.bean"
 
     def test_missing_file_raises(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError):

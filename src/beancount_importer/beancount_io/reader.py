@@ -42,6 +42,24 @@ def read_ledger(
     )
 
 
+def read_open_accounts(path: Path) -> frozenset[str]:
+    """Return every account named by an `open` directive reachable from `path`.
+
+    `load_file` resolves `include`s, so pointing this at a standalone
+    `accounts.bean` (or a top-level `main.bean` that pulls the chart in
+    transitively) yields the full chart — crucially including accounts that
+    carry no transaction yet. The transaction-derived pool
+    (`read_ledger_multi`) can only surface accounts that appear on a posting,
+    so unused-but-opened accounts are invisible without this.
+    """
+    if not path.exists():
+        return frozenset()
+    entries, _errors, _options = load_file(str(path))
+    return frozenset(
+        d.account for d in entries if isinstance(d, bc_data.Open)
+    )
+
+
 def read_ledger_multi(
     path: Path,
     *,

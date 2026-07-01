@@ -75,6 +75,11 @@ class CategorizeContext(BaseModel):
     # with ledger tag names, grown in-session. Ordered most-relevant-first.
     known_tags: tuple[RememberedTag, ...] = ()
     existing_entries: tuple[LedgerEntry, ...] = ()
+    # Authoritative account chart (accounts opened in `accounts.bean`). Unlike
+    # `existing_entries` — which only names accounts appearing on a posting —
+    # this includes opened-but-unused accounts, so the `[l]`/`[o]` pickers can
+    # list the full chart. Usage counts still derive from `existing_entries`.
+    known_accounts: tuple[str, ...] = ()
     # Source-side account (e.g. `Assets:B:SPK`) and run progress; needed by
     # the screen-driven categorizer to render the headline + state header.
     source_account: str = ""

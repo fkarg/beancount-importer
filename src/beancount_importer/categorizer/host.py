@@ -254,7 +254,7 @@ def _ask_pick(console: Console, ctx: CategorizeContext) -> PickDecision:
         if entry.target_account:
             counts[entry.target_account] += 1
     suggestions, all_accounts = rank_accounts(
-        ctx.txn, ctx.candidates, ctx.existing_entries
+        ctx.txn, ctx.candidates, ctx.existing_entries, known_accounts=ctx.known_accounts
     )
     pick_ctx = PickContext(
         txn=ctx.txn,
@@ -262,7 +262,6 @@ def _ask_pick(console: Console, ctx: CategorizeContext) -> PickDecision:
         suggestions=tuple(suggestions),
         suggestion_counts=dict(counts),
         all_accounts=tuple(all_accounts),
-        existing_entries=ctx.existing_entries,
         progress=ctx.progress,
         bank_key=ctx.txn.bank_key,
         year=ctx.txn.booking_date.year,

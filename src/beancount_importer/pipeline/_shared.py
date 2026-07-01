@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol
 
-from beancount_importer.beancount_io.reader import read_ledger_multi
+from beancount_importer.beancount_io.reader import read_ledger_multi, read_open_accounts
 from beancount_importer.config import BankConfig
 from beancount_importer.models import LedgerEntry, SourceTransaction
 from beancount_importer.parsers.base import Parser
@@ -105,6 +106,31 @@ def _load_all_outputs(
                 (entry.file_path, entry.line_start, entry.source_account), entry
             )
     return list(deduped.values())
+
+
+def _load_account_chart(base_dir: Path, session: ImportSession) -> tuple[str, ...]:
+    """The authoritative account chart from `open` directives, sorted.
+
+    Prefers `config.accounts_file` (a standalone chart like `accounts.bean`);
+    when that yields nothing, falls back to `config.main_bean`'s
+    include-resolved opens. Templates may contain `{year}` — resolved against
+    each year in `year_filter` (today's year when unfiltered), matching how the
+    CLI resolves per-year `main_bean` paths. Returns `()` when neither source
+    exists, so the pickers fall back to the transaction-derived pool (today's
+    behaviour).
+    """
+    config = session.config
+    years = session.options.year_filter or (date.today().year,)
+    for template in (config.accounts_file, config.main_bean):
+        if not template:
+            continue
+        paths = {(base_dir / template.format(year=y)).resolve() for y in years}
+        opens: set[str] = set()
+        for path in paths:
+            opens |= read_open_accounts(path)
+        if opens:
+            return tuple(sorted(opens))
+    return ()
 
 
 def _gather_csv_files(bank: BankConfig, base_dir: Path) -> list[Path]:

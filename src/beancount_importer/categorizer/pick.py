@@ -6,7 +6,7 @@ match the principle ("color and shape both carry meaning").
 
 Hotkey set:
 - `[1-8]` pick from the top-8 suggestions
-- `[l]` list all accounts (paged 10/page)
+- `[l]` list all accounts (full chart, column grid, with usage counts)
 - `[w]` write a custom account name
 - `[o]` transfer to own account (filtered to Assets/Liabilities)
 - `[s]` skip
@@ -19,7 +19,7 @@ screen already needs (a filtered numbered list).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -34,7 +34,7 @@ from beancount_importer.categorizer.screen import (
     hotkey,
     styled_account,
 )
-from beancount_importer.models import LedgerEntry, SourceTransaction
+from beancount_importer.models import SourceTransaction
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -56,8 +56,7 @@ class PickContext:
     bank_account: str
     suggestions: tuple[str, ...]               # already ranked by `rank_accounts`
     suggestion_counts: dict[str, int]          # frequency annotations (dim "34×")
-    all_accounts: tuple[str, ...]              # full pool for `[l]` paging
-    existing_entries: tuple[LedgerEntry, ...]  # for `[o]` transfer-to-own filter
+    all_accounts: tuple[str, ...]              # full chart for `[l]` and `[o]`
     progress: tuple[int, int] = (0, 0)
     bank_key: str = ""
     year: int = 0
@@ -181,7 +180,7 @@ def run(console: Console, ctx: PickContext) -> PickDecision:
                 action="pick", account=ctx.suggestions[int(key) - 1]
             )
         if key == "l":
-            picked = _full_list(console, ctx.all_accounts)
+            picked = _full_list(console, ctx.all_accounts, ctx.suggestion_counts)
             if picked is not None:
                 return PickDecision(action="pick", account=picked)
             continue
@@ -191,7 +190,7 @@ def run(console: Console, ctx: PickContext) -> PickDecision:
                 return PickDecision(action="pick", account=picked)
             continue
         # key == "o"
-        picked = _transfer_to_own(console, ctx.existing_entries)
+        picked = _transfer_to_own(console, ctx.all_accounts, ctx.suggestion_counts)
         if picked is not None:
             return PickDecision(action="pick", account=picked)
 
@@ -199,13 +198,23 @@ def run(console: Console, ctx: PickContext) -> PickDecision:
 # ── Sub-prompts ───────────────────────────────────────────────────────────────
 
 
-def _full_list(console: Console, accounts: Iterable[str]) -> str | None:
+def _count_label(count: int | None) -> str:
+    """Frequency annotation shared by the suggestions block and the full list:
+    `34×` when used, `—` when the account carries no usage (opened-but-unused).
+    """
+    return f"{count}×" if count else "—"
+
+
+def _full_list(
+    console: Console, accounts: Iterable[str], counts: Mapping[str, int]
+) -> str | None:
     """Show every `accounts` entry at once in an alphabetical column grid.
 
-    Earlier this was 10-per-page paging, but the typical user has ~100
-    accounts and wants to *scan* visually for the one they need —
-    paging makes that much harder than it has to be. Terminal scroll
-    handles overflow if the list is huge.
+    The pool is the authoritative chart (accounts opened in `accounts.bean`),
+    so opened-but-unused accounts appear too — the user wants to *scan*
+    visually for the one they need. `counts` annotates each with its ledger
+    usage (`—` when unused). Terminal scroll handles overflow if the list is
+    huge.
 
     Input is free-text rather than `Prompt.ask(choices=…)` because
     indices may be three digits (>9 accounts blows the single-key cap).
@@ -217,7 +226,7 @@ def _full_list(console: Console, accounts: Iterable[str]) -> str | None:
         console.print("  [dim](no accounts loaded)[/]")
         return None
     while True:
-        _render_column_grid(console, items)
+        _render_column_grid(console, items, counts)
         console.print(
             f"  {hotkey('1-' + str(len(items)))} pick   "
             f"{hotkey('enter')} redraw   {hotkey('x')} cancel"
@@ -247,19 +256,26 @@ def _full_list(console: Console, accounts: Iterable[str]) -> str | None:
 MAX_GRID_COLS = 5
 
 
-def _render_column_grid(console: Console, items: list[str]) -> None:
+def _render_column_grid(
+    console: Console, items: list[str], counts: Mapping[str, int]
+) -> None:
     """Lay `items` out column-major so reading top-to-bottom is alphabetical.
 
     Column count adapts to terminal width with the longest account name
     setting cell width. Column-major (vs. row-major) means columns 1, 2,
     3 contain items 1..r, r+1..2r, 2r+1..3r — so a user scanning a
     sorted list moves their eyes down a column, not zig-zag across rows.
+
+    Each cell carries a right-aligned dim usage count (`34×`, or `—` when the
+    account is opened-but-unused), matching the suggestions block.
     """
     n_digits = len(str(len(items)))
     max_acc_len = max(len(a) for a in items)
+    labels = {a: _count_label(counts.get(a)) for a in items}
+    max_count_len = max(len(s) for s in labels.values())
     # Visible per cell: `[NN]` (n_digits + 2) + ` ` (1) + `◆ account`
-    # (2 + max_acc_len). Cells are joined by 2 spaces.
-    cell_width = n_digits + 5 + max_acc_len
+    # (2 + max_acc_len) + `  ` (2) + right-aligned count. Cells joined by 2.
+    cell_width = n_digits + 7 + max_acc_len + max_count_len
     join_width = 2
     n_cols = max(
         1,
@@ -277,7 +293,8 @@ def _render_column_grid(console: Console, items: list[str]) -> None:
             # Pad on visible width; Rich markup in `styled_account`
             # makes `f"{...:<N}"` count escape chars and under-space.
             pad = " " * (max_acc_len - len(acc))
-            cells.append(f"{label} {styled_account(acc)}{pad}")
+            count = labels[acc].rjust(max_count_len)
+            cells.append(f"{label} {styled_account(acc)}{pad}  [dim]{count}[/]")
         console.print("  " + "  ".join(cells))
     console.print()
 
@@ -303,18 +320,17 @@ def _write_custom(console: Console, known: tuple[str, ...]) -> str | None:
 
 
 def _transfer_to_own(
-    console: Console, entries: tuple[LedgerEntry, ...]
+    console: Console, all_accounts: Iterable[str], counts: Mapping[str, int]
 ) -> str | None:
-    """List Assets/Liabilities accounts (any side of any entry) and pick one.
+    """List Assets/Liabilities accounts from the chart and pick one.
 
+    Filters the full chart rather than reconstructing from postings — so an
+    own account that's only ever a 3rd posting leg (or merely opened) still
+    lists, instead of vanishing the way the old entry-derived pool let it.
     Reuses `_full_list`'s shape — same column grid, narrower input pool.
     """
-    seen: dict[str, None] = {}
-    for entry in entries:
-        for acc in (entry.source_account, entry.target_account):
-            if acc and acc.startswith(("Assets:", "Liabilities:")):
-                seen.setdefault(acc, None)
-    if not seen:
+    own = [a for a in all_accounts if a.startswith(("Assets:", "Liabilities:"))]
+    if not own:
         console.print("  [dim](no own-account history yet)[/]")
         return None
-    return _full_list(console, sorted(seen))
+    return _full_list(console, own, counts)

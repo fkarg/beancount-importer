@@ -13,7 +13,7 @@ from beancount_importer.categorizer.pick import (
     render,
     run,
 )
-from beancount_importer.models import LedgerEntry, SourceTransaction
+from beancount_importer.models import SourceTransaction
 
 
 def _console() -> Console:
@@ -45,7 +45,6 @@ def _ctx(
     ),
     counts: dict[str, int] | None = None,
     all_accounts: tuple[str, ...] = _UNSET,
-    existing: tuple[LedgerEntry, ...] = (),
 ) -> PickContext:
     # `all_accounts=_UNSET` defaults to suggestions; explicit `()` is honoured
     # so tests can exercise the empty-pool branch without `or` collapsing it.
@@ -57,7 +56,6 @@ def _ctx(
         suggestions=suggestions,
         suggestion_counts=counts or {"Expenses:Online": 34, "Expenses:Household": 9},
         all_accounts=all_accounts,
-        existing_entries=existing,
         progress=(13, 47),
         bank_key="spk",
         year=2024,
@@ -255,46 +253,45 @@ class TestRun:
     def test_o_transfer_to_own_filters_to_assets_and_liabilities(
         self, monkeypatch
     ):
-        # Existing entries include Expenses (filtered out) plus Assets and
-        # Liabilities (kept). The user picks #2 from the filtered list.
-        existing = (
-            LedgerEntry(
-                date=date(2024, 1, 1),
-                narration="x",
-                source_account="Assets:B:SPK",
-                target_account="Expenses:Food",
-                amount=Decimal("-10"),
-            ),
-            LedgerEntry(
-                date=date(2024, 1, 2),
-                narration="y",
-                source_account="Assets:B:N26",
-                target_account="Assets:B:SPK",
-                amount=Decimal("100"),
-            ),
-            LedgerEntry(
-                date=date(2024, 1, 3),
-                narration="z",
-                source_account="Liabilities:CreditCard:Visa",
-                target_account="Expenses:Travel",
-                amount=Decimal("-50"),
-            ),
+        # `[o]` sources from the full chart (`all_accounts`), filtered to
+        # Assets/Liabilities. Expenses are dropped; the user picks #2.
+        all_accounts = (
+            "Assets:B:N26",
+            "Assets:B:SPK",
+            "Expenses:Food",  # filtered out
+            "Liabilities:CreditCard:Visa",
         )
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask", _scripted("o", "2")
         )
-        decision = run(_console(), _ctx(existing=existing))
+        decision = run(_console(), _ctx(all_accounts=all_accounts))
         # Sorted alphabetically: Assets:B:N26, Assets:B:SPK, Liabilities:...
         assert decision.action == "pick"
         assert decision.account == "Assets:B:SPK"
 
+    def test_o_includes_opened_but_unused_liability(self, monkeypatch):
+        # The bug that started this: a liability that only ever appears as a
+        # 3rd posting leg (or is merely opened) was invisible in `[o]`. Sourced
+        # from the chart it now lists, even with no transaction of its own.
+        all_accounts = (
+            "Assets:B:SPK",
+            "Liabilities:CreditCard:Visa",
+            "Liabilities:Familie:Anna",  # opened, never a captured posting
+        )
+        monkeypatch.setattr(
+            "rich.prompt.Prompt.ask", _scripted("o", "3")
+        )
+        decision = run(_console(), _ctx(all_accounts=all_accounts))
+        assert decision.action == "pick"
+        assert decision.account == "Liabilities:Familie:Anna"
+
     def test_o_with_no_own_history_loops_back(self, monkeypatch):
-        # `o` then `s` — no Assets/Liabilities entries means "no history",
+        # `o` then `s` — no Assets/Liabilities in the chart means "no history",
         # the sub-prompt returns None, the run loops to the next hotkey.
         monkeypatch.setattr(
             "rich.prompt.Prompt.ask", _scripted("o", "s")
         )
-        assert run(_console(), _ctx(existing=())).action == "skip"
+        assert run(_console(), _ctx(all_accounts=("Expenses:Food",))).action == "skip"
 
 
 # ── Listing UX regressions ────────────────────────────────────────────────────
@@ -360,7 +357,31 @@ class TestRedrawAfterCancel:
             "rich.prompt.Prompt.ask", _scripted("o", "s")
         )
         console = _console()
-        run(console, _ctx(existing=()))
+        run(console, _ctx(all_accounts=("Expenses:Food",)))
         # After the `[o]` sub-prompt prints "(no own-account history yet)"
         # and returns, Screen 2 should redraw before the next prompt.
         assert console.export_text().count("[l] list all accounts") >= 2
+
+
+class TestFullListCounts:
+    """`[l]` annotates each account with its usage count, mirroring the top
+    suggestions — so a user scanning the full chart still sees which accounts
+    they lean on. Opened-but-unused accounts show `—`.
+    """
+
+    def test_l_list_shows_usage_counts(self, monkeypatch):
+        # `Expenses:Rare` is only in the full pool (not a suggestion), so its
+        # `7×` can only come from the `[l]` grid, not the suggestions block.
+        monkeypatch.setattr("rich.prompt.Prompt.ask", _scripted("l", "x", "s"))
+        console = _console()
+        run(
+            console,
+            _ctx(
+                all_accounts=("Expenses:Online", "Expenses:Rare"),
+                counts={"Expenses:Rare": 7},
+            ),
+        )
+        out = console.export_text()
+        assert "7×" in out
+        # `Expenses:Online` has no count → renders the em-dash placeholder.
+        assert "—" in out

@@ -59,11 +59,17 @@ def rank_accounts(
     *,
     top_n: int = 10,
     suggested_target: str | None = None,
+    known_accounts: Iterable[str] = (),
 ) -> tuple[list[str], list[str]]:
     """Return `(top_n_suggestions, all_known_accounts)`.
 
     `suggested_target` (e.g. a rule's target) is always at index 0 of the
     suggestions list — the user expects their rule's choice to win.
+
+    `known_accounts` is the authoritative chart (accounts opened in
+    `accounts.bean`). It widens `all_known_accounts` — so the `[l]` picker
+    lists opened-but-unused accounts — without entering the ranked
+    suggestions, which stay driven purely by ledger usage.
     """
     is_debit = txn.amount < 0
     candidate_accounts = {entry.target_account for entry, _ in candidates if entry.target_account}
@@ -73,7 +79,8 @@ def rank_accounts(
             counter[entry.source_account] += 1
         if entry.target_account:
             counter[entry.target_account] += 1
-    all_accounts = sorted(counter)
+    used_accounts = sorted(counter)
+    all_accounts = sorted(set(counter) | {a for a in known_accounts if a})
 
     def _sign_score(account: str) -> int:
         if is_debit:
@@ -93,7 +100,7 @@ def rank_accounts(
         candidate_bonus = 5 if account in candidate_accounts else 0
         return (candidate_bonus, _sign_score(account), counter[account])
 
-    ranked = sorted(all_accounts, key=lambda a: _score(a), reverse=True)
+    ranked = sorted(used_accounts, key=lambda a: _score(a), reverse=True)
     top: list[str] = []
     if suggested_target:
         top.append(suggested_target)
