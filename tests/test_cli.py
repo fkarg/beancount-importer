@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import json
 import textwrap
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from typer.testing import CliRunner
 
-from beancount_importer.cli import app, doctor_app
+from beancount_importer.cli import _commit_message, app, doctor_app
+from beancount_importer.models import ImportResult, SourceTransaction
 
 
 CONFIG_TOML = textwrap.dedent("""\
@@ -497,3 +501,58 @@ class TestMigrateFromLegacy:
         assert "trip" in tag_state.read_text()
         # Legacy file is untouched
         assert (tmp_path / ".import_config.json").exists()
+
+
+class TestCommitMessage:
+    @staticmethod
+    def _result(
+        bank: str,
+        day: date,
+        action: Literal["new", "update", "skip", "transfer", "quit"] = "new",
+    ) -> ImportResult:
+        txn = SourceTransaction(
+            booking_date=day,
+            amount=Decimal("-10.00"),
+            currency="EUR",
+            payee="Payee",
+            description="desc",
+            bank_key=bank,
+        )
+        return ImportResult(source_txn=txn, action=action)
+
+    def test_single_bank_names_bank_with_range(self):
+        msg = _commit_message([
+            self._result("spk", date(2024, 1, 3)),
+            self._result("spk", date(2024, 6, 28)),
+            self._result("spk", date(2024, 3, 1), action="update"),
+        ])
+        assert msg == "bean-import: spk 2024-01-03..2024-06-28 — 2 new, 1 updated"
+
+    def test_same_day_collapses_range(self):
+        msg = _commit_message([self._result("spk", date(2024, 5, 5))])
+        assert msg == "bean-import: spk 2024-05-05 — 1 new"
+
+    def test_updates_only(self):
+        msg = _commit_message([self._result("spk", date(2024, 5, 5), action="update")])
+        assert msg == "bean-import: spk 2024-05-05 — 1 updated"
+
+    def test_multiple_banks_split_in_body(self):
+        msg = _commit_message([
+            self._result("spk", date(2024, 1, 3)),
+            self._result("spk", date(2024, 5, 12)),
+            self._result("paypal", date(2024, 2, 1), action="update"),
+        ])
+        subject, blank, *body = msg.splitlines()
+        assert subject == "bean-import: 2024-01-03..2024-05-12 — 2 new, 1 updated"
+        assert blank == ""
+        assert body == [
+            "paypal: 2024-02-01 — 1 updated",
+            "spk: 2024-01-03..2024-05-12 — 2 new",
+        ]
+
+    def test_skips_and_quits_are_ignored(self):
+        msg = _commit_message([
+            self._result("spk", date(2024, 1, 1), action="skip"),
+            self._result("spk", date(2024, 1, 2), action="quit"),
+        ])
+        assert msg == "bean-import: rules/decisions only"

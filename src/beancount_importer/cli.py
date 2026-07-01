@@ -490,6 +490,48 @@ def main(
             _commit_session(config, base_dir, results)
 
 
+def _commit_message(results: list[ImportResult]) -> str:
+    """Build the auto-commit message from the results that touched the ledger.
+
+    Subject: overall booking-date range + counts, with the bank name when a
+    single bank was imported. With multiple banks the body carries one
+    range+counts line per bank. Ranges use booking dates, not run time, so
+    the message says which period the data covers.
+    """
+    changed = [r for r in results if r.action in ("new", "update")]
+    if not changed:
+        # Rules/decisions/tag-state edits can dirty the repo without any
+        # ledger writes (e.g. a run of skips and blocks).
+        return "bean-import: rules/decisions only"
+
+    def span(rs: list[ImportResult]) -> str:
+        dates = [r.source_txn.booking_date for r in rs]
+        lo, hi = min(dates), max(dates)
+        return str(lo) if lo == hi else f"{lo}..{hi}"
+
+    def counts(rs: list[ImportResult]) -> str:
+        n_new = sum(1 for r in rs if r.action == "new")
+        n_upd = sum(1 for r in rs if r.action == "update")
+        parts = [f"{n_new} new"] if n_new else []
+        if n_upd:
+            parts.append(f"{n_upd} updated")
+        return ", ".join(parts)
+
+    by_bank: dict[str, list[ImportResult]] = {}
+    for r in changed:
+        by_bank.setdefault(r.source_txn.bank_key, []).append(r)
+
+    if len(by_bank) == 1:
+        bank = next(iter(by_bank))
+        return f"bean-import: {bank} {span(changed)} — {counts(changed)}"
+
+    subject = f"bean-import: {span(changed)} — {counts(changed)}"
+    body = "\n".join(
+        f"{bank}: {span(rs)} — {counts(rs)}" for bank, rs in sorted(by_bank.items())
+    )
+    return f"{subject}\n\n{body}"
+
+
 def _commit_session(
     config: Config, base_dir: Path, results: list[ImportResult]
 ) -> None:
@@ -509,11 +551,7 @@ def _commit_session(
     existing = [str(p) for p in paths if p.exists()]
     if not existing:
         return
-    years = sorted({r.source_txn.booking_date.year for r in results})
-    n_new = sum(1 for r in results if r.action == "new")
-    n_upd = sum(1 for r in results if r.action == "update")
-    label = ",".join(str(y) for y in years) if years else "none"
-    message = f"bean-import: {label} — {n_new} new, {n_upd} updated"
+    message = _commit_message(results)
     git = ["git", "-C", str(base_dir)]
     try:
         subprocess.run([*git, "add", "--", *existing], check=True, capture_output=True)
@@ -522,7 +560,7 @@ def _commit_session(
             console.print("[dim]auto-commit: nothing changed[/]")
             return
         subprocess.run([*git, "commit", "-m", message], check=True, capture_output=True)
-        console.print(f"[green]committed:[/] {message}")
+        console.print(f"[green]committed:[/] {message.splitlines()[0]}")
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         console.print(f"[yellow]auto-commit skipped ({exc})[/]")
 
