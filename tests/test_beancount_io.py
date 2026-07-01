@@ -5,13 +5,21 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+from beancount.core import amount as bc_amount, data as bc_data
 
 from beancount_importer.beancount_io.reader import (
+    _extract_entry,
     read_ledger,
     read_ledger_multi,
     read_open_accounts,
 )
-from beancount_importer.beancount_io.writer import append_entry, format_transaction, splice_entries
+from beancount_importer.beancount_io.writer import (
+    append_entry,
+    apply_update,
+    format_transaction,
+    splice_entries,
+)
+from beancount_importer.models import CategoryProposal, LedgerEntry, Posting
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -83,6 +91,46 @@ class TestReadLedger:
     def test_no_entries_for_wrong_account(self):
         entries = read_ledger(FIXTURES / "sample.bean", "Assets:B:N26")
         assert entries == []
+
+
+class TestReaderInternalMetadata:
+    """beancount's loader injects reserved `__x__` keys (e.g. `__tolerances__`)
+    onto transaction meta during booking. Those are not user metadata and are
+    invalid as source syntax — they must not survive onto `LedgerEntry`, or a
+    later `apply_update` would splice `__tolerances__: ...` and fail to reparse.
+    """
+
+    def test_dunder_txn_metadata_is_dropped(self):
+        txn = bc_data.Transaction(
+            meta={
+                "filename": "x.bean",
+                "lineno": 1,
+                "__tolerances__": {"EUR": Decimal("0.005")},
+                "sepa_ref": "KEEP-ME",
+            },
+            date=date(2024, 1, 15),
+            flag="*",
+            payee="P",
+            narration="N",
+            tags=frozenset(),
+            links=frozenset(),
+            postings=[
+                bc_data.Posting(
+                    "Assets:B:SPK",
+                    bc_amount.Amount(Decimal("-1"), "EUR"),
+                    None, None, None, None,
+                ),
+                bc_data.Posting(
+                    "Expenses:X",
+                    bc_amount.Amount(Decimal("1"), "EUR"),
+                    None, None, None, None,
+                ),
+            ],
+        )
+        entry = _extract_entry(txn, "Assets:B:SPK", "x.bean", ())
+        assert entry is not None
+        assert "__tolerances__" not in entry.metadata
+        assert entry.metadata["sepa_ref"] == "KEEP-ME"
 
 
 class TestReadOpenAccounts:
@@ -625,6 +673,67 @@ class TestFormatTransaction:
             narration_max_length=70,
         )
         assert '"short"' in text
+
+    def test_internal_dunder_metadata_is_dropped(self):
+        # Reserved `__x__` keys are not valid beancount source syntax; the
+        # writer must never emit them, at either the txn or posting level.
+        text = format_transaction(
+            date_str="2024-01-15",
+            flag="*",
+            payee=None,
+            narration="Test",
+            postings=[
+                ("Assets:B:SPK", "-1 EUR", {"__automatic__": "True"}),
+                ("Expenses:Other", "1 EUR", {}),
+            ],
+            metadata={"__tolerances__": "{'EUR': 0.005}", "sepa_ref": "REF-001"},
+        )
+        assert "__tolerances__" not in text
+        assert "__automatic__" not in text
+        assert 'sepa_ref: "REF-001"' in text
+
+
+class TestApplyUpdateRobustness:
+    """Regression: an entry loaded via beancount carries `__tolerances__` on
+    its metadata; splicing it back must produce reparse-valid beancount rather
+    than crashing with `Invalid token: '__tolerances__:'` and rolling back.
+    """
+
+    def test_apply_update_survives_internal_metadata(self, tmp_path: Path):
+        f = tmp_path / "SPK.bean"
+        f.write_text(
+            '2024-01-15 * "Netflix" "Old narration"\n'
+            "  Assets:B:SPK            -15.99 EUR\n"
+            "  Expenses:Old             15.99 EUR\n"
+        )
+        entry = LedgerEntry(
+            date=date(2024, 1, 15),
+            flag="*",
+            payee="Netflix",
+            narration="Old narration",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Old",
+            amount=Decimal("-15.99"),
+            currency="EUR",
+            metadata={
+                "__tolerances__": "{'EUR': Decimal('0.005')}",
+                "sepa_ref": "NFX",
+            },
+            line_start=1,
+            file_path=str(f),
+        )
+        proposal = CategoryProposal(
+            action="categorize",
+            postings=(Posting(account="Expenses:New"),),
+            narration="New narration",
+        )
+        # Would raise "beancount parse failed after splice — rolled back" if the
+        # reserved key were written.
+        apply_update(entry, proposal, "Assets:B:SPK")
+        out = f.read_text()
+        assert "__tolerances__" not in out
+        assert 'sepa_ref: "NFX"' in out
+        assert "Expenses:New" in out
 
 
 # ── writer: append_entry ─────────────────────────────────────────────────────

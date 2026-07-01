@@ -173,6 +173,8 @@ def format_transaction(
     lines = [header]
     if metadata:
         for k, v in metadata.items():
+            if _is_reserved_meta_key(k):
+                continue
             lines.append(f'  {k}: "{v}"')
     for posting in postings:
         account, amount, *rest = posting
@@ -182,5 +184,18 @@ def format_transaction(
         else:
             lines.append(f"  {account}")
         for mk, mv in posting_meta.items():
+            if _is_reserved_meta_key(mk):
+                continue
             lines.append(f'    {mk}: "{mv}"')
     return "\n".join(lines) + "\n"
+
+
+def _is_reserved_meta_key(key: str) -> bool:
+    """True for keys beancount reserves for its loader (`__automatic__`,
+    `__tolerances__`, `__residual__`, …). These carry a leading dunder, are not
+    valid metadata-key source syntax, and must never be written back — doing so
+    fails the post-splice reparse (`Invalid token: '__tolerances__:'`). The
+    reader also filters them, but the writer is the last line of defence for a
+    robust splice regardless of where an entry's metadata originated.
+    """
+    return key.startswith("__")

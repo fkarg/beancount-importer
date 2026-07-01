@@ -148,7 +148,11 @@ def _extract_entry(
         source_posting.meta and source_posting.meta.get("__automatic__")
     )
 
-    meta = dict(txn.meta)
+    # Drop beancount's reserved loader keys (`__tolerances__`, `__residual__`,
+    # …) from the txn-level meta — they are not user metadata and are invalid
+    # as source syntax, so carrying them onto the entry would make a later
+    # `apply_update` splice unparseable. (Posting-level meta is filtered below.)
+    meta = {k: v for k, v in txn.meta.items() if not k.startswith("__")}
     line_start = meta.pop("lineno", 0)
     # Beancount's loader records the *real* source file in `meta["filename"]`
     # — different from `file_path` when the entry was reached via an
