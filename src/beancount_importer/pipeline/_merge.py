@@ -21,7 +21,6 @@ from beancount_importer.models import (
     Posting,
     SourceTransaction,
 )
-from beancount_importer.pipeline._proposal import _escape_for_regex
 from beancount_importer.pipeline._result import _format_new_entry
 from beancount_importer.pipeline.types import MergeDecision
 from beancount_importer.rules.models import CategorizationRule
@@ -154,17 +153,18 @@ def _block_update_rule(
     treats this as "block didn't take" and downgrades to a plain skip.
     """
     if txn.payee:
-        pattern = _escape_for_regex(txn.payee)
         return CategorizationRule(
             target_account=entry.target_account,
-            payee_pattern=pattern,
+            payee_pattern=txn.payee.strip(),
+            match_mode="contains",
             bank_key=txn.bank_key,
             suppress_updates=True,
         )
     if txn.description:
         return CategorizationRule(
             target_account=entry.target_account,
-            description_pattern=_escape_for_regex(txn.description),
+            description_pattern=txn.description.strip(),
+            match_mode="contains",
             bank_key=txn.bank_key,
             suppress_updates=True,
         )

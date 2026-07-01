@@ -95,6 +95,36 @@ class TestCategorizationRuleMatches:
         with pytest.raises(ValueError):
             make_rule(payee_pattern="[invalid")
 
+    def test_default_match_mode_is_regex(self):
+        # Backward-compat: rules loaded without match_mode keep regex semantics.
+        assert make_rule().match_mode == "regex"
+
+    def test_contains_matches_literal_substring_with_specials(self):
+        # A `contains` pattern is a literal — regex metacharacters are matched
+        # verbatim, not interpreted. `DE*RT4` would fail as a regex here.
+        rule = make_rule(payee_pattern="DE*RT4", match_mode="contains")
+        assert rule.matches(make_txn(payee="AMZN MKTP DE*RT4..."))
+        assert not rule.matches(make_txn(payee="AMZN MKTP DERT4"))
+
+    def test_contains_is_case_insensitive(self):
+        rule = make_rule(payee_pattern="mktp", match_mode="contains")
+        assert rule.matches(make_txn(payee="AMZN MKTP DE"))
+
+    def test_exact_requires_whole_string(self):
+        rule = make_rule(payee_pattern="Netflix", match_mode="exact")
+        assert rule.matches(make_txn(payee="netflix"))  # casefold equality
+        assert not rule.matches(make_txn(payee="Netflix Abo"))
+
+    def test_contains_pattern_skips_regex_validation(self):
+        # A literal `contains` pattern may contain regex-invalid text; it must
+        # not be rejected by the regex validator.
+        rule = make_rule(payee_pattern="[invalid", match_mode="contains")
+        assert rule.matches(make_txn(payee="x [invalid y"))
+
+    def test_regex_mode_still_validates(self):
+        with pytest.raises(ValueError):
+            make_rule(payee_pattern="[invalid", match_mode="regex")
+
 
 class TestCategorizationRuleSuppressionFlags:
     def test_defaults_off(self):

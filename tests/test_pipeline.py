@@ -227,7 +227,12 @@ class TestPipelineRules:
 
         session = make_session(base_dir)
         results = run(session, base_dir, categ, NoopReporter())
-        assert results[0].new_rule is not None
+        nr = results[0].new_rule
+        assert nr is not None
+        # Derived rules store the raw payee as a case-insensitive literal
+        # substring — no regex escapes.
+        assert nr.payee_pattern == "Netflix"
+        assert nr.match_mode == "contains"
         # By the time the third txn was visited, working_rules had grown.
         assert seen_rules_count[2] > seen_rules_count[0]
 

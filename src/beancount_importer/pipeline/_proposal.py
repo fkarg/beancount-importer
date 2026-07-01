@@ -16,8 +16,6 @@ Used by `_resolve_proposal` in run.py and by `_apply_merge_decision` in
 
 from __future__ import annotations
 
-import re
-
 from beancount_importer.matching.registry import MatchOutcome
 from beancount_importer.models import (
     CategoryProposal,
@@ -135,8 +133,9 @@ def _derive_rule(
     """Synthesize a CategorizationRule from a one-off categorize proposal.
 
     Heuristic: prefer matching by payee when available, falling back to
-    description. The pattern is the literal string anchored case-insensitively;
-    users can refine it later via the rule editor.
+    description. The pattern is the raw literal text matched case-insensitively
+    as a substring (`match_mode="contains"`) — human-readable, no regex escapes;
+    users can refine it (or switch to regex) later via the rule editor.
     """
     if not proposal.postings:
         return None
@@ -144,21 +143,18 @@ def _derive_rule(
     payee_pattern = ""
     desc_pattern = ""
     if txn.payee:
-        payee_pattern = _escape_for_regex(txn.payee)
+        payee_pattern = txn.payee.strip()
     elif txn.description:
-        desc_pattern = _escape_for_regex(txn.description)
+        desc_pattern = txn.description.strip()
     if not payee_pattern and not desc_pattern:
         return None
     return CategorizationRule(
         target_account=target,
         payee_pattern=payee_pattern,
         description_pattern=desc_pattern,
+        match_mode="contains",
         bank_key=txn.bank_key,
         override_payee=proposal.payee,
         override_narration=proposal.narration,
         tag=proposal.tag,
     )
-
-
-def _escape_for_regex(s: str) -> str:
-    return re.escape(s.strip())

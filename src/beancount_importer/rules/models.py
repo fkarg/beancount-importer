@@ -4,7 +4,7 @@ import re
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from beancount_importer.models import SourceTransaction
 
@@ -15,6 +15,14 @@ class CategorizationRule(BaseModel):
     target_account: str
     payee_pattern: str = ""
     description_pattern: str = ""
+    # How `payee_pattern` / `description_pattern` are matched:
+    #   "contains" — case-insensitive literal substring (patterns stay human
+    #                readable; regex metacharacters are matched verbatim)
+    #   "exact"    — case-insensitive whole-string equality
+    #   "regex"    — `re.search(…, IGNORECASE)`
+    # Defaults to "regex" so rules persisted before this field existed keep
+    # their original semantics on load. New / derived rules use "contains".
+    match_mode: Literal["contains", "exact", "regex"] = "regex"
     # "credit" = positive amounts, "debit" = negative, "" = any
     amount_sign: Literal["credit", "debit", ""] = ""
     bank_key: str = ""  # empty = match any bank
@@ -41,15 +49,26 @@ class CategorizationRule(BaseModel):
     #   "amortize_months"  — generic amortization with no intermediate asset
     amortize_type: Literal["", "lifetime_months", "prepaid_months", "amortize_months"] = ""
 
-    @field_validator("payee_pattern", "description_pattern")
-    @classmethod
-    def validate_regex(cls, v: str) -> str:
-        if v:
-            try:
-                re.compile(v, re.IGNORECASE)
-            except re.error as e:
-                raise ValueError(f"Invalid regex pattern {v!r}: {e}") from e
-        return v
+    @model_validator(mode="after")
+    def validate_regex(self) -> CategorizationRule:
+        # Only regex-mode patterns must be valid regex; a "contains"/"exact"
+        # pattern is a literal that may legitimately contain `[`, `*`, `(`, …
+        if self.match_mode == "regex":
+            for pattern in (self.payee_pattern, self.description_pattern):
+                if pattern:
+                    try:
+                        re.compile(pattern, re.IGNORECASE)
+                    except re.error as e:
+                        raise ValueError(
+                            f"Invalid regex pattern {pattern!r}: {e}"
+                        ) from e
+        return self
+
+    def _pattern_matches(self, pattern: str, haystack: str) -> bool:
+        if self.match_mode == "regex":
+            return re.search(pattern, haystack, re.IGNORECASE) is not None
+        h, p = haystack.casefold(), pattern.casefold()
+        return h == p if self.match_mode == "exact" else p in h
 
     def matches(self, txn: SourceTransaction) -> bool:
         if self.bank_key and txn.bank_key != self.bank_key:
@@ -60,14 +79,11 @@ class CategorizationRule(BaseModel):
         if self.amount_sign == "debit" and txn.amount >= Decimal(0):
             return False
 
-        if self.payee_pattern:
-            haystack = txn.payee or ""
-            if not re.search(self.payee_pattern, haystack, re.IGNORECASE):
-                return False
+        if self.payee_pattern and not self._pattern_matches(
+            self.payee_pattern, txn.payee or ""
+        ):
+            return False
 
-        if self.description_pattern:
-            haystack = txn.description or ""
-            if not re.search(self.description_pattern, haystack, re.IGNORECASE):
-                return False
-
-        return True
+        if not self.description_pattern:
+            return True
+        return self._pattern_matches(self.description_pattern, txn.description or "")
