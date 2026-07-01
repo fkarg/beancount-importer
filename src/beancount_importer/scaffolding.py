@@ -393,12 +393,16 @@ def _legacy_rule_to_new(item: dict[str, Any]) -> list[CategorizationRule]:
         "amortize_type": item.get("amortize_type") or "",
     }
 
-    # `match_field="any"` had OR semantics — expand to two rules sharing a
-    # target so either payee OR description match still routes correctly.
+    # `match_field="any"` had OR semantics — one rule with match_any matches
+    # payee OR description, exactly reproducing it (no twin-rule expansion).
     if match_field == "any" and pattern:
         return [
-            CategorizationRule.model_validate({**base, "payee_pattern": pattern}),
-            CategorizationRule.model_validate({**base, "description_pattern": pattern}),
+            CategorizationRule.model_validate({
+                **base,
+                "payee_pattern": pattern,
+                "description_pattern": pattern,
+                "match_any": True,
+            })
         ]
 
     # Default: payee match.

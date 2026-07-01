@@ -149,12 +149,12 @@ class TestMigrateLegacyInPlace:
         )
         migrate_legacy(tmp_path)
         rules = json.loads((tmp_path / ".beancount-importer" / "rules.json").read_text())
-        assert len(rules) == 2
-        # Same target, but one rule keys on payee, the other on description
-        targets = {r["target_account"] for r in rules}
-        assert targets == {"Expenses:Transport"}
-        keys = {("payee" if r["payee_pattern"] else "description") for r in rules}
-        assert keys == {"payee", "description"}
+        # Legacy "any" (OR semantics) → one either-rule, not a twin pair.
+        assert len(rules) == 1
+        assert rules[0]["target_account"] == "Expenses:Transport"
+        assert rules[0]["match_any"] is True
+        assert rules[0]["payee_pattern"] == "Bahn"
+        assert rules[0]["description_pattern"] == "Bahn"
 
     def test_re_runs_on_empty_rules_file(self, tmp_path: Path):
         # Simulates the bug: an earlier broken migration left an empty `[]`.
@@ -204,7 +204,8 @@ class TestMigrateLegacyInPlace:
         steam = next(r for r in rules if r["payee_pattern"] == "www.steampowered.com")
         other = next(r for r in rules if r["payee_pattern"] == "Other")
         assert steam["suppress_narration_updates"] is True
-        assert other["suppress_narration_updates"] is False
+        # Dense serialization omits the default False flag entirely.
+        assert other.get("suppress_narration_updates", False) is False
 
     def test_active_tag_under_config_block(self, tmp_path: Path):
         # The actual layout: active_tag + recent_tags nested under "config".

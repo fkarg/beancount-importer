@@ -246,6 +246,28 @@ class TestRulesStorage:
         assert isinstance(data, list)
         assert len(data) == 1
 
+    def test_save_omits_default_and_null_fields(self, tmp_path: Path):
+        # Rules carry many fields that are usually at their default; writing
+        # them all bloats the file. Only non-default fields are serialized.
+        path = tmp_path / "rules.json"
+        save_rules(
+            [CategorizationRule(
+                target_account="Expenses:X",
+                payee_pattern="Y",
+                match_mode="contains",
+            )],
+            path,
+        )
+        assert json.loads(path.read_text()) == [
+            {"target_account": "Expenses:X", "payee_pattern": "Y",
+             "match_mode": "contains"}
+        ]
+        # Missing fields still load as their defaults.
+        loaded = load_rules(path)[0]
+        assert loaded.override_payee is None
+        assert loaded.amount_sign == ""
+        assert loaded.match_any is False
+
     def test_creates_parent_dirs(self, tmp_path: Path):
         path = tmp_path / "subdir" / "rules.json"
         save_rules([], path)

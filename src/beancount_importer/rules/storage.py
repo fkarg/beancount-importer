@@ -19,5 +19,13 @@ def save_rules(rules: list[CategorizationRule], path: Path) -> None:
     """Persist rules to a JSON file, creating parent dirs as needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump([r.model_dump() for r in rules], f, indent=2, ensure_ascii=False)
+        # `exclude_defaults` drops the many usually-default fields (empty
+        # patterns, None overrides, False suppress/transform flags) so the file
+        # stays readable. Missing fields load back as their model defaults.
+        json.dump(
+            [r.model_dump(exclude_defaults=True) for r in rules],
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
         f.write("\n")
