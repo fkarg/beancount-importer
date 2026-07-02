@@ -27,6 +27,13 @@ intermediary CSVs frequently use the funding bank's terse payee while the
 ledger entry carries the merchant name, so the overlap can be just one
 shared token.
 
+Exception: a *merchant-less* intermediary top-up — PayPal's "Bank Deposit to
+PP Account" carries a generic description and NO payee — has no merchant token
+to match against the settled entry, so the floor would always reject it. For
+those rows the floor is waived and `|amount| + (date or metadata-date)` against
+a metadata-bearing, text-carrying entry is enough (matching the reference
+importer). Rows *with* a payee still require the floor.
+
 The check uses `LedgerEntry.metadata_dates`, which the reader populates from
 `MatchingConfig.metadata_date_keys` — so the set of keys treated as
 "settlement evidence" is configurable without the matcher knowing about
@@ -65,6 +72,9 @@ class _IntermediarySettlementMatcher:
             # settlement match from an amount/date coincidence — leave the
             # row for normal dedup/scoring instead of silent-skipping.
             return None
+        # Merchant-less intermediary top-ups have no payee (only a generic
+        # description); the similarity floor is waived for them below.
+        has_payee = bool(txn.payee and txn.payee.strip())
         for entry in existing_entries:
             if not entry.metadata_dates:
                 continue
@@ -77,7 +87,9 @@ class _IntermediarySettlementMatcher:
             entry_text = " ".join(filter(None, [entry.payee, entry.narration]))
             if not entry_text:
                 continue
-            if similarity_score(txn_text, entry_text) < TEXT_FLOOR:
+            # A payee-carrying row must clear the floor; a merchant-less
+            # top-up (no payee) relies on |amount| + date alone.
+            if has_payee and similarity_score(txn_text, entry_text) < TEXT_FLOOR:
                 continue
             return MatchOutcome(
                 kind="skip",

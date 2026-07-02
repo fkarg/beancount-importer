@@ -295,6 +295,44 @@ class TestIntermediarySettlementMatcher:
         assert outcome is not None
         assert outcome.kind == "skip"
 
+    def test_skips_merchant_less_deposit_despite_zero_text_overlap(self):
+        # The real "Bank Deposit to PP Account" row: NO payee, a generic
+        # description sharing no token with the settled merchant entry
+        # ("Uber"). The similarity floor is waived because there's no
+        # merchant to match — |amount| + metadata-date carry the skip.
+        # This is the regressed case the reference importer handled.
+        txn = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("29.06"),
+            currency="EUR",
+            description="Bank Deposit to PP Account",  # payee left unset
+            bank_key="paypal",
+        )
+        outcome = settled_hook.match(txn, {}, [_settled_entry()])
+        assert outcome is not None
+        assert outcome.kind == "skip"
+
+    def test_merchant_less_deposit_still_requires_entry_text(self):
+        # Waiving the floor does not waive the entry-text guard: a nameless
+        # settlement entry is too weak to silent-skip a payee-less deposit.
+        textless_entry = LedgerEntry(
+            date=date(2024, 4, 29),
+            narration="",
+            source_account="Assets:B:SPK",
+            target_account="Expenses:Food:Outside",
+            amount=Decimal("-29.06"),
+            currency="EUR",
+            metadata_dates=(date(2024, 5, 3),),
+        )
+        txn = SourceTransaction(
+            booking_date=date(2024, 5, 3),
+            amount=Decimal("29.06"),
+            currency="EUR",
+            description="Bank Deposit to PP Account",
+            bank_key="paypal",
+        )
+        assert settled_hook.match(txn, {}, [textless_entry]) is None
+
     def test_does_not_skip_entry_without_metadata_dates(self):
         # A regular merchant entry (no paypal:/settle:) is NOT settlement
         # evidence; the matcher must pass so dedup/scoring can run normally.
