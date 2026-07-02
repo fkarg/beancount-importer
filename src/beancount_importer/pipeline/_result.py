@@ -24,6 +24,10 @@ from beancount_importer.models import (
     ProposedChange,
     SourceTransaction,
 )
+from beancount_importer.pipeline._paypal_bundles import (
+    FUNDING_ACCOUNT_KEY,
+    PAYPAL_DATE_KEY,
+)
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.tags import TagStateDelta
 
@@ -533,11 +537,22 @@ def _format_new_entry(
     payee = proposal.payee or txn.payee
     narration = proposal.narration or txn.description or ""
 
+    # PayPal pass-through collapse: `resolve_paypal_settlements` dropped the
+    # paired funding ("Bank Deposit") row and stamped this purchase with the
+    # funding bank + PayPal date. Book the source leg to that bank with
+    # posting-level `paypal: <date>` (still negative-leading — `txn.amount` is
+    # the purchase's debit) instead of the PayPal account, so `settle_inv`
+    # splits it into the PayPal purchase + bank→PayPal settle legs at load.
+    source_account = bank.account
+    source_metadata = dict(bank_posting_metadata or {})
+    funding_account = txn.raw_data.get(FUNDING_ACCOUNT_KEY)
+    if funding_account:
+        source_account = funding_account
+        source_metadata = {"paypal": txn.raw_data[PAYPAL_DATE_KEY]}
+
     postings: list[tuple[str, str | None, dict[str, str]]] = []
     # Source-account leg always carries the explicit amount + currency.
-    postings.append(
-        (bank.account, f"{txn.amount} {txn.currency}", bank_posting_metadata or {})
-    )
+    postings.append((source_account, f"{txn.amount} {txn.currency}", source_metadata))
     # A collapsed foreign-currency purchase (e.g. PayPal's General Currency
     # Conversion bundle) books the home amount on the source leg and prices
     # the single counter-leg in the original currency with a `@@` total cost.

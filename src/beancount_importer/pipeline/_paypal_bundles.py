@@ -27,12 +27,21 @@ from __future__ import annotations
 from collections import defaultdict
 
 from beancount_importer.models import SourceTransaction
+from beancount_importer.rules.engine import find_matching_rule
+from beancount_importer.rules.models import CategorizationRule
 
 # Raw-column keys (English + German), read off `raw_data`. The generic parser
 # preserves the full row, so grouping keys survive regardless of field mapping.
 _TXNID_KEYS = ("Transaction ID", "Transaktionscode")
 _REFTXN_KEYS = ("Reference Txn ID", "Zugehöriger Transaktionscode")
 _DESC_KEYS = ("Description", "Subject", "Betreff", "Item Title")
+
+# Marker keys stamped onto a pass-through *purchase* row by
+# `resolve_paypal_settlements`, read back in `_result._format_new_entry` to
+# render the collapsed funding leg. Underscore-prefixed so they never collide
+# with a real PayPal CSV column.
+FUNDING_ACCOUNT_KEY = "_paypal_funding_account"
+PAYPAL_DATE_KEY = "_paypal_date"
 
 _GCC_DESC = "General Currency Conversion"
 _HOLD_DESC = "Account Hold for Open Authorization"
@@ -99,6 +108,77 @@ def _plan_currency_conversions(
         }
         suppress.update(_raw(leg, _TXNID_KEYS) for leg in legs)
     return suppress, overrides
+
+
+def resolve_paypal_settlements(
+    txns: list[SourceTransaction],
+    rules: list[CategorizationRule],
+    *,
+    internal_prefixes: tuple[str, ...],
+    paypal_account: str | None,
+) -> list[SourceTransaction]:
+    """Collapse PayPal pass-through funding rows into their purchase.
+
+    PayPal funds a purchase by instantly pulling the exact amount from the
+    user's bank; that shows up as a *second* PayPal-CSV row — positive amount,
+    generic description ("Bank Deposit to PP Account", among other narrations),
+    whose `Reference Txn ID` points at the purchase's `Transaction ID`. Left
+    alone, the pair books as two ledger entries (purchase on PayPal + a
+    PayPal↔bank transfer) instead of the single settle_inv-shaped transaction
+    the user wants.
+
+    For each such pair this drops the funding row and stamps the purchase with
+    the funding bank account (resolved from the funding row's own
+    categorization rule — the CSV never names the bank) plus the PayPal date,
+    so `_format_new_entry` books the purchase's source leg to that bank with
+    posting-level `paypal: <date>` (negative-leading) rather than the PayPal
+    account. The pairing is deterministic by transaction id — no amount/date
+    heuristic — and narration-independent.
+
+    A funding row is left untouched (and books as an ordinary transfer) when it
+    references no in-batch purchase (a genuine balance top-up), the amounts
+    don't mirror exactly, or its rule resolves to something other than an
+    internal-transfer account (so the funding bank is unknown). PayPal itself
+    is excluded as a funding target — a deposit can't fund PayPal from PayPal.
+    """
+    if paypal_account is None:
+        return txns
+    paypal = [t for t in txns if t.bank_key == "paypal"]
+    by_id = {tid: t for t in paypal if (tid := _raw(t, _TXNID_KEYS))}
+
+    drop: set[int] = set()
+    annotate: dict[int, dict[str, str]] = {}
+    for dep in paypal:
+        if dep.amount <= 0:
+            continue
+        purchase = by_id.get(_raw(dep, _REFTXN_KEYS))
+        if purchase is None or purchase.amount >= 0:
+            continue
+        if dep.currency != purchase.currency or dep.amount != -purchase.amount:
+            continue
+        rule = find_matching_rule(dep, rules)
+        if rule is None:
+            continue
+        funding = rule.target_account
+        if funding == paypal_account or not funding.startswith(internal_prefixes):
+            continue
+        drop.add(id(dep))
+        annotate[id(purchase)] = {
+            FUNDING_ACCOUNT_KEY: funding,
+            PAYPAL_DATE_KEY: purchase.booking_date.isoformat(),
+        }
+
+    if not drop:
+        return txns
+    out: list[SourceTransaction] = []
+    for t in txns:
+        if id(t) in drop:
+            continue
+        overrides = annotate.get(id(t))
+        if overrides:
+            t = t.model_copy(update={"raw_data": {**t.raw_data, **overrides}})
+        out.append(t)
+    return out
 
 
 def _plan_hold_reversals(

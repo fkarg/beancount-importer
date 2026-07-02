@@ -35,6 +35,7 @@ from beancount_importer.pipeline._clean import (
     clean_spk_transfer_prefix,
 )
 from beancount_importer.pipeline._merge import _apply_merge_decision
+from beancount_importer.pipeline._paypal_bundles import resolve_paypal_settlements
 from beancount_importer.pipeline._proposal import (
     _derive_rule,
     _is_ambiguous_match,
@@ -108,6 +109,17 @@ def run(
 
     banks = _select_banks(session)
     inputs = _parse_all_inputs(banks, base_dir, year_filter, reporter)
+    # Collapse PayPal pass-through funding rows ("Bank Deposit"-style deposits
+    # that fund a same-CSV purchase) into that purchase, so the pair books as a
+    # single settle_inv-shaped entry instead of a purchase + a separate
+    # transfer. Needs the rules (the CSV never names the funding bank), so it
+    # runs here rather than in `_parse_all_inputs`.
+    inputs = resolve_paypal_settlements(
+        inputs,
+        list(session.rules),
+        internal_prefixes=tuple(config.matching.internal_transfer_account_prefixes),
+        paypal_account=config.paypal_account,
+    )
     if session.options.chronological:
         # Stable sort: within a day, the existing bank/CSV order is the
         # tiebreak. Reordering shifts which leg of a same-session transfer

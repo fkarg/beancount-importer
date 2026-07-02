@@ -746,6 +746,127 @@ class TestPipelineCrossBank:
         )
 
 
+class TestPipelinePayPalPassThrough:
+    """End-to-end collapse of a PayPal purchase + its funding "Bank Deposit"
+    row into a single settle_inv-shaped entry (see `resolve_paypal_settlements`).
+    """
+
+    _HEADER = "Date,Description,Currency,Gross,Name,Transaction ID,Reference Txn ID"
+
+    def _paypal_bank(self) -> BankConfig:
+        return BankConfig(
+            key="paypal",
+            display_name="PayPal",
+            account="Assets:B:PayPal",
+            file_glob="PayPal_*.csv",
+            output_file="paypal.bean",
+            csv=CsvConfig(
+                delimiter=",",
+                date_format=["%Y-%m-%d"],
+                amount_locale="en",
+                field_date="Date",
+                field_amount="Gross",
+                field_currency="Currency",
+                field_payee="Name",
+                field_description="Description",
+                field_sepa_reference="Transaction ID",
+            ),
+        )
+
+    def _session(self, rules: tuple[CategorizationRule, ...]) -> ImportSession:
+        cfg = Config(
+            banks=[self._paypal_bank()],
+            transactions_dir="transactions",
+            matching=MatchingConfig(min_score=0.35),
+            paypal_account="Assets:B:PayPal",
+        )
+        return ImportSession(config=cfg, rules=rules, options=ImportOptions())
+
+    def _deposit_rule(self) -> CategorizationRule:
+        return CategorizationRule(
+            target_account="Assets:B:SPK",
+            description_pattern="Bank Deposit",
+            match_mode="contains",
+            bank_key="paypal",
+        )
+
+    def _write(self, path: Path, *rows: str) -> None:
+        path.write_text(self._HEADER + "\n" + "\n".join(rows) + "\n")
+
+    def test_collapses_into_single_negative_leading_entry(self, tmp_path: Path):
+        self._write(
+            tmp_path / "PayPal_2025.csv",
+            "2025-09-16,Express Checkout Payment,EUR,-171.80,Blueprint,PAY1,EXT0",
+            "2025-09-16,Bank Deposit to PP Account,EUR,171.80,,DEP1,PAY1",
+        )
+        session = self._session((self._deposit_rule(),))
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Health"), NoopReporter()
+        )
+        # Deposit dropped pre-loop; only the purchase remains, as one entry.
+        assert len(results) == 1
+        text = results[0].new_entry_text
+        assert results[0].action == "new"
+        # Funding leg booked to the bank (from the deposit's rule) with the
+        # PayPal date, NOT to the PayPal account; expense leg follows.
+        assert "Assets:B:SPK" in text
+        assert "-171.80 EUR" in text
+        assert "paypal: 2025-09-16" in text
+        assert "Expenses:Health" in text
+        assert "Assets:B:PayPal" not in text
+        # Negative-leading: the bank debit precedes the expense.
+        assert text.index("Assets:B:SPK") < text.index("Expenses:Health")
+
+    def test_topup_without_reference_stays_a_transfer(self, tmp_path: Path):
+        # A balance top-up (no Reference Txn ID) is not collapsed — it books as
+        # an ordinary transfer to the funding bank via its rule.
+        self._write(
+            tmp_path / "PayPal_2025.csv",
+            "2025-09-16,Bank Deposit to PP Account,EUR,50.00,,DEP1,",
+        )
+        session = self._session((self._deposit_rule(),))
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 1
+        text = results[0].new_entry_text
+        assert "Assets:B:PayPal" in text
+        assert "50.00 EUR" in text
+        assert "paypal:" not in text
+
+    def test_no_rule_leaves_both_rows(self, tmp_path: Path):
+        # Funding bank unknown → no collapse; both rows reach the pipeline.
+        self._write(
+            tmp_path / "PayPal_2025.csv",
+            "2025-09-16,Express Checkout Payment,EUR,-171.80,Blueprint,PAY1,EXT0",
+            "2025-09-16,Bank Deposit to PP Account,EUR,171.80,,DEP1,PAY1",
+        )
+        session = self._session(())
+        results = run(session, tmp_path, fixed_categorize(), NoopReporter())
+        assert len(results) == 2
+
+    def test_reimport_of_collapsed_entry_is_skipped(self, tmp_path: Path):
+        # Once written, re-importing the same CSV must not re-create the entry:
+        # the deposit is dropped again, and the purchase dedups against the
+        # settled (paypal-metadata) entry via the intermediary_settlement matcher.
+        (tmp_path / "transactions").mkdir()
+        (tmp_path / "transactions" / "PAYPAL.bean").write_text(
+            '2025-09-16 * "Blueprint" "Express Checkout Payment"\n'
+            "  Assets:B:SPK  -171.80 EUR\n"
+            "    paypal: 2025-09-16\n"
+            "  Expenses:Health  171.80 EUR\n"
+        )
+        self._write(
+            tmp_path / "PayPal_2025.csv",
+            "2025-09-16,Express Checkout Payment,EUR,-171.80,Blueprint,PAY1,EXT0",
+            "2025-09-16,Bank Deposit to PP Account,EUR,171.80,,DEP1,PAY1",
+        )
+        session = self._session((self._deposit_rule(),))
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Health"), NoopReporter()
+        )
+        assert len(results) == 1
+        assert results[0].action == "skip"
+
+
 class TestPipelineMatchers:
     """End-to-end tests that exercise cross-source matchers in `run()`."""
 
