@@ -203,6 +203,11 @@ class Config(BaseModel):
     # metadata key becomes `paypal:` rather than `actual:` to match the
     # `plugins/settle_inv` convention.
     paypal_account: str | None = None
+    # Path to a Steam purchase-history CSV export (resolved relative to the
+    # finances root). When set, Steam purchases are enriched with their game
+    # titles at import time; unset disables the enrichment entirely. See
+    # `transforms/steam.py`.
+    steam_history_file: str | None = None
     transforms: TransformsConfig = TransformsConfig()
     matching: MatchingConfig = MatchingConfig()
 

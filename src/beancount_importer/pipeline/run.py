@@ -76,6 +76,7 @@ from beancount_importer.rules.tags import (
 )
 from beancount_importer.session import ImportSession
 from beancount_importer.transforms import apply_transforms, load_transforms
+from beancount_importer.transforms.steam import SteamEnricher, load_steam_index
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -152,6 +153,11 @@ def run(
     bank_by_key = {b.key: b for b in banks}
 
     transforms = load_transforms(config.transforms.enabled)
+    if config.steam_history_file is not None:
+        transforms = [
+            *transforms,
+            SteamEnricher(load_steam_index(base_dir / config.steam_history_file)),
+        ]
     matchers = load_matchers(list(config.matching.enabled_matchers))
     working_rules: list[CategorizationRule] = list(session.rules)
     working_tag: ActiveTag | None = session.tag_state.active
