@@ -256,11 +256,14 @@ def format_transaction(
 
 
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Canonical integers only: no leading zeros, so zero-padded references
+# (`007`, account numbers) stay quoted and keep their padding on round-trip.
+_INTEGER = re.compile(r"-?(?:[1-9][0-9]*|0)")
 
 
 def _render_meta_value(value: str) -> str:
-    """Render a metadata value: bare for date-shaped and boolean values,
-    quoted otherwise.
+    """Render a metadata value: bare for date-shaped, boolean, and integer
+    values, quoted otherwise.
 
     beancount parses `settle: 2024-01-17` as a `date` but `settle:
     "2024-01-17"` as a `str`. Date-consuming plugins (settle/actual/paypal)
@@ -268,11 +271,15 @@ def _render_meta_value(value: str) -> str:
     likewise `via_paypal: TRUE` must be the bare boolean the existing
     placeholder convention uses (the reader stringifies a parsed bool as
     "True", so that spelling normalizes back to bare uppercase too).
-    Everything else stays a quoted string.
+    Integer values (`lifetime_months: 36`) are emitted bare because the
+    amortize plugin does Decimal arithmetic on them — a quoted `"36"` reads
+    back as a `str` and crashes it. Everything else stays a quoted string.
     """
     if value in ("TRUE", "True", "FALSE", "False"):
         return value.upper()
-    return value if _ISO_DATE.fullmatch(value) else f'"{value}"'
+    if _ISO_DATE.fullmatch(value) or _INTEGER.fullmatch(value):
+        return value
+    return f'"{value}"'
 
 
 def _is_reserved_meta_key(key: str) -> bool:

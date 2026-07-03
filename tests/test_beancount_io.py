@@ -724,6 +724,28 @@ class TestFormatTransaction:
         # Non-date metadata stays quoted.
         assert 'sepa_ref: "REF-123"' in text
 
+    def test_integer_metadata_written_bare_not_quoted(self):
+        # beancount parses `lifetime_months: 36` as a number but
+        # `lifetime_months: "36"` as a str. The amortize plugin divides a
+        # Decimal by this value, so a quoted string crashes it — integer
+        # metadata must be emitted bare. Leading-zero strings are NOT
+        # integers (they're zero-padded references) and stay quoted so their
+        # padding survives the round-trip.
+        text = format_transaction(
+            date_str="2024-01-15",
+            flag="*",
+            payee=None,
+            narration="IKEA",
+            postings=[
+                ("Liabilities:CreditCard:Zinia", "-867.72 EUR", {}),
+                ("Expenses:Housing:Furniture", None, {}),
+            ],
+            metadata={"lifetime_months": "36", "ref": "007"},
+        )
+        assert "lifetime_months: 36" in text
+        assert 'lifetime_months: "36"' not in text
+        assert 'ref: "007"' in text
+
     def test_internal_dunder_metadata_is_dropped(self):
         # Reserved `__x__` keys are not valid beancount source syntax; the
         # writer must never emit them, at either the txn or posting level.
