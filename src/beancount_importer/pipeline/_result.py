@@ -548,7 +548,12 @@ def _format_new_entry(
     funding_account = txn.raw_data.get(FUNDING_ACCOUNT_KEY)
     if funding_account:
         source_account = funding_account
-        source_metadata = {"paypal": txn.raw_data[PAYPAL_DATE_KEY]}
+        # Bank-funded pass-through carries a PayPal date → settle_inv split.
+        # Buyer-Credit (Pay-in-30) funding omits it → book the source leg
+        # straight to the credit liability with no `paypal:` metadata.
+        paypal_date = txn.raw_data.get(PAYPAL_DATE_KEY)
+        if paypal_date:
+            source_metadata = {"paypal": paypal_date}
 
     postings: list[tuple[str, str | None, dict[str, str]]] = []
     # Source-account leg always carries the explicit amount + currency.

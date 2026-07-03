@@ -46,6 +46,7 @@ PAYPAL_DATE_KEY = "_paypal_date"
 _GCC_DESC = "General Currency Conversion"
 _HOLD_DESC = "Account Hold for Open Authorization"
 _REVERSAL_DESC = "Reversal of General Account Hold"
+_BUYER_CREDIT_DESC = "PayPal Buyer Credit Payment Funding"
 
 
 def _raw(txn: SourceTransaction, keys: tuple[str, ...]) -> str:
@@ -116,6 +117,7 @@ def resolve_paypal_settlements(
     *,
     internal_prefixes: tuple[str, ...],
     paypal_account: str | None,
+    paypal_credit_account: str | None = None,
 ) -> list[SourceTransaction]:
     """Collapse PayPal pass-through funding rows into their purchase.
 
@@ -155,6 +157,17 @@ def resolve_paypal_settlements(
         if purchase is None or purchase.amount >= 0:
             continue
         if dep.currency != purchase.currency or dep.amount != -purchase.amount:
+            continue
+        # Pay-in-30: a "Buyer Credit Payment Funding" row funds the purchase
+        # from PayPal's credit line, not a bank. Book the purchase directly
+        # against the credit liability (no `paypal:` date → no settle_inv
+        # split; the money doesn't move at purchase time). The later repayment
+        # (bank → PayPalPayLater) is a separate row pair.
+        if _raw(dep, _DESC_KEYS) == _BUYER_CREDIT_DESC:
+            if paypal_credit_account is None:
+                continue
+            drop.add(id(dep))
+            annotate[id(purchase)] = {FUNDING_ACCOUNT_KEY: paypal_credit_account}
             continue
         rule = find_matching_rule(dep, rules)
         if rule is None:

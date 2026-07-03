@@ -120,6 +120,7 @@ def run(
         list(session.rules),
         internal_prefixes=tuple(config.matching.internal_transfer_account_prefixes),
         paypal_account=config.paypal_account,
+        paypal_credit_account=config.paypal_credit_account,
     )
     if session.options.chronological:
         # Stable sort: within a day, the existing bank/CSV order is the

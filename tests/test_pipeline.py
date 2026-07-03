@@ -779,6 +779,7 @@ class TestPipelinePayPalPassThrough:
             transactions_dir="transactions",
             matching=MatchingConfig(min_score=0.35),
             paypal_account="Assets:B:PayPal",
+            paypal_credit_account="Liabilities:PayPalPayLater",
         )
         return ImportSession(config=cfg, rules=rules, options=ImportOptions())
 
@@ -816,6 +817,27 @@ class TestPipelinePayPalPassThrough:
         assert "Assets:B:PayPal" not in text
         # Negative-leading: the bank debit precedes the expense.
         assert text.index("Assets:B:SPK") < text.index("Expenses:Health")
+
+    def test_buyer_credit_purchase_books_to_paylater(self, tmp_path: Path):
+        # Pay-in-30: purchase funded by a Buyer Credit row books straight to the
+        # credit liability — no bank leg, no `paypal:` settle metadata, no PayPal.
+        self._write(
+            tmp_path / "PayPal_2025.csv",
+            "2025-10-28,Express Checkout Payment,EUR,-374.90,A&O,PAY1,EXT0",
+            "2025-10-28,PayPal Buyer Credit Payment Funding,EUR,374.90,,BC1,PAY1",
+        )
+        session = self._session(())  # no rule needed — credit account is config
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Events:Ticket"), NoopReporter()
+        )
+        assert len(results) == 1
+        text = results[0].new_entry_text
+        assert "Liabilities:PayPalPayLater" in text
+        assert "-374.90 EUR" in text
+        assert "Expenses:Events:Ticket" in text
+        assert "paypal:" not in text
+        assert "Assets:B:PayPal" not in text
+        assert text.index("Liabilities:PayPalPayLater") < text.index("Expenses:Events:Ticket")
 
     def test_topup_without_reference_stays_a_transfer(self, tmp_path: Path):
         # A balance top-up (no Reference Txn ID) is not collapsed — it books as

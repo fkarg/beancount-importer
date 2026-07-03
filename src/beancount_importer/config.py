@@ -203,6 +203,12 @@ class Config(BaseModel):
     # metadata key becomes `paypal:` rather than `actual:` to match the
     # `plugins/settle_inv` convention.
     paypal_account: str | None = None
+    # Account for PayPal's "Pay in 30 / Buyer Credit" line. When set, a purchase
+    # funded by a `PayPal Buyer Credit Payment Funding` row books directly
+    # against this liability (Expenses / PayPalPayLater) with no PayPal
+    # intermediary; the later bank repayment pays it down. Unset leaves
+    # buyer-credit rows as ordinary transactions. See `resolve_paypal_settlements`.
+    paypal_credit_account: str | None = None
     # Path to a Steam purchase-history CSV export (resolved relative to the
     # finances root). When set, Steam purchases are enriched with their game
     # titles at import time; unset disables the enrichment entirely. See

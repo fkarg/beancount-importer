@@ -155,9 +155,13 @@ def _deposit_rule(
     )
 
 
-def _resolve(txns, rules, *, paypal="Assets:B:PayPal"):
+def _resolve(txns, rules, *, paypal="Assets:B:PayPal", credit="Liabilities:PayPalPayLater"):
     return resolve_paypal_settlements(
-        txns, rules, internal_prefixes=_PREFIXES, paypal_account=paypal
+        txns,
+        rules,
+        internal_prefixes=_PREFIXES,
+        paypal_account=paypal,
+        paypal_credit_account=credit,
     )
 
 
@@ -252,6 +256,40 @@ class TestPassThroughSettlement:
         out = _resolve([spk, purchase, deposit], [_deposit_rule()])
         assert spk in out
         assert [t.sepa_reference for t in out if t.bank_key == "paypal"] == ["PAY1"]
+
+
+class TestBuyerCreditSettlement:
+    """Pay-in-30: purchase funded by a `PayPal Buyer Credit Payment Funding`
+    row (Ref → purchase). Unlike a bank-funded deposit, this books the purchase
+    directly against the credit liability with NO `paypal:` settle metadata —
+    no money moves through PayPal or a bank at purchase time."""
+
+    def _pair(self):
+        purchase = _tx("Express Checkout Payment", "PAY1", "EXT0", "-374.90", payee="A&O")
+        funding = _tx("PayPal Buyer Credit Payment Funding", "BC1", "PAY1", "374.90")
+        return purchase, funding
+
+    def test_collapses_credit_pair_to_paylater(self):
+        purchase, funding = self._pair()
+        # No categorization rule needed — the credit account is fixed by config.
+        out = _resolve([purchase, funding], [])
+        assert [t.sepa_reference for t in out] == ["PAY1"]
+        pay = out[0]
+        assert pay.raw_data[FUNDING_ACCOUNT_KEY] == "Liabilities:PayPalPayLater"
+        # Direct expense-on-credit → no settle_inv metadata.
+        assert PAYPAL_DATE_KEY not in pay.raw_data
+
+    def test_no_credit_account_leaves_pair(self):
+        purchase, funding = self._pair()
+        out = _resolve([purchase, funding], [], credit=None)
+        assert {t.sepa_reference for t in out} == {"PAY1", "BC1"}
+        assert FUNDING_ACCOUNT_KEY not in purchase.raw_data
+
+    def test_credit_amount_mismatch_not_paired(self):
+        purchase = _tx("Express Checkout Payment", "PAY1", "EXT0", "-374.90", payee="A&O")
+        funding = _tx("PayPal Buyer Credit Payment Funding", "BC1", "PAY1", "300.00")
+        out = _resolve([purchase, funding], [])
+        assert {t.sepa_reference for t in out} == {"PAY1", "BC1"}
 
 
 # ── Pipeline hook ─────────────────────────────────────────────────────────────
