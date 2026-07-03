@@ -839,6 +839,32 @@ class TestPipelinePayPalPassThrough:
         assert "Assets:B:PayPal" not in text
         assert text.index("Liabilities:PayPalPayLater") < text.index("Expenses:Events:Ticket")
 
+    def test_buyer_credit_repayment_via_general_payment(self, tmp_path: Path):
+        # Repayment of a Pay-in-30 balance: a "General Payment" charge to
+        # "PayPal (Europe)" (the credit paydown) plus its Bank Deposit funding.
+        # Structurally identical to a passthrough purchase, so the EXISTING
+        # collapse books it to the bank with `paypal:`; the counter is
+        # categorized (by rule) to the credit liability. No new code needed.
+        self._write(
+            tmp_path / "PayPal_2025.csv",
+            "2025-11-27,General Payment,EUR,-374.90,PayPal (Europe),GP1,",
+            "2025-11-27,Bank Deposit to PP Account,EUR,374.90,,DEP1,GP1",
+        )
+        session = self._session((self._deposit_rule(),))
+        results = run(
+            session,
+            tmp_path,
+            fixed_categorize("Liabilities:PayPalPayLater"),
+            NoopReporter(),
+        )
+        assert len(results) == 1
+        text = results[0].new_entry_text
+        assert "Assets:B:SPK" in text
+        assert "-374.90 EUR" in text
+        assert "paypal: 2025-11-27" in text
+        assert "Liabilities:PayPalPayLater" in text
+        assert "Assets:B:PayPal" not in text
+
     def test_topup_without_reference_stays_a_transfer(self, tmp_path: Path):
         # A balance top-up (no Reference Txn ID) is not collapsed — it books as
         # an ordinary transfer to the funding bank via its rule.
