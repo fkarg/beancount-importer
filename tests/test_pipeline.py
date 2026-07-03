@@ -839,6 +839,20 @@ class TestPipelinePayPalPassThrough:
         assert "Assets:B:PayPal" not in text
         assert text.index("Liabilities:PayPalPayLater") < text.index("Expenses:Events:Ticket")
 
+    def test_emits_paypal_txn_id_metadata(self, tmp_path: Path):
+        # Every PayPal-sourced entry carries its Transaction ID as metadata so a
+        # re-import can match it by exact id rather than fuzzy amount+date.
+        self._write(
+            tmp_path / "PayPal_2025.csv",
+            "2025-10-28,Express Checkout Payment,EUR,-374.90,A&O,PAY1,EXT0",
+            "2025-10-28,PayPal Buyer Credit Payment Funding,EUR,374.90,,BC1,PAY1",
+        )
+        session = self._session(())
+        results = run(
+            session, tmp_path, fixed_categorize("Expenses:Events:Ticket"), NoopReporter()
+        )
+        assert 'paypal_txn_id: "PAY1"' in results[0].new_entry_text
+
     def test_buyer_credit_repayment_via_general_payment(self, tmp_path: Path):
         # Repayment of a Pay-in-30 balance: a "General Payment" charge to
         # "PayPal (Europe)" (the credit paydown) plus its Bank Deposit funding.

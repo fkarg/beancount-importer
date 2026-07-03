@@ -577,6 +577,10 @@ def _format_new_entry(
         postings.append((p.account, amount_str, dict(p.metadata)))
 
     metadata = dict(proposal.metadata)
+    # Stamp the PayPal Transaction ID (held in sepa_reference) so a re-import
+    # can dedup this entry by exact id rather than fuzzy amount+date.
+    if txn.bank_key == "paypal" and txn.sepa_reference:
+        metadata.setdefault("paypal_txn_id", txn.sepa_reference)
     # `#hashtag` on the header, not `tag:` metadata — see format_transaction.
     tags = (proposal.tag,) if proposal.tag else ()
 
