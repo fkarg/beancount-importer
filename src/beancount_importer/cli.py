@@ -210,13 +210,17 @@ def _resolve(base: Path, template: str, year: int) -> Path:
 # ── Init / migrate helpers ────────────────────────────────────────────────────
 
 
-def _run_init(target: Path) -> None:
+def _run_init(target: Path, years: list[int] | None = None) -> None:
     """Write a starter `.beancount-importer/config.toml` and project skeleton.
 
     Layout produced:
       <target>/.beancount-importer/config.toml
       <target>/transactions/
       <target>/documents/
+
+    When `years` is given, each year is additionally scaffolded via
+    `scaffold_year` (per-year `.bean` files, document folders, `all.bean`
+    registration) using the just-loaded config.
     """
     target.mkdir(parents=True, exist_ok=True)
     config_dir = target / ".beancount-importer"
@@ -232,6 +236,13 @@ def _run_init(target: Path) -> None:
     console.print(
         f"Edit {cfg_path.relative_to(target)} and add a `[[banks]]` entry per bank."
     )
+
+    if years:
+        from beancount_importer.scaffolding import scaffold_year
+
+        config = Config.load(cfg_path)
+        for year in years:
+            scaffold_year(target, config, year, console=console)
 
 
 def _run_migrate(project_dir: Path) -> None:
@@ -359,7 +370,7 @@ def main(
     del version  # handled via callback; only present in signature for --help
 
     if init:
-        _run_init(Path("."))
+        _run_init(Path("."), years)
         return
 
     if migrate:

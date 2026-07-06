@@ -473,6 +473,42 @@ class TestInit:
         runner.invoke(app, ["--init"])
         assert existing.read_text() == "# user-edited\n"
 
+    def test_init_year_scaffolds_year(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        # Seed a config with one bank so scaffold_year has something to emit.
+        config_dir = tmp_path / ".beancount-importer"
+        config_dir.mkdir()
+        (config_dir / "config.toml").write_text(textwrap.dedent("""\
+            transactions_dir = "transactions"
+            documents_dir = "documents"
+
+            [[banks]]
+            key = "spk"
+            display_name = "SPK"
+            account = "Assets:B:SPK"
+            file_glob = "documents/SPK_*.csv"
+            output_file = "transactions/{year}/SPK.bean"
+
+            [banks.csv]
+            field_date = "date"
+            field_amount = "amount"
+        """))
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(app, ["--init", "2027"])
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "transactions" / "2027" / "SPK.bean").is_file()
+        assert (tmp_path / "transactions" / "2027" / "main.bean").is_file()
+        assert (tmp_path / "documents" / "2027" / "statements").is_dir()
+        assert 'include "2027/main.bean"' in (
+            tmp_path / "transactions" / "all.bean"
+        ).read_text()
+
+    def test_init_without_year_skips_scaffold(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(app, ["--init"])
+        assert result.exit_code == 0, result.output
+        # No year dirs created when no year is given.
+        assert not list((tmp_path / "transactions").glob("*/"))
+
 
 class TestMigrateFromLegacy:
     def test_writes_files_in_place(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

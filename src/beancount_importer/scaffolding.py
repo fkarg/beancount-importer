@@ -21,12 +21,17 @@ Idempotent: any new file that already exists is left alone (an empty
 from __future__ import annotations
 
 import json
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import tomli_w
+from beancount.core import data as bc_data
+from beancount.parser import parser as bc_parser
 from rich.console import Console
 
+from beancount_importer.config import Config
 from beancount_importer.rules.models import CategorizationRule
 from beancount_importer.rules.storage import save_rules
 
@@ -536,3 +541,167 @@ def ensure_year_dir(transactions_dir: Path, year: int) -> Path:
     year_dir = transactions_dir / str(year)
     year_dir.mkdir(parents=True, exist_ok=True)
     return year_dir
+
+
+_HEADER = ";; -*- mode: beancount; coding: utf-8; fill-column: 400; -*-\n"
+
+# The three per-year files that structure a year but aren't bank ledgers, so
+# they're never mistaken for an includable `{BANK}.bean`.
+_STRUCTURAL_BEANS = frozenset({"main.bean", "setup.bean", "balances.bean"})
+
+
+def scaffold_year(
+    base_dir: Path,
+    config: Config,
+    year: int,
+    *,
+    console: Console | None = None,
+) -> None:
+    """Scaffold a new ledger year in place.
+
+    Creates `transactions/{year}/` (with `main.bean`, `setup.bean`,
+    `balances.bean` and one empty `{BANK}.bean` per bank), the
+    `documents/{year}/{statements,bescheide}/` input folders, and registers the
+    year in `transactions/all.bean`. Everything is idempotent — existing files
+    are left untouched (never truncated) and the `all.bean` entry is added once.
+    """
+    out = console if console is not None else Console()
+    base_dir = base_dir.resolve()
+    tx_dir = base_dir / config.transactions_dir
+    docs_dir = base_dir / config.documents_dir
+
+    year_dir = ensure_year_dir(tx_dir, year)
+    for sub in ("statements", "bescheide"):
+        (docs_dir / str(year) / sub).mkdir(parents=True, exist_ok=True)
+
+    # Union bank set: config banks + any bank ledger present in last year's dir.
+    bank_files: set[str] = {
+        Path(b.output_file.format(year=year)).name for b in config.banks
+    }
+    prev_dir = tx_dir / str(year - 1)
+    if prev_dir.is_dir():
+        for p in prev_dir.glob("*.bean"):
+            if p.name not in _STRUCTURAL_BEANS:
+                bank_files.add(p.name)
+    bank_files_sorted = sorted(bank_files)
+
+    # Accounts to pad + seed: config bank accounts + accounts asserted last year.
+    prior = _read_prior_balances(prev_dir / "balances.bean")
+    accounts = sorted({b.account for b in config.banks} | set(prior))
+
+    def _rel(p: Path) -> str:
+        return str(p.relative_to(base_dir))
+
+    def _write_if_absent(path: Path, content: str) -> None:
+        if path.exists():
+            out.print(f"[yellow]exists[/]: {_rel(path)} (left untouched)")
+        else:
+            path.write_text(content, encoding="utf-8")
+            out.print(f"[green]wrote[/] {_rel(path)}")
+
+    for name in bank_files_sorted:
+        _write_if_absent(year_dir / name, "")
+
+    _write_if_absent(
+        year_dir / "main.bean", _render_main(year, bank_files_sorted, config.banks)
+    )
+    _write_if_absent(
+        year_dir / "balances.bean", _render_balances(year, accounts, prior)
+    )
+    _write_if_absent(year_dir / "setup.bean", _render_setup(year, accounts))
+
+    _register_in_all_bean(tx_dir / "all.bean", year, out=out, rel=_rel)
+
+
+def _read_prior_balances(path: Path) -> dict[str, tuple[Decimal, str]]:
+    """Return the latest `balance` amount per account from a balances file.
+
+    Parses syntax only (no loader/booking), so unopened accounts don't error.
+    Missing file → empty mapping.
+    """
+    if not path.is_file():
+        return {}
+    entries, _errors, _opts = bc_parser.parse_file(str(path))
+    by_account: dict[str, list[tuple[date, Decimal, str]]] = {}
+    for e in entries:
+        if isinstance(e, bc_data.Balance):
+            number = e.amount.number
+            assert number is not None  # a parsed balance always has an amount
+            by_account.setdefault(e.account, []).append(
+                (e.date, number, e.amount.currency)
+            )
+    result: dict[str, tuple[Decimal, str]] = {}
+    for account, items in by_account.items():
+        _d, num, ccy = max(items)  # latest assertion by date
+        result[account] = (num, ccy)
+    return result
+
+
+def _render_main(year: int, bank_files: list[str], banks: list[Any]) -> str:
+    lines = [_HEADER.rstrip("\n"), "", 'include "balances.bean"']
+    lines += [f'include "{name}"' for name in bank_files]
+    lines += ["", ";; Document links for statements (uncomment once the PDF exists)"]
+    for bank in sorted(banks, key=lambda b: b.account):
+        stem = Path(bank.output_file.format(year=year)).stem
+        lines.append(
+            f"; {year}-12-31 document {bank.account} "
+            f'"../../documents/{year}/statements/{stem}_{year}.pdf"'
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _render_balances(
+    year: int, accounts: list[str], prior: dict[str, tuple[Decimal, str]]
+) -> str:
+    lines = [
+        _HEADER.rstrip("\n"),
+        ";;",
+        f";; Balance checks — opening {year}-01-01",
+        ";;",
+        "",
+    ]
+    for account in accounts:
+        if account in prior:
+            num, ccy = prior[account]
+            lines.append(
+                f"{year}-01-01 balance {account}  {num} {ccy}"
+                f"  ; VERIFY (copied from {year - 1} close)"
+            )
+        else:
+            lines.append(f"; {year}-01-01 balance {account}  0.00 EUR")
+    return "\n".join(lines) + "\n"
+
+
+def _render_setup(year: int, accounts: list[str]) -> str:
+    lines = [
+        _HEADER.rstrip("\n"),
+        "",
+        "* Transaction History",
+        "; Stock-lot history and other opening transactions go here (manual).",
+        "",
+        "* Padding Accounts",
+    ]
+    for account in accounts:
+        lines.append(f"{year - 1}-12-31 pad {account} Equity:Opening-Balances")
+    lines += ["", "* Commodities", "; Year-opening price directives go here (manual)."]
+    return "\n".join(lines) + "\n"
+
+
+def _register_in_all_bean(path: Path, year: int, *, out: Console, rel) -> None:
+    """Append the year's includes to `all.bean`, following the repo convention.
+
+    `setup.bean` is commented (every year after the base year carries its
+    openings through real transactions); `main.bean` is active. Idempotent.
+    """
+    entry = (
+        f'; include "{year}/setup.bean"   ; initializing for the year {year}\n'
+        f'include "{year}/main.bean"         ; in creation\n'
+    )
+    existing = path.read_text(encoding="utf-8") if path.exists() else _HEADER
+    if f'include "{year}/main.bean"' in existing:
+        out.print(f"[yellow]exists[/]: {rel(path)} already registers {year}")
+        return
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    path.write_text(existing + "\n" + entry, encoding="utf-8")
+    out.print(f"[green]registered[/] {year} in {rel(path)}")

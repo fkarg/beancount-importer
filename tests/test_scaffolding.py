@@ -11,7 +11,24 @@ import json
 import tomllib
 from pathlib import Path
 
-from beancount_importer.scaffolding import ensure_year_dir, migrate_legacy
+from beancount_importer.config import BankConfig, Config, CsvConfig
+from beancount_importer.scaffolding import (
+    ensure_year_dir,
+    migrate_legacy,
+    scaffold_year,
+)
+
+
+def _bank(key: str, account: str) -> BankConfig:
+    """Minimal bank whose output_file lands per-year as `{KEY}.bean`."""
+    return BankConfig(
+        key=key,
+        display_name=key.upper(),
+        account=account,
+        file_glob=f"documents/{key}_*.csv",
+        output_file=f"transactions/{{year}}/{key.upper()}.bean",
+        csv=CsvConfig(field_date="date", field_amount="amount"),
+    )
 
 
 def _seed_legacy(
@@ -621,3 +638,165 @@ class TestMigrateLegacyDefensiveBranches:
         p = tmp_path / "rules.json"
         p.write_text("{not json")
         assert _has_meaningful_rules(p) is True
+
+
+class TestScaffoldYear:
+    def _config(self, banks: list[BankConfig] | None = None) -> Config:
+        return Config(banks=banks if banks is not None else [_bank("spk", "Assets:B:SPK")])
+
+    def _prev_balances(self, base: Path, year: int, body: str) -> None:
+        """Seed `transactions/{year}/balances.bean` with the given directives."""
+        d = base / "transactions" / str(year)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "balances.bean").write_text(body, encoding="utf-8")
+
+    def test_creates_year_directories(self, tmp_path: Path):
+        scaffold_year(tmp_path, self._config(), 2027)
+        assert (tmp_path / "transactions" / "2027").is_dir()
+        assert (tmp_path / "documents" / "2027" / "statements").is_dir()
+        assert (tmp_path / "documents" / "2027" / "bescheide").is_dir()
+
+    def test_creates_empty_bank_files_from_config(self, tmp_path: Path):
+        cfg = self._config([_bank("spk", "Assets:B:SPK"), _bank("n26", "Assets:B:N26")])
+        scaffold_year(tmp_path, cfg, 2027)
+        spk = tmp_path / "transactions" / "2027" / "SPK.bean"
+        n26 = tmp_path / "transactions" / "2027" / "N26.bean"
+        assert spk.is_file() and spk.read_text() == ""
+        assert n26.is_file() and n26.read_text() == ""
+
+    def test_bank_files_union_includes_prev_year_only(self, tmp_path: Path):
+        # config knows only SPK; last year's dir also has NO.bean → both created.
+        prev = tmp_path / "transactions" / "2026"
+        prev.mkdir(parents=True)
+        (prev / "NO.bean").write_text("; last year\n")
+        scaffold_year(tmp_path, self._config([_bank("spk", "Assets:B:SPK")]), 2027)
+        new = tmp_path / "transactions" / "2027"
+        assert (new / "SPK.bean").is_file()
+        assert (new / "NO.bean").is_file()
+
+    def test_structural_files_not_treated_as_banks(self, tmp_path: Path):
+        prev = tmp_path / "transactions" / "2026"
+        prev.mkdir(parents=True)
+        for name in ("main.bean", "setup.bean", "balances.bean"):
+            (prev / name).write_text("; struct\n")
+        scaffold_year(tmp_path, self._config([]), 2027)
+        # None of the structural names should be re-created as includable banks.
+        main = (tmp_path / "transactions" / "2027" / "main.bean").read_text()
+        assert 'include "setup.bean"' not in main
+        assert 'include "main.bean"' not in main
+
+    def test_main_bean_includes_banks_and_balances(self, tmp_path: Path):
+        cfg = self._config([_bank("spk", "Assets:B:SPK"), _bank("n26", "Assets:B:N26")])
+        scaffold_year(tmp_path, cfg, 2027)
+        main = (tmp_path / "transactions" / "2027" / "main.bean").read_text()
+        assert 'include "balances.bean"' in main
+        assert 'include "N26.bean"' in main
+        assert 'include "SPK.bean"' in main
+
+    def test_main_bean_has_commented_doc_links(self, tmp_path: Path):
+        scaffold_year(tmp_path, self._config([_bank("spk", "Assets:B:SPK")]), 2027)
+        main = (tmp_path / "transactions" / "2027" / "main.bean").read_text()
+        assert (
+            '; 2027-12-31 document Assets:B:SPK '
+            '"../../documents/2027/statements/SPK_2027.pdf"'
+        ) in main
+
+    def test_balances_carry_forward_latest_prior_close(self, tmp_path: Path):
+        self._prev_balances(
+            tmp_path,
+            2026,
+            "2026-01-01 balance Assets:B:SPK   10.00 EUR\n"
+            "2026-12-31 balance Assets:B:SPK  123.45 EUR\n",
+        )
+        scaffold_year(tmp_path, self._config([_bank("spk", "Assets:B:SPK")]), 2027)
+        bal = (tmp_path / "transactions" / "2027" / "balances.bean").read_text()
+        line = next(
+            ln for ln in bal.splitlines() if "2027-01-01 balance Assets:B:SPK" in ln
+        )
+        assert "123.45 EUR" in line  # latest (12-31), not the 01-01 opening
+        assert "VERIFY" in line
+        assert not line.lstrip().startswith(";")  # active assertion, not commented
+
+    def test_balances_pick_latest_by_date_ignoring_non_balance(self, tmp_path: Path):
+        # A non-balance directive is skipped, and the latest *date* wins even
+        # when an earlier-dated assertion appears later in the file.
+        self._prev_balances(
+            tmp_path,
+            2026,
+            "2026-12-31 balance Assets:B:SPK  123.45 EUR\n"
+            '2026-06-01 note Assets:B:SPK "midyear note"\n'
+            "2026-06-01 balance Assets:B:SPK   99.99 EUR\n",
+        )
+        scaffold_year(tmp_path, self._config([_bank("spk", "Assets:B:SPK")]), 2027)
+        bal = (tmp_path / "transactions" / "2027" / "balances.bean").read_text()
+        line = next(
+            ln for ln in bal.splitlines() if "2027-01-01 balance Assets:B:SPK" in ln
+        )
+        assert "123.45 EUR" in line
+        assert "99.99" not in line
+
+    def test_all_bean_without_trailing_newline(self, tmp_path: Path):
+        tx = tmp_path / "transactions"
+        tx.mkdir()
+        (tx / "all.bean").write_text('include "2026/main.bean"')  # no trailing \n
+        scaffold_year(tmp_path, self._config([_bank("spk", "Assets:B:SPK")]), 2027)
+        all_bean = (tx / "all.bean").read_text()
+        assert 'include "2026/main.bean"\n' in all_bean
+        assert 'include "2027/main.bean"' in all_bean
+
+    def test_balances_placeholder_when_no_prior(self, tmp_path: Path):
+        scaffold_year(tmp_path, self._config([_bank("spk", "Assets:B:SPK")]), 2027)
+        bal = (tmp_path / "transactions" / "2027" / "balances.bean").read_text()
+        line = next(ln for ln in bal.splitlines() if "balance Assets:B:SPK" in ln)
+        assert line.lstrip().startswith(";")  # commented placeholder
+        assert "2027-01-01" in line
+
+    def test_setup_pads_every_account(self, tmp_path: Path):
+        # union: config account + an account seen only in prior balances.
+        self._prev_balances(tmp_path, 2026, "2026-12-31 balance Assets:B:N26  5.00 EUR\n")
+        scaffold_year(tmp_path, self._config([_bank("spk", "Assets:B:SPK")]), 2027)
+        setup = (tmp_path / "transactions" / "2027" / "setup.bean").read_text()
+        assert "2026-12-31 pad Assets:B:SPK Equity:Opening-Balances" in setup
+        assert "2026-12-31 pad Assets:B:N26 Equity:Opening-Balances" in setup
+
+    def test_all_bean_registration(self, tmp_path: Path):
+        scaffold_year(tmp_path, self._config(), 2027)
+        all_bean = (tmp_path / "transactions" / "all.bean").read_text()
+        assert 'include "2027/main.bean"' in all_bean
+        assert '; include "2027/setup.bean"' in all_bean
+
+    def test_all_bean_idempotent(self, tmp_path: Path):
+        scaffold_year(tmp_path, self._config(), 2027)
+        scaffold_year(tmp_path, self._config(), 2027)
+        all_bean = (tmp_path / "transactions" / "all.bean").read_text()
+        assert all_bean.count('include "2027/main.bean"') == 1
+
+    def test_existing_files_untouched(self, tmp_path: Path):
+        new = tmp_path / "transactions" / "2027"
+        new.mkdir(parents=True)
+        (new / "SPK.bean").write_text("; already has entries\n")
+        (new / "main.bean").write_text("; hand-edited main\n")
+        scaffold_year(tmp_path, self._config([_bank("spk", "Assets:B:SPK")]), 2027)
+        assert (new / "SPK.bean").read_text() == "; already has entries\n"
+        assert (new / "main.bean").read_text() == "; hand-edited main\n"
+
+    def test_no_banks_degrades_to_dirs_and_registration(self, tmp_path: Path):
+        scaffold_year(tmp_path, self._config([]), 2027)
+        assert (tmp_path / "transactions" / "2027").is_dir()
+        assert (tmp_path / "documents" / "2027" / "statements").is_dir()
+        assert 'include "2027/main.bean"' in (
+            tmp_path / "transactions" / "all.bean"
+        ).read_text()
+        # no bank files
+        beans = list((tmp_path / "transactions" / "2027").glob("*.bean"))
+        assert {p.name for p in beans} == {"main.bean", "setup.bean", "balances.bean"}
+
+    def test_respects_custom_dir_names(self, tmp_path: Path):
+        cfg = Config(
+            banks=[_bank("spk", "Assets:B:SPK")],
+            transactions_dir="ledger",
+            documents_dir="docs",
+        )
+        scaffold_year(tmp_path, cfg, 2027)
+        assert (tmp_path / "ledger" / "2027" / "SPK.bean").is_file()
+        assert (tmp_path / "docs" / "2027" / "statements").is_dir()
